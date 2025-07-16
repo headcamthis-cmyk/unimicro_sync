@@ -12,7 +12,12 @@ SHOPIFY_TOKEN = "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"
 SHOPIFY_API_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01"
 
 def check_auth(auth):
-    return auth and auth.username == USERNAME and auth.password == PASSWORD
+    if auth and auth.username == USERNAME and auth.password == PASSWORD:
+        return True
+    # Fallback to query parameters
+    user = request.args.get('user')
+    password = request.args.get('pass')
+    return user == USERNAME and password == PASSWORD
 
 def find_product_by_sku(sku):
     url = f"{SHOPIFY_API_URL}/products.json?fields=id,title,variants"
