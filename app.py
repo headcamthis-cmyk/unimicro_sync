@@ -3,7 +3,7 @@ from flask import Flask, request, Response
 app = Flask(__name__)
 
 USERNAME = "synall"
-PASSWORD = "your_password_here"
+PASSWORD = "synall"
 
 def check_auth(auth):
     return auth and auth.username == USERNAME and auth.password == PASSWORD
