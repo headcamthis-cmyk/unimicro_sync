@@ -43,15 +43,22 @@ def create_collection(title, handle):
         }
     }
 
-    logging.info(f"Attempting to create Shopify collection with data: {data}")
+    logging.info(f"Attempting to create Shopify collection. URL: {url}")
+    logging.info(f"Request headers: {headers}")
+    logging.info(f"Payload: {data}")
 
     try:
         response = requests.post(url, json=data, headers=headers)
         logging.info(f"Shopify API create collection response: {response.status_code} - {response.text}")
 
-        if response.status_code == 201:
-            logging.info(f"Successfully created Shopify collection: {title}")
-            return True
+        if response.status_code in [200, 201]:
+            created_collection = response.json().get('custom_collection')
+            if created_collection:
+                logging.info(f"Successfully created collection: {created_collection['title']} (ID: {created_collection['id']})")
+                return True
+            else:
+                logging.warning("Response returned 200/201 but no 'custom_collection' in response JSON.")
+                return False
         else:
             logging.warning(f"Unexpected response while creating collection: {response.status_code} - {response.text}")
             return False
