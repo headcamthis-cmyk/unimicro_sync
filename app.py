@@ -38,7 +38,7 @@ def create_collection(title, handle):
     data = {
         "custom_collection": {
             "title": title,
-            "handle": handle
+            "handle": handle.lower().replace(" ", "-")
         }
     }
 
