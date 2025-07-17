@@ -30,7 +30,6 @@ def requires_auth(f):
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def receive_xml():
-    # Instead of basic auth, read from query parameters
     user = request.args.get('user')
     passwd = request.args.get('pass')
 
@@ -47,7 +46,7 @@ def receive_xml():
 
     print(f'XML feed saved as {filename}')
 
-    return Response('<response>OK</response>', mimetype='application/xml'
+    return Response('<response>OK</response>', mimetype='application/xml')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
