@@ -28,20 +28,26 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-@app.route('/product', methods=['POST'])
-@requires_auth
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def receive_xml():
+    # Instead of basic auth, read from query parameters
+    user = request.args.get('user')
+    passwd = request.args.get('pass')
+
+    if user != USERNAME or passwd != PASSWORD:
+        return Response('Unauthorized', status=401)
+
     xml_data = request.data.decode('utf-8')
-    
+
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f'unimicro_feed_{timestamp}.xml'
-    
+
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(xml_data)
 
     print(f'XML feed saved as {filename}')
-    
-    return Response('<response>OK</response>', mimetype='application/xml')
+
+    return Response('<response>OK</response>', mimetype='application/xml'
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
