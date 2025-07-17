@@ -74,12 +74,12 @@ def create_collection(title, handle, retries=3):
                             logging.info(f"Collection already exists with handle '{handle}'. Skipping creation.")
                             return True
 
-                    logging.warning(f"Handle '{handle}' not found in returned collections. Unknown state.")
-                    return False
+                    logging.warning(f"Handle '{handle}' not found in returned collections, but assuming success due to 200/201 status.")
+                    return True
 
                 else:
-                    logging.error("Unexpected JSON structure in Shopify response.")
-                    return False
+                    logging.warning("Unexpected JSON structure in Shopify response. Assuming success due to 200/201 status.")
+                    return True
 
             else:
                 logging.warning(f"Unexpected status code when creating collection: {response.status_code}")
