@@ -29,11 +29,6 @@ def get_existing_collections():
     return {}
 
 def create_collection(title, handle):
-    existing_collections = get_existing_collections()
-    if handle in existing_collections:
-        logging.info(f"Collection with handle '{handle}' already exists. Skipping creation.")
-        return False
-
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -80,10 +75,18 @@ def post_productgroup():
         logging.info(f"Product Group XML:\n{xml_data}")
 
         root = ET.fromstring(xml_data)
+
+        # Fetch existing collections once to avoid redundant calls
+        existing_collections = get_existing_collections()
+
         for pg in root.findall("productgroup"):
             group_id = pg.find("id").text
             title = pg.find("description").text
             handle = f"group-{group_id}".lower().replace(" ", "-")
+
+            if handle in existing_collections:
+                logging.info(f"Collection with handle '{handle}' already exists. Skipping creation.")
+                continue
 
             created = create_collection(title, handle)
             if created:
