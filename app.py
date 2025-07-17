@@ -61,6 +61,7 @@ def create_product(title, sku, price):
             "variants": [{
                 "sku": sku,
                 "price": price
+                "inventory_management": "shopify"
             }]
         }
     }
