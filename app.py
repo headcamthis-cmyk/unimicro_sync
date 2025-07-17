@@ -98,18 +98,23 @@ def create_collection(title, handle, retries=3):
             else:
                 return False
 
-def verify_collection_exists(handle):
+def verify_collection_exists(handle, retries=2, delay=2):
     """
     Re-fetch collections to verify if the specified handle exists.
+    Retries verification a few times with a delay to account for API lag.
     """
-    logging.info(f"Verifying existence of collection with handle '{handle}'...")
-    collections = get_existing_collections()
-    if handle in collections:
-        logging.info(f"Verification success: Collection '{handle}' exists with ID {collections[handle]}.")
-        return True
-    else:
-        logging.warning(f"Verification failed: Collection with handle '{handle}' does not exist after creation attempt.")
-        return False
+    for attempt in range(retries + 1):
+        logging.info(f"Verifying existence of collection with handle '{handle}' (attempt {attempt + 1})...")
+        collections = get_existing_collections()
+        if handle in collections:
+            logging.info(f"Verification success: Collection '{handle}' exists with ID {collections[handle]}.")
+            return True
+        if attempt < retries:
+            logging.info(f"Handle '{handle}' not found. Retrying after {delay} seconds...")
+            time.sleep(delay)
+
+    logging.warning(f"Verification failed: Collection with handle '{handle}' does not exist after {retries + 1} attempts.")
+    return False
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def post_productgroup():
