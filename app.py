@@ -2,12 +2,15 @@ from flask import Flask, request, Response
 import logging
 import xml.etree.ElementTree as ET
 import requests
+from datetime import datetime
+import time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 SHOPIFY_DOMAIN = 'asmshop.no'
 SHOPIFY_TOKEN = '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'
+SHOPIFY_API_VERSION = '2024-10'
 
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
@@ -17,10 +20,12 @@ def index():
     return "Uni Micro Sync API is running."
 
 def get_existing_collections():
-    url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        "Content-Type": "application/json"
     }
+    logging.info(f"Fetching existing collections from Shopify URL: {url}")
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
         collections = response.json().get('custom_collections', [])
@@ -28,8 +33,8 @@ def get_existing_collections():
     logging.error(f"Failed to fetch existing collections: {response.status_code} - {response.text}")
     return {}
 
-def create_collection(title, handle):
-    url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
+def create_collection(title, handle, retries=3):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
         "Content-Type": "application/json"
@@ -39,39 +44,49 @@ def create_collection(title, handle):
         "custom_collection": {
             "title": title,
             "handle": handle,
-            "published": True
+            "published_at": datetime.utcnow().isoformat() + 'Z'
         }
     }
 
-    logging.info(f"Attempting to create Shopify collection:")
+    logging.info("Attempting to create Shopify collection:")
+    logging.info(f"- HTTP Method: POST")
     logging.info(f"- URL: {url}")
-    logging.info(f"- Request headers: {headers}")
-    logging.info(f"- Payload JSON: {data}")
+    logging.info(f"- Headers: {headers}")
+    logging.info(f"- Payload: {data}")
 
-    try:
-        response = requests.post(url, json=data, headers=headers)
-        logging.info(f"Shopify API response code: {response.status_code}")
-        logging.info(f"Shopify API response headers: {dict(response.headers)}")
-        logging.info(f"Shopify API response body: {response.text}")
+    for attempt in range(retries):
+        try:
+            response = requests.post(url, json=data, headers=headers)
+            logging.info(f"Shopify API response code: {response.status_code}")
+            logging.info(f"Shopify API response headers: {dict(response.headers)}")
+            logging.info(f"Shopify API response body: {response.text}")
 
-        if response.status_code in [200, 201]:
-            json_response = response.json()
-            if 'custom_collection' in json_response:
-                created_collection = json_response['custom_collection']
-                logging.info(f"Successfully created collection: {created_collection['title']} (ID: {created_collection['id']})")
-                return True
+            if response.status_code in [200, 201]:
+                json_response = response.json()
+                if 'custom_collection' in json_response:
+                    created_collection = json_response['custom_collection']
+                    logging.info(f"Successfully created collection: {created_collection['title']} (ID: {created_collection['id']})")
+                    return True
+                else:
+                    logging.error("Expected 'custom_collection' in response, but not found. Full response JSON:")
+                    logging.error(json_response)
+                    return False
             else:
-                logging.error("Expected 'custom_collection' in response, but not found. Full response JSON:")
-                logging.error(json_response)
-                return False
-        else:
-            logging.warning(f"Unexpected status code when creating collection: {response.status_code}")
-            logging.warning(f"Response text: {response.text}")
-            return False
+                logging.warning(f"Unexpected status code when creating collection: {response.status_code}")
+                if attempt < retries - 1:
+                    logging.info(f"Retrying... (attempt {attempt + 2})")
+                    time.sleep(1)
+                else:
+                    logging.warning(f"Response text: {response.text}")
+                    return False
 
-    except Exception as e:
-        logging.exception(f"Exception occurred while creating Shopify collection: {e}")
-        return False
+        except Exception as e:
+            logging.exception(f"Exception occurred while creating Shopify collection: {e}")
+            if attempt < retries - 1:
+                logging.info(f"Retrying after exception... (attempt {attempt + 2})")
+                time.sleep(1)
+            else:
+                return False
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def post_productgroup():
@@ -89,7 +104,6 @@ def post_productgroup():
         logging.info(f"Product Group XML:\n{xml_data}")
 
         root = ET.fromstring(xml_data)
-
         existing_collections = get_existing_collections()
 
         for pg in root.findall("productgroup"):
