@@ -38,7 +38,7 @@ def create_collection(title, handle):
     data = {
         "custom_collection": {
             "title": title,
-            "handle": handle.lower().replace(" ", "-"),
+            "handle": handle,
             "published": True
         }
     }
@@ -76,7 +76,6 @@ def post_productgroup():
 
         root = ET.fromstring(xml_data)
 
-        # Fetch existing collections once to avoid redundant calls
         existing_collections = get_existing_collections()
 
         for pg in root.findall("productgroup"):
@@ -91,8 +90,9 @@ def post_productgroup():
             created = create_collection(title, handle)
             if created:
                 logging.info(f"Created Shopify collection for product group: {title}")
+                existing_collections[handle] = True  # Update cache to prevent re-creation
             else:
-                logging.info(f"Collection for product group '{title}' was not created (it may already exist).")
+                logging.warning(f"Failed to create Shopify collection for product group: {title}")
 
     except Exception as e:
         logging.error(f"Failed to process product group XML: {e}")
