@@ -16,7 +16,19 @@ def is_authenticated(username, password):
 def index():
     return "Uni Micro Sync API is running."
 
-def create_or_update_collection(group_id, title):
+def get_existing_collections():
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        collections = response.json().get('custom_collections', [])
+        return {c['title']: c['id'] for c in collections}
+    logging.error(f"Failed to fetch existing collections: {response.status_code} - {response.text}")
+    return {}
+
+def create_collection(title, handle):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -26,12 +38,12 @@ def create_or_update_collection(group_id, title):
     data = {
         "custom_collection": {
             "title": title,
-            "handle": f"group-{group_id}"
+            "handle": handle
         }
     }
 
     response = requests.post(url, json=data, headers=headers)
-    logging.info(f"Shopify API response: {response.status_code} - {response.text}")
+    logging.info(f"Shopify API create collection response: {response.status_code} - {response.text}")
     return response.status_code == 201 or response.status_code == 200
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
@@ -49,14 +61,22 @@ def post_productgroup():
         logging.info("Authorized productgroup POST received.")
         logging.info(f"Product Group XML:\n{xml_data}")
 
+        existing_collections = get_existing_collections()
+
         root = ET.fromstring(xml_data)
         for pg in root.findall("productgroup"):
             group_id = pg.find("id").text
             title = pg.find("description").text
+            handle = f"group-{group_id}"
 
-            success = create_or_update_collection(group_id, title)
-            if not success:
-                logging.warning(f"Failed to sync group {group_id} ({title}) to Shopify")
+            if title in existing_collections:
+                logging.info(f"Collection '{title}' already exists in Shopify.")
+            else:
+                created = create_collection(title, handle)
+                if created:
+                    logging.info(f"Created Shopify collection for product group: {title}")
+                else:
+                    logging.warning(f"Failed to create collection for product group: {title}")
 
     except Exception as e:
         logging.error(f"Failed to process product group XML: {e}")
