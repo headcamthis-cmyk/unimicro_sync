@@ -43,27 +43,34 @@ def create_collection(title, handle):
         }
     }
 
-    logging.info(f"Attempting to create Shopify collection. URL: {url}")
-    logging.info(f"Request headers: {headers}")
-    logging.info(f"Payload: {data}")
+    logging.info(f"Attempting to create Shopify collection:")
+    logging.info(f"- URL: {url}")
+    logging.info(f"- Request headers: {headers}")
+    logging.info(f"- Payload JSON: {data}")
 
     try:
         response = requests.post(url, json=data, headers=headers)
-        logging.info(f"Shopify API create collection response: {response.status_code} - {response.text}")
+        logging.info(f"Shopify API response code: {response.status_code}")
+        logging.info(f"Shopify API response headers: {dict(response.headers)}")
+        logging.info(f"Shopify API response body: {response.text}")
 
         if response.status_code in [200, 201]:
-            created_collection = response.json().get('custom_collection')
-            if created_collection:
+            json_response = response.json()
+            if 'custom_collection' in json_response:
+                created_collection = json_response['custom_collection']
                 logging.info(f"Successfully created collection: {created_collection['title']} (ID: {created_collection['id']})")
                 return True
             else:
-                logging.warning("Response returned 200/201 but no 'custom_collection' in response JSON.")
+                logging.error("Expected 'custom_collection' in response, but not found. Full response JSON:")
+                logging.error(json_response)
                 return False
         else:
-            logging.warning(f"Unexpected response while creating collection: {response.status_code} - {response.text}")
+            logging.warning(f"Unexpected status code when creating collection: {response.status_code}")
+            logging.warning(f"Response text: {response.text}")
             return False
+
     except Exception as e:
-        logging.error(f"Exception when creating collection: {e}")
+        logging.exception(f"Exception occurred while creating Shopify collection: {e}")
         return False
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
