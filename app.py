@@ -58,19 +58,29 @@ def create_collection(title, handle, retries=3):
         try:
             response = requests.post(url, json=data, headers=headers)
             logging.info(f"Shopify API response code: {response.status_code}")
-            logging.info(f"Shopify API response headers: {dict(response.headers)}")
             logging.info(f"Shopify API response body: {response.text}")
 
             if response.status_code in [200, 201]:
                 json_response = response.json()
+
                 if 'custom_collection' in json_response:
                     created_collection = json_response['custom_collection']
                     logging.info(f"Successfully created collection: {created_collection['title']} (ID: {created_collection['id']})")
                     return True
-                else:
-                    logging.error("Expected 'custom_collection' in response, but not found. Full response JSON:")
-                    logging.error(json_response)
+
+                elif 'custom_collections' in json_response:
+                    for collection in json_response['custom_collections']:
+                        if collection['handle'] == handle:
+                            logging.info(f"Collection already exists with handle '{handle}'. Skipping creation.")
+                            return True
+
+                    logging.warning(f"Handle '{handle}' not found in returned collections. Unknown state.")
                     return False
+
+                else:
+                    logging.error("Unexpected JSON structure in Shopify response.")
+                    return False
+
             else:
                 logging.warning(f"Unexpected status code when creating collection: {response.status_code}")
                 if attempt < retries - 1:
@@ -118,7 +128,7 @@ def post_productgroup():
             created = create_collection(title, handle)
             if created:
                 logging.info(f"Created Shopify collection for product group: {title}")
-                existing_collections[handle] = True  # Update cache to prevent re-creation
+                existing_collections[handle] = True
             else:
                 logging.warning(f"Failed to create Shopify collection for product group: {title}")
 
