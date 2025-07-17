@@ -48,7 +48,10 @@ def product(path):
     print(data)
 
     try:
-        root = ET.fromstring(data)
+         root = ET.fromstring(data)
+    # dump every tag name so you see what’s actually coming in:
+    tags = sorted({elem.tag for elem in root.iter()})
+    print(f"XML tags in this upload: {tags}")
         for product in root.findall(".//Product"):
             sku = product.findtext("SKU")
             title = product.findtext("ProductName")
