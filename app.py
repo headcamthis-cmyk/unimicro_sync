@@ -46,21 +46,29 @@ def post_productgroup():
         print("Unauthorized access attempt to productgroup endpoint.")
         return Response("Unauthorized", status=401)
 
-@app.route('/product/postproduct2.aspx', methods=['POST'])
-@requires_auth
-def post_product():
-    xml_data = request.data
-    filename = save_xml(xml_data, 'product_feed')
-    print(f'PRODUCT XML saved as {filename}')
-    return '<response>Products processed and synced to Shopify.</response>'
+@app.route('/product/twinxml/postproduct2.aspx', methods=['POST'])
+def post_productgroup():
+    user = request.args.get('user')
+    password = request.args.get('pass')
 
-@app.route('/product/postfiles.aspx', methods=['POST'])
-@requires_auth
-def post_files():
-    xml_data = request.data
-    filename = save_xml(xml_data, 'mediafiles')
-    print(f'MEDIAFILES XML saved as {filename}')
-    return '<response>OK</response>'
+    if user == 'synall' and password == 'synall':
+        print("Authorized productgroup POST received.")
+        return Response("<response>OK</response>", mimetype='application/xml')
+    else:
+        print("Unauthorized access attempt to productgroup endpoint.")
+        return Response("Unauthorized", status=401)
+
+@app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
+def post_productgroup():
+    user = request.args.get('user')
+    password = request.args.get('pass')
+
+    if user == 'synall' and password == 'synall':
+        print("Authorized productgroup POST received.")
+        return Response("<response>OK</response>", mimetype='application/xml')
+    else:
+        print("Unauthorized access attempt to productgroup endpoint.")
+        return Response("Unauthorized", status=401)
 
 @app.route('/status.aspx', methods=['GET'])
 def status():
