@@ -142,8 +142,9 @@ def post_product():
             title_elem = product.find("description")
             price_elem = product.find("price")
             group_elem = product.find("productgroup")
+            quantity_elem = product.find("quantityonhand")
 
-            if None in (sku_elem, title_elem, price_elem, group_elem):
+            if None in (sku_elem, title_elem, price_elem, group_elem, quantity_elem):
                 logging.warning("Skipping product due to missing field(s):")
                 if sku_elem is None:
                     logging.warning(" - Missing <productno> or <productident>")
@@ -153,14 +154,17 @@ def post_product():
                     logging.warning(" - Missing <price>")
                 if group_elem is None:
                     logging.warning(" - Missing <productgroup>")
+                if quantity_elem is None:
+                    logging.warning(" - Missing <quantityonhand>")
                 continue
 
             sku = sku_elem.text
             title = title_elem.text
             price = price_elem.text
             group_id = group_elem.text
+            quantity = int(float(quantity_elem.text.replace(',', '.')))
 
-            logging.info(f"Parsed product: SKU={sku}, Title={title}, Price={price}, Group ID={group_id}")
+            logging.info(f"Parsed product: SKU={sku}, Title={title}, Price={price}, Group ID={group_id}, Quantity={quantity}")
 
             handle = f"group-{group_id}".lower().replace(" ", "-")
             collection_id = collections.get(handle)
@@ -172,50 +176,11 @@ def post_product():
             product_id = create_product(title, sku, price)
             if product_id:
                 assign_product_to_collection(product_id, collection_id)
+                update_product_inventory(sku, quantity)
 
     except Exception as e:
         logging.error(f"Failed to process product XML: {e}")
         return Response('<response>Error processing XML</response>', mimetype='text/xml')
-
-    return Response('<response>OK</response>', mimetype='text/xml')
-
-@app.route('/product/twinxml/updatestock.aspx', methods=['POST'])
-def update_stock():
-    username = request.args.get('user')
-    password = request.args.get('pass')
-
-    if not is_authenticated(username, password):
-        return Response('Unauthorized', status=401)
-
-    try:
-        xml_data = request.data.decode('utf-8', errors='replace')
-        logging.info("Authorized stock update POST received.")
-        logging.info(f"Stock XML:\n{xml_data}")
-
-        root = ET.fromstring(xml_data)
-
-        for product in root.findall("product"):
-            sku_elem = product.find("productno") or product.find("productident")
-            quantity_elem = product.find("quantityonhand")
-
-            if None in (sku_elem, quantity_elem):
-                logging.warning("Skipping stock update due to missing field(s):")
-                if sku_elem is None:
-                    logging.warning(" - Missing <productno> or <productident>")
-                if quantity_elem is None:
-                    logging.warning(" - Missing <quantityonhand>")
-                continue
-
-            sku = sku_elem.text
-            quantity = int(float(quantity_elem.text.replace(',', '.')))
-
-            logging.info(f"Updating stock for SKU={sku} to quantity={quantity}")
-
-            update_product_inventory(sku, quantity)
-
-    except Exception as e:
-        logging.error(f"Failed to process stock XML: {e}")
-        return Response('<response>Error processing stock XML</response>', mimetype='text/xml')
 
     return Response('<response>OK</response>', mimetype='text/xml')
 
@@ -232,7 +197,6 @@ def update_product_inventory(sku, quantity):
         for product in products:
             for variant in product.get('variants', []):
                 if variant.get('sku') == sku:
-                    variant_id = variant['id']
                     inventory_item_id = variant['inventory_item_id']
 
                     inventory_url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json"
