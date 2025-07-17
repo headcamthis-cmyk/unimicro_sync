@@ -5,7 +5,7 @@ import requests
 app = Flask(__name__)
 
 USERNAME = "synall"
-PASSWORD = "your_password_here"
+PASSWORD = "synall"
 
 SHOPIFY_STORE = "asmshop.no"
 SHOPIFY_TOKEN = "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"
