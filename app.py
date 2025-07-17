@@ -8,7 +8,7 @@ import time
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-SHOPIFY_DOMAIN = 'asmshop.no'
+SHOPIFY_DOMAIN = 'allsupermotoas.myshopify.com'
 SHOPIFY_TOKEN = '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'
 SHOPIFY_API_VERSION = '2024-10'
 
