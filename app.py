@@ -145,7 +145,7 @@ def post_product():
         collections = get_existing_collections()
 
         for product in root.findall("product"):
-            sku_elem = product.find("productno")
+            sku_elem = product.find("productno") or product.find("productident")
             title_elem = product.find("description")
             price_elem = product.find("price")
             group_elem = product.find("productgroup")
