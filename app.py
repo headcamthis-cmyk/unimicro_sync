@@ -1,100 +1,73 @@
 from flask import Flask, request, Response
+from functools import wraps
+from datetime import datetime
+import xml.etree.ElementTree as ET
 import os
-import datetime
-import secrets
-
-USERNAME = 'synall'
-PASSWORD = 'synall'
 
 app = Flask(__name__)
 
-def is_authenticated():
-    user = request.args.get('user')
-    passwd = request.args.get('pass')
-    return user == USERNAME and passwd == PASSWORD
+# Basic auth configuration
+USERNAME = os.environ.get('APP_USERNAME', 'synall')
+PASSWORD = os.environ.get('APP_PASSWORD', 'synall')
 
-def save_and_log(label):
-    xml_data = request.data.decode('utf-8', errors='replace')
+def check_auth(username, password):
+    return username == USERNAME and password == PASSWORD
 
-    print(f"===== START OF {label} XML =====")
-    print(xml_data)
-    print(f"===== END OF {label} XML =====")
+def authenticate():
+    return Response('Could not verify your access level for that URL.\n'
+                    'You have to login with proper credentials', 401,
+                    {'WWW-Authenticate': 'Basic realm="Login Required"'})
 
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'unimicro_{label.lower()}_feed_{timestamp}.xml'
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(xml_data)
+def save_xml(data, prefix):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'unimicro_{prefix}_{timestamp}.xml'
+    with open(filename, 'wb') as f:
+        f.write(data)
+    return filename
 
-    print(f'{label} XML saved as {filename}')
-    return Response('<response>OK</response>', mimetype='application/xml')
+@app.route('/product/postproductgroup.aspx', methods=['POST'])
+@requires_auth
+def post_productgroup():
+    xml_data = request.data
+    filename = save_xml(xml_data, 'productgroup_feed')
+    print(f'PRODUCTGROUP XML saved as {filename}')
+    return '<response>OK</response>'
 
-
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
-def post_product_group():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    return save_and_log('PRODUCTGROUP')
-
-
-@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+@app.route('/product/postproduct2.aspx', methods=['POST'])
+@requires_auth
 def post_product():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    return save_and_log('PRODUCT')
+    xml_data = request.data
+    filename = save_xml(xml_data, 'product_feed')
+    print(f'PRODUCT XML saved as {filename}')
+    return '<response>Products processed and synced to Shopify.</response>'
 
+@app.route('/product/postfiles.aspx', methods=['POST'])
+@requires_auth
+def post_files():
+    xml_data = request.data
+    filename = save_xml(xml_data, 'mediafiles')
+    print(f'MEDIAFILES XML saved as {filename}')
+    return '<response>OK</response>'
 
-@app.route('/product/twinxml/postproduct2.aspx', methods=['POST'])
-def post_product2():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    return save_and_log('PRODUCT2')
-
-
-@app.route('/product/twinxml/poststock.aspx', methods=['POST'])
-def post_stock():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    return save_and_log('STOCK')
-
-
-@app.route('/product/twinxml/postprice.aspx', methods=['POST'])
-def post_price():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    return save_and_log('PRICE')
-
-
-@app.route('/product/twinxml/orders.aspx', methods=['GET'])
-def get_orders():
-    if not is_authenticated():
-        return Response('Unauthorized', status=401)
-    empty_orders_xml = '<?xml version="1.0" encoding="iso-8859-1"?><Root></Root>'
-    return Response(empty_orders_xml, mimetype='application/xml')
-
-
-@app.route('/product/display.aspx', methods=['GET'])
-def display_product_group():
-    menuid = request.args.get('menuid')
-    print(f"Display request for menuid: {menuid}")
-    return Response(f'<response>Displaying menu id {menuid}</response>', mimetype='application/xml')
-
+@app.route('/status.aspx', methods=['GET'])
+def status():
+    return '<response>OK</response>'
 
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST'])
 @app.route('/<path:path>', methods=['GET', 'POST'])
 def catch_all(path):
-    print("===== Unhandled Request =====")
-    print(f"Method: {request.method}")
-    print(f"Full Path: {request.full_path}")
-    print(f"Headers: {dict(request.headers)}")
-    if request.method == 'POST':
-        print("===== POST BODY =====")
-        print(request.data.decode('utf-8', errors='replace'))
-        print("=====================")
-    print("===== End of Unhandled Request =====")
-    return Response('Not Found', status=404)
-
+    print(f'Unhandled Request: {request.method} {request.path}')
+    return Response('<response>Not Found</response>', status=404)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
