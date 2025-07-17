@@ -34,7 +34,7 @@ def save_xml(data, prefix):
         f.write(data)
     return filename
 
-@app.route('/product/postproductgroup.aspx', methods=['POST'])
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 @requires_auth
 def post_productgroup():
     xml_data = request.data
