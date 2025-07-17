@@ -32,7 +32,7 @@ def post_productgroup():
 
     return Response("<response>OK</response>", mimetype='text/xml')
 
-@app.route('/product/twinxml/postproduct2.aspx', methods=['POST'])
+@app.route('/product/twinxml/postproduct.asp', methods=['POST'])
 def post_product():
     username = request.args.get('user')
     password = request.args.get('pass')
