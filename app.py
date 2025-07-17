@@ -6,7 +6,7 @@ from werkzeug.security import safe_str_cmp
 
 # Credentials from Uni Micro V3 config
 USERNAME = 'synall'
-PASSWORD = 'your_password_here'  # Replace with the actual password from Uni Micro
+PASSWORD = 'synall'  # Replace with the actual password from Uni Micro
 
 app = Flask(__name__)
 
