@@ -57,19 +57,32 @@ def receive_product2():
     return Response('<response>OK</response>', mimetype='application/xml')
 
 
+@app.route('/product/twinxml/orders.aspx', methods=['GET'])
+def get_orders():
+    if not is_authenticated():
+        return Response('Unauthorized', status=401)
+    
+    empty_orders_xml = '<?xml version="1.0" encoding="iso-8859-1"?><Root></Root>'
+    return Response(empty_orders_xml, mimetype='application/xml')
+
+
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST'])
 @app.route('/<path:path>', methods=['GET', 'POST'])
 def catch_all(path):
-    print(f"Unhandled request to path: /{path}")
-    
+    print("===== Unhandled request =====")
+    print(f"Method: {request.method}")
+    print(f"Full Path: {request.full_path}")
+    print(f"Headers: {dict(request.headers)}")
+
     if request.method == 'POST':
         print("===== POST BODY =====")
         print(request.data.decode('utf-8', errors='replace'))
         print("=====================")
-        
+
+    print("===== End of Unhandled request =====")
     return Response('Not Found', status=404)
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run
