@@ -24,7 +24,7 @@ def get_existing_collections():
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
         collections = response.json().get('custom_collections', [])
-        return {c['title']: c['id'] for c in collections}
+        return {c['handle']: c['id'] for c in collections}
     logging.error(f"Failed to fetch existing collections: {response.status_code} - {response.text}")
     return {}
 
@@ -67,10 +67,10 @@ def post_productgroup():
         for pg in root.findall("productgroup"):
             group_id = pg.find("id").text
             title = pg.find("description").text
-            handle = f"group-{group_id}"
+            handle = f"group-{group_id}".lower().replace(" ", "-")
 
-            if title in existing_collections:
-                logging.info(f"Collection '{title}' already exists in Shopify.")
+            if handle in existing_collections:
+                logging.info(f"Collection with handle '{handle}' already exists in Shopify.")
             else:
                 created = create_collection(title, handle)
                 if created:
