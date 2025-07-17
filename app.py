@@ -61,6 +61,12 @@ def receive_product2():
 @app.route('/<path:path>', methods=['GET', 'POST'])
 def catch_all(path):
     print(f"Unhandled request to path: /{path}")
+    
+    if request.method == 'POST':
+        print("===== POST BODY =====")
+        print(request.data.decode('utf-8', errors='replace'))
+        print("=====================")
+        
     return Response('Not Found', status=404)
 
 
