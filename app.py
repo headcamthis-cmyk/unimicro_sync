@@ -10,16 +10,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 SHOPIFY_DOMAIN = 'allsupermotoas.myshopify.com'
 SHOPIFY_TOKEN = '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'
 SHOPIFY_API_VERSION = '2024-10'
-
+SHOPIFY_LOCATION_ID = '<YOUR_SHOPIFY_LOCATION_ID>'
 
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
 
-
 @app.route('/')
 def index():
     return "Uni Micro Sync API is running."
-
 
 def get_existing_collections():
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
@@ -32,7 +30,6 @@ def get_existing_collections():
         collections = response.json().get('custom_collections', [])
         return {c['handle']: c['id'] for c in collections}
     return {}
-
 
 def create_collection(title, handle):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
@@ -51,7 +48,6 @@ def create_collection(title, handle):
         logging.info(f"Created collection: {title} (Handle: {handle})")
     else:
         logging.warning(f"Failed to create collection {title}: {response.status_code} - {response.text}")
-
 
 def create_product(title, sku, price):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
@@ -74,7 +70,6 @@ def create_product(title, sku, price):
     logging.warning(f"Failed to create product: {response.status_code} - {response.text}")
     return None
 
-
 def assign_product_to_collection(product_id, collection_id):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/collects.json"
     headers = {
@@ -92,7 +87,6 @@ def assign_product_to_collection(product_id, collection_id):
         logging.info(f"Assigned product {product_id} to collection {collection_id}")
     else:
         logging.warning(f"Failed to assign product to collection: {response.status_code} - {response.text}")
-
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def post_productgroup():
@@ -126,7 +120,6 @@ def post_productgroup():
         return Response('<response>Error processing XML</response>', mimetype='text/xml')
 
     return Response('<response>OK</response>', mimetype='text/xml')
-
 
 @app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
 def post_product():
@@ -186,11 +179,81 @@ def post_product():
 
     return Response('<response>OK</response>', mimetype='text/xml')
 
+@app.route('/product/twinxml/updatestock.aspx', methods=['POST'])
+def update_stock():
+    username = request.args.get('user')
+    password = request.args.get('pass')
+
+    if not is_authenticated(username, password):
+        return Response('Unauthorized', status=401)
+
+    try:
+        xml_data = request.data.decode('utf-8', errors='replace')
+        logging.info("Authorized stock update POST received.")
+        logging.info(f"Stock XML:\n{xml_data}")
+
+        root = ET.fromstring(xml_data)
+
+        for product in root.findall("product"):
+            sku_elem = product.find("productno") or product.find("productident")
+            quantity_elem = product.find("quantityonhand")
+
+            if None in (sku_elem, quantity_elem):
+                logging.warning("Skipping stock update due to missing field(s):")
+                if sku_elem is None:
+                    logging.warning(" - Missing <productno> or <productident>")
+                if quantity_elem is None:
+                    logging.warning(" - Missing <quantityonhand>")
+                continue
+
+            sku = sku_elem.text
+            quantity = int(float(quantity_elem.text.replace(',', '.')))
+
+            logging.info(f"Updating stock for SKU={sku} to quantity={quantity}")
+
+            update_product_inventory(sku, quantity)
+
+    except Exception as e:
+        logging.error(f"Failed to process stock XML: {e}")
+        return Response('<response>Error processing stock XML</response>', mimetype='text/xml')
+
+    return Response('<response>OK</response>', mimetype='text/xml')
+
+def update_product_inventory(sku, quantity):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json?fields=id,variants"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        products = response.json().get('products', [])
+        for product in products:
+            for variant in product.get('variants', []):
+                if variant.get('sku') == sku:
+                    variant_id = variant['id']
+                    inventory_item_id = variant['inventory_item_id']
+
+                    inventory_url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json"
+                    data = {
+                        "location_id": SHOPIFY_LOCATION_ID,
+                        "inventory_item_id": inventory_item_id,
+                        "available": quantity
+                    }
+                    inv_response = requests.post(inventory_url, json=data, headers=headers)
+                    if inv_response.status_code in [200, 201]:
+                        logging.info(f"Stock updated for SKU={sku} to quantity={quantity}")
+                    else:
+                        logging.warning(f"Failed to update stock for SKU={sku}: {inv_response.status_code} - {inv_response.text}")
+                    return
+        logging.warning(f"SKU {sku} not found in Shopify.")
+    else:
+        logging.error(f"Failed to fetch products from Shopify: {response.status_code} - {response.text}")
 
 @app.route('/product/twinxml/orders.aspx', methods=['GET'])
 def get_orders():
     return Response('<response>No orders processing implemented</response>', mimetype='text/xml')
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
