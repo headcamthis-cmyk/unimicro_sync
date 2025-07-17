@@ -3,7 +3,6 @@ import logging
 import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime
-import time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -22,7 +21,6 @@ def index():
     return "Uni Micro Sync API is running."
 
 
-
 def get_existing_collections():
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
     headers = {
@@ -34,6 +32,25 @@ def get_existing_collections():
         collections = response.json().get('custom_collections', [])
         return {c['handle']: c['id'] for c in collections}
     return {}
+
+
+def create_collection(title, handle):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "custom_collection": {
+            "title": title,
+            "handle": handle
+        }
+    }
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code in [200, 201]:
+        logging.info(f"Created collection: {title} (Handle: {handle})")
+    else:
+        logging.warning(f"Failed to create collection {title}: {response.status_code} - {response.text}")
 
 
 def create_product(title, sku, price):
@@ -77,6 +94,40 @@ def assign_product_to_collection(product_id, collection_id):
         logging.warning(f"Failed to assign product to collection: {response.status_code} - {response.text}")
 
 
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+def post_productgroup():
+    username = request.args.get('user')
+    password = request.args.get('pass')
+
+    if not is_authenticated(username, password):
+        return Response('Unauthorized', status=401)
+
+    try:
+        xml_data = request.data.decode('utf-8', errors='replace')
+        logging.info("Authorized productgroup POST received.")
+        logging.info(f"Product Group XML:\n{xml_data}")
+
+        root = ET.fromstring(xml_data)
+        existing_collections = get_existing_collections()
+
+        for pg in root.findall("productgroup"):
+            group_id = pg.find("id").text
+            title = pg.find("description").text
+            handle = f"group-{group_id}".lower().replace(" ", "-")
+
+            if handle in existing_collections:
+                logging.info(f"Collection with handle '{handle}' already exists. Skipping creation.")
+                continue
+
+            create_collection(title, handle)
+
+    except Exception as e:
+        logging.error(f"Failed to process product group XML: {e}")
+        return Response('<response>Error processing XML</response>', mimetype='text/xml')
+
+    return Response('<response>OK</response>', mimetype='text/xml')
+
+
 @app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
 def post_product():
     username = request.args.get('user')
@@ -112,6 +163,11 @@ def post_product():
         return Response('<response>Error processing XML</response>', mimetype='text/xml')
 
     return Response('<response>OK</response>', mimetype='text/xml')
+
+
+@app.route('/product/twinxml/orders.aspx', methods=['GET'])
+def get_orders():
+    return Response('<response>No orders processing implemented</response>', mimetype='text/xml')
 
 
 if __name__ == '__main__':
