@@ -29,6 +29,11 @@ def get_existing_collections():
     return {}
 
 def create_collection(title, handle):
+    existing_collections = get_existing_collections()
+    if handle in existing_collections:
+        logging.info(f"Collection with handle '{handle}' already exists. Skipping creation.")
+        return False
+
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/2023-01/custom_collections.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -53,7 +58,7 @@ def create_collection(title, handle):
             logging.info(f"Successfully created Shopify collection: {title}")
             return True
         else:
-            logging.error(f"Failed to create collection: {response.status_code} - {response.text}")
+            logging.warning(f"Unexpected response while creating collection: {response.status_code} - {response.text}")
             return False
     except Exception as e:
         logging.error(f"Exception when creating collection: {e}")
@@ -74,22 +79,17 @@ def post_productgroup():
         logging.info("Authorized productgroup POST received.")
         logging.info(f"Product Group XML:\n{xml_data}")
 
-        existing_collections = get_existing_collections()
-
         root = ET.fromstring(xml_data)
         for pg in root.findall("productgroup"):
             group_id = pg.find("id").text
             title = pg.find("description").text
             handle = f"group-{group_id}".lower().replace(" ", "-")
 
-            if handle in existing_collections:
-                logging.info(f"Collection with handle '{handle}' already exists in Shopify.")
+            created = create_collection(title, handle)
+            if created:
+                logging.info(f"Created Shopify collection for product group: {title}")
             else:
-                created = create_collection(title, handle)
-                if created:
-                    logging.info(f"Created Shopify collection for product group: {title}")
-                else:
-                    logging.warning(f"Failed to create collection for product group: {title}")
+                logging.info(f"Collection for product group '{title}' was not created (it may already exist).")
 
     except Exception as e:
         logging.error(f"Failed to process product group XML: {e}")
