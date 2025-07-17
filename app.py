@@ -5,7 +5,7 @@ import datetime
 import secrets
 
 USERNAME = 'synall'
-PASSWORD = 'your_password_here'  # Replace with the actual password
+PASSWORD = 'synall'  # Replace with the actual password
 
 app = Flask(__name__)
 
