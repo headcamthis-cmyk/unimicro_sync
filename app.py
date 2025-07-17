@@ -153,7 +153,7 @@ def post_product():
             if None in (sku_elem, title_elem, price_elem, group_elem):
                 logging.warning("Skipping product due to missing field(s):")
                 if sku_elem is None:
-                    logging.warning(" - Missing <productno>")
+                    logging.warning(" - Missing <productno> or <productident>")
                 if title_elem is None:
                     logging.warning(" - Missing <description>")
                 if price_elem is None:
