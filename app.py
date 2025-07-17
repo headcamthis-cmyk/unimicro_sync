@@ -19,6 +19,11 @@ def receive_xml():
 
     xml_data = request.data.decode('utf-8')
 
+    # Log the entire XML content
+    print("===== START OF XML DATA =====")
+    print(xml_data)
+    print("===== END OF XML DATA =====")
+
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f'unimicro_feed_{timestamp}.xml'
 
