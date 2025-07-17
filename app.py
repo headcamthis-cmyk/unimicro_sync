@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, abort
+from flask import Flask, request, Response
 import os
 import datetime
 import secrets
@@ -44,6 +44,16 @@ def receive_product():
 
     xml_data = request.data.decode('utf-8', errors='replace')
     save_and_log_xml(xml_data, 'PRODUCT')
+    return Response('<response>OK</response>', mimetype='application/xml')
+
+
+@app.route('/product/twinxml/postproduct2.aspx', methods=['POST'])
+def receive_product2():
+    if not is_authenticated():
+        return Response('Unauthorized', status=401)
+
+    xml_data = request.data.decode('utf-8', errors='replace')
+    save_and_log_xml(xml_data, 'PRODUCT2')
     return Response('<response>OK</response>', mimetype='application/xml')
 
 
