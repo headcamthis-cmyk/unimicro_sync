@@ -1,5 +1,4 @@
 from flask import Flask, request, Response, abort
-from functools import wraps
 import os
 import datetime
 import secrets
@@ -9,29 +8,42 @@ PASSWORD = 'synall'  # Replace with the actual password
 
 app = Flask(__name__)
 
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
-def receive_xml():
+def is_authenticated():
     user = request.args.get('user')
     passwd = request.args.get('pass')
+    return user == USERNAME and passwd == PASSWORD
 
-    if user != USERNAME or passwd != PASSWORD:
-        return Response('Unauthorized', status=401)
-
-    xml_data = request.data.decode('utf-8')
-
-    # Log the entire XML content
-    print("===== START OF XML DATA =====")
+def save_and_log_xml(xml_data, label):
+    print(f"===== START OF {label} XML =====")
     print(xml_data)
-    print("===== END OF XML DATA =====")
+    print(f"===== END OF {label} XML =====")
 
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'unimicro_feed_{timestamp}.xml'
+    filename = f'unimicro_{label.lower()}_feed_{timestamp}.xml'
 
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(xml_data)
 
-    print(f'XML feed saved as {filename}')
+    print(f'{label} XML feed saved as {filename}')
 
+
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+def receive_productgroup():
+    if not is_authenticated():
+        return Response('Unauthorized', status=401)
+
+    xml_data = request.data.decode('utf-8', errors='replace')
+    save_and_log_xml(xml_data, 'PRODUCTGROUP')
+    return Response('<response>OK</response>', mimetype='application/xml')
+
+
+@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+def receive_product():
+    if not is_authenticated():
+        return Response('Unauthorized', status=401)
+
+    xml_data = request.data.decode('utf-8', errors='replace')
+    save_and_log_xml(xml_data, 'PRODUCT')
     return Response('<response>OK</response>', mimetype='application/xml')
 
 
