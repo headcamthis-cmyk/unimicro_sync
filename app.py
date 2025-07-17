@@ -35,12 +35,16 @@ def save_xml(data, prefix):
     return filename
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
-@requires_auth
 def post_productgroup():
-    xml_data = request.data
-    filename = save_xml(xml_data, 'productgroup_feed')
-    print(f'PRODUCTGROUP XML saved as {filename}')
-    return '<response>OK</response>'
+    user = request.args.get('user')
+    password = request.args.get('pass')
+
+    if user == 'synall' and password == 'synall':
+        print("Authorized productgroup POST received.")
+        return Response("<response>OK</response>", mimetype='application/xml')
+    else:
+        print("Unauthorized access attempt to productgroup endpoint.")
+        return Response("Unauthorized", status=401)
 
 @app.route('/product/postproduct2.aspx', methods=['POST'])
 @requires_auth
