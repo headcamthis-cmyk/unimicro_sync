@@ -36,7 +36,7 @@ def post_productgroup():
 def post_product():
     username = request.args.get('user')
     password = request.args.get('pass')
-    logging.info(f"Incoming request to /product/twinxml/postproduct2.aspx with user={username}")
+    logging.info(f"Incoming request to /product/twinxml/postproduct.aspx with user={username}")
 
     if not is_authenticated(username, password):
         logging.warning(f"Unauthorized attempt on product endpoint with user={username}")
