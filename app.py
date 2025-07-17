@@ -38,13 +38,26 @@ def create_collection(title, handle):
     data = {
         "custom_collection": {
             "title": title,
-            "handle": handle.lower().replace(" ", "-")
+            "handle": handle.lower().replace(" ", "-"),
+            "published": True
         }
     }
 
-    response = requests.post(url, json=data, headers=headers)
-    logging.info(f"Shopify API create collection response: {response.status_code} - {response.text}")
-    return response.status_code == 201 or response.status_code == 200
+    logging.info(f"Attempting to create Shopify collection with data: {data}")
+
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        logging.info(f"Shopify API create collection response: {response.status_code} - {response.text}")
+
+        if response.status_code == 201:
+            logging.info(f"Successfully created Shopify collection: {title}")
+            return True
+        else:
+            logging.error(f"Failed to create collection: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Exception when creating collection: {e}")
+        return False
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def post_productgroup():
