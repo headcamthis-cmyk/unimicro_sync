@@ -11,12 +11,15 @@ SHOPIFY_DOMAIN = 'allsupermotoas.myshopify.com'
 SHOPIFY_TOKEN = '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'
 SHOPIFY_API_VERSION = '2024-10'
 
+
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
+
 
 @app.route('/')
 def index():
     return "Uni Micro Sync API is running."
+
 
 def get_existing_collections():
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
@@ -29,6 +32,7 @@ def get_existing_collections():
         collections = response.json().get('custom_collections', [])
         return {c['handle']: c['id'] for c in collections}
     return {}
+
 
 def create_collection(title, handle):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
@@ -47,6 +51,7 @@ def create_collection(title, handle):
         logging.info(f"Created collection: {title} (Handle: {handle})")
     else:
         logging.warning(f"Failed to create collection {title}: {response.status_code} - {response.text}")
+
 
 def create_product(title, sku, price):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
@@ -69,6 +74,7 @@ def create_product(title, sku, price):
     logging.warning(f"Failed to create product: {response.status_code} - {response.text}")
     return None
 
+
 def assign_product_to_collection(product_id, collection_id):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/collects.json"
     headers = {
@@ -86,6 +92,7 @@ def assign_product_to_collection(product_id, collection_id):
         logging.info(f"Assigned product {product_id} to collection {collection_id}")
     else:
         logging.warning(f"Failed to assign product to collection: {response.status_code} - {response.text}")
+
 
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
 def post_productgroup():
@@ -119,6 +126,7 @@ def post_productgroup():
         return Response('<response>Error processing XML</response>', mimetype='text/xml')
 
     return Response('<response>OK</response>', mimetype='text/xml')
+
 
 @app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
 def post_product():
@@ -159,6 +167,8 @@ def post_product():
             price = price_elem.text
             group_id = group_elem.text
 
+            logging.info(f"Parsed product: SKU={sku}, Title={title}, Price={price}, Group ID={group_id}")
+
             handle = f"group-{group_id}".lower().replace(" ", "-")
             collection_id = collections.get(handle)
 
@@ -176,9 +186,11 @@ def post_product():
 
     return Response('<response>OK</response>', mimetype='text/xml')
 
+
 @app.route('/product/twinxml/orders.aspx', methods=['GET'])
 def get_orders():
     return Response('<response>No orders processing implemented</response>', mimetype='text/xml')
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
