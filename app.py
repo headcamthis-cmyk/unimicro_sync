@@ -49,6 +49,23 @@ def create_collection(title, handle):
     else:
         logging.warning(f"Failed to create collection {title}: {response.status_code} - {response.text}")
 
+def find_product_by_sku(sku):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json?limit=250"
+    headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        products = response.json().get('products', [])
+        for product in products:
+            for variant in product.get('variants', []):
+                if variant['sku'] == sku:
+                    return {
+                        "product_id": product['id'],
+                        "variant_id": variant['id'],
+                        "inventory_item_id": variant['inventory_item_id'],
+                        "current_price": variant['price']
+                    }
+    return None
+
 def create_product(title, sku, price):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
     headers = {
@@ -72,6 +89,16 @@ def create_product(title, sku, price):
         return product['id'], variant['inventory_item_id']
     logging.warning(f"Failed to create product: {response.status_code} - {response.text}")
     return None, None
+
+def update_product_price(variant_id, new_price):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/variants/{variant_id}.json"
+    headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN}
+    data = {"variant": {"id": variant_id, "price": new_price}}
+    response = requests.put(url, json=data, headers=headers)
+    if response.status_code == 200:
+        logging.info(f"Updated price for variant {variant_id} to {new_price}")
+    else:
+        logging.warning(f"Failed to update price for variant {variant_id}: {response.status_code} - {response.text}")
 
 def assign_product_to_collection(product_id, collection_id):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/collects.json"
@@ -150,11 +177,19 @@ def post_product():
                 logging.warning(f"No collection found for group ID {group_id} (handle: {handle}). Skipping product {sku}.")
                 continue
 
-            product_id, inventory_item_id = create_product(title, sku, price)
-            if product_id:
-                assign_product_to_collection(product_id, collection_id)
-            if inventory_item_id:
-                update_inventory_level(inventory_item_id, quantity)
+            existing_product = find_product_by_sku(sku)
+            if existing_product:
+                logging.info(f"Product with SKU {sku} exists, checking for updates.")
+                if str(existing_product['current_price']) != str(price):
+                    update_product_price(existing_product['variant_id'], price)
+                update_inventory_level(existing_product['inventory_item_id'], quantity)
+                assign_product_to_collection(existing_product['product_id'], collection_id)
+            else:
+                product_id, inventory_item_id = create_product(title, sku, price)
+                if product_id:
+                    assign_product_to_collection(product_id, collection_id)
+                if inventory_item_id:
+                    update_inventory_level(inventory_item_id, quantity)
 
     except Exception as e:
         logging.error(f"Failed to process product XML: {e}")
