@@ -197,36 +197,120 @@ def post_product():
 
     return Response('<response>OK</response>', mimetype='text/xml')
 
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
-def post_productgroup():
+@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+def post_product():
     username = request.args.get('user')
     password = request.args.get('pass')
-
     if not is_authenticated(username, password):
         return Response('Unauthorized', status=401)
 
     try:
-        xml_data = request.data.decode('utf-8', errors='replace')
-        logging.info("Authorized productgroup POST received.")
-        logging.info(f"Product Group XML:\n{xml_data}")
+        raw = request.data  # keep bytes; let the XML parser handle declared encoding
+        logging.info("Authorized product POST received.")
+        logging.info(f"Request headers: {dict(request.headers)}")
 
-        root = ET.fromstring(xml_data)
-        existing_collections = get_existing_collections()
+        # Parse, tolerating utf-8/utf-16 and namespaces
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            # As a fallback, try decoding to utf-8 explicitly
+            root = ET.fromstring(raw.decode('utf-8', errors='replace'))
+            logging.warning(f"XML parsed after utf-8 fallback. Original error: {e}")
 
-        for pg in root.findall("productgroup"):
-            group_id = pg.find("id").text
-            title = pg.find("description").text
-            handle = f"group-{group_id}".lower().replace(" ", "-")
+        # Helper: case-insensitive tag fetch with multiple aliases
+        def gettext(node, *names):
+            for n in names:
+                # try exact, lowercase, and namespace-agnostic
+                el = node.find(n)
+                if el is None:
+                    el = node.find(n.lower())
+                if el is None:
+                    el = node.find(f".//{n}")  # in case of nested field
+                if el is not None and el.text is not None:
+                    t = el.text.strip()
+                    if t != "":
+                        return t
+            # namespace-insensitive scan
+            for child in node.iter():
+                tag = child.tag.split('}', 1)[-1].lower() if '}' in child.tag else child.tag.lower()
+                for n in names:
+                    if tag == n.lower():
+                        if child.text and child.text.strip():
+                            return child.text.strip()
+            return None
 
-            if handle in existing_collections:
-                logging.info(f"Collection with handle '{handle}' already exists. Skipping creation.")
+        # Preload collections once
+        collections = get_existing_collections()
+        logging.info(f"Loaded {len(collections)} collections for handle lookup")
+
+        total = 0
+        created = 0
+        updated = 0
+        skipped = 0
+
+        # Find all product nodes anywhere in the tree
+        for p in root.iter():
+            if p.tag.split('}', 1)[-1].lower() != 'product':
+                continue
+            total += 1
+
+            sku = gettext(p, "productno", "productident", "articleno", "itemno", "sku")
+            title = gettext(p, "description", "name", "title")
+            price = gettext(p, "price", "salesprice", "price1")
+            qty_text = gettext(p, "quantityonhand", "stock", "instock", "physicalstock", "qty")
+            group_id = gettext(p, "productgroup", "productgroupno", "groupno", "groupid", "pgid", "qvalue")
+
+            # Convert quantity safely
+            quantity = None
+            if qty_text is not None:
+                try:
+                    quantity = int(float(qty_text.replace(',', '.')))
+                except Exception:
+                    pass
+
+            # Log why we skip
+            missing = [k for k, v in {
+                "sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity
+            }.items() if v in (None, "")]
+            if missing:
+                skipped += 1
+                logging.warning(f"Skipping product due to missing field(s) {missing}. Raw children tags: {[c.tag for c in p]}")
                 continue
 
-            create_collection(title, handle)
+            # Collection handle
+            handle = f"group-{group_id}".lower().replace(" ", "-")
+            collection_id = collections.get(handle)
+            if not collection_id:
+                skipped += 1
+                logging.warning(f"Collection not found for handle '{handle}' (group_id={group_id}). Create group first or adjust mapping.")
+                continue
+
+            # Price normalization
+            price_norm = str(float(str(price).replace(',', '.')))
+
+            # Create or update
+            existing = find_product_by_sku(sku)
+            if existing:
+                if str(existing['current_price']) != price_norm:
+                    update_product_price(existing['variant_id'], price_norm)
+                if quantity is not None:
+                    update_inventory_level(existing['inventory_item_id'], quantity)
+                assign_product_to_collection(existing['product_id'], collection_id)
+                updated += 1
+            else:
+                product_id, inventory_item_id = create_product(title, sku, price_norm)
+                if product_id:
+                    assign_product_to_collection(product_id, collection_id)
+                if inventory_item_id and quantity is not None:
+                    update_inventory_level(inventory_item_id, quantity)
+                created += 1
+
+        logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
+        return Response('<response>OK</response>', mimetype='text/xml')
 
     except Exception as e:
-        logging.error(f"Failed to process product group XML: {e}")
-        return Response('<response>Error processing XML</response>', mimetype='text/xml')
+        logging.exception(f"Failed to process product XML: {e}")
+        return Response('<response>Error processing XML</response>', mimetype='text/xml', status=500)
 
     return Response('<response>OK</response>', mimetype='text/xml')
 
