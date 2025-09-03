@@ -7,19 +7,29 @@ import os
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# === Shopify config ===
+# -------- Shopify config --------
 SHOPIFY_DOMAIN = 'allsupermotoas.myshopify.com'
 SHOPIFY_TOKEN = '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'
 SHOPIFY_API_VERSION = '2024-10'
 SHOPIFY_LOCATION_ID = '16764928067'  # inventory location
 
-# === Helpers ===
+# -------- Utils --------
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
 
 def ok():
-    # Uni expects literally "OK"
     return Response('OK', mimetype='text/plain')
+
+@app.before_request
+def _log_every_request():
+    try:
+        logging.info(f"REQ {request.method} {request.path}?{request.query_string.decode(errors='ignore')}")
+    except Exception:
+        pass
+
+@app.route('/')
+def index():
+    return "Uni Micro Sync API is running."
 
 def shopify_headers(json=True):
     h = {"X-Shopify-Access-Token": SHOPIFY_TOKEN}
@@ -27,10 +37,27 @@ def shopify_headers(json=True):
         h["Content-Type"] = "application/json"
     return h
 
-@app.route('/')
-def index():
-    return "Uni Micro Sync API is running."
+def _parse_xml(raw_bytes, what="payload"):
+    try:
+        return ET.fromstring(raw_bytes)
+    except ET.ParseError as e:
+        logging.warning(f"{what}: primary parse failed ({e}); trying utf-8 fallback")
+        return ET.fromstring(raw_bytes.decode('utf-8', errors='replace'))
 
+def _gettext(node, *names):
+    # Try direct and nested; case- and namespace-tolerant
+    for n in names:
+        el = node.find(n) or node.find(n.lower()) or node.find(f".//{n}")
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()
+    for child in node.iter():
+        tag = child.tag.split('}', 1)[-1].lower()
+        for n in names:
+            if tag == n.lower() and child.text and child.text.strip():
+                return child.text.strip()
+    return None
+
+# -------- Shopify helpers --------
 def get_existing_collections():
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/custom_collections.json"
     r = requests.get(url, headers=shopify_headers())
@@ -49,7 +76,6 @@ def create_collection(title, handle):
         logging.warning(f"Create collection failed for {title}: {r.status_code} - {r.text}")
 
 def find_product_by_sku(sku):
-    # Simple: scan first 250 products. (Optimize later via /variants.json?sku=)
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json?limit=250"
     r = requests.get(url, headers=shopify_headers(json=False))
     if r.status_code == 200:
@@ -108,54 +134,32 @@ def assign_product_to_collection(product_id, collection_id):
 
 def update_inventory_level(inventory_item_id, quantity):
     url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json"
-    data = {
-        "location_id": SHOPIFY_LOCATION_ID,
-        "inventory_item_id": inventory_item_id,
-        "available": int(quantity)
-    }
+    data = {"location_id": SHOPIFY_LOCATION_ID, "inventory_item_id": inventory_item_id, "available": int(quantity)}
     r = requests.post(url, headers=shopify_headers(), json=data)
     if r.status_code in (200, 201):
         logging.info(f"Stock set inventory_item_id={inventory_item_id} -> {quantity}")
     else:
         logging.warning(f"Inventory update failed: {r.status_code} - {r.text}")
 
-# ---------- XML helpers ----------
-def _parse_xml(raw_bytes, what="payload"):
-    try:
-        return ET.fromstring(raw_bytes)
-    except ET.ParseError as e:
-        logging.warning(f"{what}: primary parse failed ({e}); trying utf-8 fallback")
-        return ET.fromstring(raw_bytes.decode('utf-8', errors='replace'))
-
-def _gettext(node, *names):
-    """Get first matching child text by any of the provided tag names (namespace/case tolerant)."""
-    for n in names:
-        el = node.find(n) or node.find(n.lower()) or node.find(f".//{n}")
-        if el is not None and el.text and el.text.strip():
-            return el.text.strip()
-    # namespace-insensitive scan
-    for child in node.iter():
-        tag = child.tag.split('}', 1)[-1].lower()
-        for n in names:
-            if tag == n.lower() and child.text and child.text.strip():
-                return child.text.strip()
-    return None
-
-# ---------- PRODUCTS ----------
-def _handle_postproduct():
-    username = request.args.get('user')
-    password = request.args.get('pass')
+# -------- Handlers (core logic reused by multiple routes) --------
+def _handle_product_post():
+    username = request.args.get('user'); password = request.args.get('pass')
     if not is_authenticated(username, password):
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
-    logging.info(f"Product POST path={request.path} headers={dict(request.headers)}")
     root = _parse_xml(raw, "product xml")
-
     collections = get_existing_collections()
     logging.info(f"Loaded {len(collections)} collections")
 
     total = created = updated = skipped = 0
+
+    # Optional visibility: how many <product> nodes?
+    count_products = 0
+    for node in root.iter():
+        if node.tag.split('}', 1)[-1].lower() == 'product':
+            count_products += 1
+    logging.info(f"Detected {count_products} <product> nodes")
 
     for p in root.iter():
         if p.tag.split('}', 1)[-1].lower() != 'product':
@@ -168,20 +172,15 @@ def _handle_postproduct():
         qty_text = _gettext(p, "quantityonhand", "stock", "instock", "physicalstock", "qty")
         group_id = _gettext(p, "productgroup", "productgroupno", "groupno", "groupid", "pgid", "qvalue")
 
-        # normalize qty
         quantity = None
         if qty_text is not None:
-            try:
-                quantity = int(float(qty_text.replace(',', '.')))
-            except Exception:
-                quantity = None
+            try: quantity = int(float(qty_text.replace(',', '.')))
+            except Exception: quantity = None
 
-        missing = [k for k, v in {
-            "sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity
-        }.items() if v in (None, "")]
+        missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity}.items() if v in (None, "")]
         if missing:
             skipped += 1
-            logging.warning(f"Skipping product; missing {missing}. Child tags: {[c.tag for c in p]}")
+            logging.warning(f"Skipping product; missing {missing}. Children: {[c.tag for c in p]}")
             continue
 
         handle = f"group-{group_id}".lower().replace(" ", "-")
@@ -206,8 +205,7 @@ def _handle_postproduct():
             updated += 1
         else:
             product_id, inventory_item_id = create_product(title, sku, price_norm)
-            if product_id:
-                assign_product_to_collection(product_id, collection_id)
+            if product_id: assign_product_to_collection(product_id, collection_id)
             if inventory_item_id is not None and quantity is not None:
                 update_inventory_level(inventory_item_id, quantity)
             created += 1
@@ -215,21 +213,12 @@ def _handle_postproduct():
     logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
     return ok()
 
-# Register both prefixed and root-level routes
-@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
-@app.route('/postproduct.aspx', methods=['POST'])
-def postproduct_router():
-    return _handle_postproduct()
-
-# ---------- PRODUCT GROUPS (Collections) ----------
-def _handle_postproductgroup():
-    username = request.args.get('user')
-    password = request.args.get('pass')
+def _handle_productgroup_post():
+    username = request.args.get('user'); password = request.args.get('pass')
     if not is_authenticated(username, password):
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
-    logging.info(f"ProductGroup POST path={request.path}")
     root = _parse_xml(raw, "product group xml")
 
     existing = get_existing_collections()
@@ -251,50 +240,75 @@ def _handle_postproductgroup():
 
     return ok()
 
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
-@app.route('/postproductgroup.aspx', methods=['POST'])
-def postproductgroup_router():
-    return _handle_postproductgroup()
-
-# ---------- IMAGES ----------
-def _handle_postfiles():
-    username = request.args.get('user')
-    password = request.args.get('pass')
+def _handle_files_post():
+    username = request.args.get('user'); password = request.args.get('pass')
     if not is_authenticated(username, password):
         return Response('Unauthorized', status=401)
-
     try:
         if 'file' in request.files:
             f = request.files['file']
             blob = f.read()
             sku = request.form.get('productno') or request.form.get('articleno') or request.form.get('itemno') or ''
             logging.info(f"Image received path={request.path} for SKU '{sku}': filename={f.filename}, size={len(blob)} bytes")
-            # TODO: attach to Shopify product images
+            # TODO: attach to Shopify product image
         else:
             raw = request.get_data()
             logging.info(f"Image upload (no multipart) path={request.path} size={len(raw)} bytes")
         return ok()
     except Exception as e:
-        logging.exception(f"postfiles.aspx failed: {e}")
+        logging.exception(f"postfiles failed: {e}")
         return Response('ERROR', mimetype='text/plain', status=500)
 
-@app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
-@app.route('/postfiles.aspx', methods=['POST'])
-def postfiles_router():
-    return _handle_postfiles()
+# -------- Route aliases --------
+# Per Uni docs, twinxml is appended automatically and default names are .asp (but can be .aspx). Support all combos. :contentReference[oaicite:2]{index=2}
 
-# ---------- STATUS ----------
-@app.route('/product/twinxml/status.aspx', methods=['GET', 'POST'])
+# PRODUCTS
+@app.route('/twinxml/postproduct.asp', methods=['POST'])
+@app.route('/twinxml/postproduct.aspx', methods=['POST'])
+@app.route('/postproduct.asp', methods=['POST'])
+@app.route('/postproduct.aspx', methods=['POST'])
+@app.route('/product/twinxml/postproduct.asp', methods=['POST'])
+@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+def postproduct_router():
+    return _handle_product_post()
+
+# PRODUCT GROUPS
+@app.route('/twinxml/postproductgroup.asp', methods=['POST'])
+@app.route('/twinxml/postproductgroup.aspx', methods=['POST'])
+@app.route('/postproductgroup.asp', methods=['POST'])
+@app.route('/postproductgroup.aspx', methods=['POST'])
+@app.route('/product/twinxml/postproductgroup.asp', methods=['POST'])
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+def postproductgroup_router():
+    return _handle_productgroup_post()
+
+# FILES / IMAGES
+@app.route('/twinxml/postfiles.asp', methods=['POST'])
+@app.route('/twinxml/postfiles.aspx', methods=['POST'])
+@app.route('/postfiles.asp', methods=['POST'])
+@app.route('/postfiles.aspx', methods=['POST'])
+@app.route('/product/twinxml/postfiles.asp', methods=['POST'])
+@app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
+def postfiles_router():
+    return _handle_files_post()
+
+# STATUS
+@app.route('/twinxml/status.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/status.aspx', methods=['GET', 'POST'])
+@app.route('/status.asp', methods=['GET', 'POST'])
 @app.route('/status.aspx', methods=['GET', 'POST'])
+@app.route('/product/twinxml/status.asp', methods=['GET', 'POST'])
+@app.route('/product/twinxml/status.aspx', methods=['GET', 'POST'])
 def status():
     return ok()
 
-# ---------- ORDERS placeholder ----------
-@app.route('/product/twinxml/orders.aspx', methods=['GET'])
-@app.route('/orders.aspx', methods=['GET'])
-def get_orders():
+# ORDERS placeholder (still “OK”)
+@app.route('/twinxml/orders.asp', methods=['GET', 'POST'])
+@app.route('/orders.asp', methods=['GET', 'POST'])
+@app.route('/product/twinxml/orders.asp', methods=['GET', 'POST'])
+def orders():
     return ok()
 
-# ---------- Entrypoint ----------
+# Entrypoint
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
