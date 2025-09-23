@@ -226,37 +226,44 @@ def _handle_productgroup_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
-    # Some UM calls do a GET or send empty bodies as a probe. Reply success with zero processed.
+    # UM sometimes probes with GET / empty body — still return a non-zero OK so it continues.
     if request.method == 'GET' or not raw or not raw.strip():
-        return Response('OK:0\r\n', mimetype='text/plain; charset=windows-1252')
+        logging.info("ProductGroup probe/empty payload -> replying OK:1")
+        return Response('OK:1\r\n', mimetype='text/plain; charset=windows-1252')
 
     root = _parse_xml(raw, "product group xml")
 
-    processed = 0
+    found = 0        # groups present in payload
+    created = 0      # groups we actually created in Shopify
     existing = get_existing_collections()
 
-    # accept any casing/namespace and nested locations
     for node in root.iter():
         if node.tag.split('}', 1)[-1].lower() != 'productgroup':
             continue
+        found += 1
 
         gid_el   = node.find('id') or node.find('groupno') or node.find('qvalue')
         title_el = node.find('description') or node.find('name') or node.find('title')
-        if not (gid_el is not None and title_el is not None and gid_el.text and title_el.text):
+        if not (gid_el is not None and gid_el.text and title_el is not None and title_el.text):
+            logging.warning("Skipping productgroup; missing id/description")
             continue
 
         group_id = gid_el.text.strip()
         title    = title_el.text.strip()
         handle   = f"group-{group_id}".lower().replace(" ", "-")
 
-        if handle not in existing:
-            create_collection(title, handle)
-            processed += 1
-            # keep our cache current so duplicates in same payload don't re-create
-            existing[handle] = True
+        if handle in existing:
+            logging.info(f"Collection '{handle}' already exists. Skipping create.")
+            continue
 
-    # UM likes an explicit "OK:<count>" success token
-    return Response(f'OK:{processed}\r\n', mimetype='text/plain; charset=windows-1252')
+        create_collection(title, handle)
+        existing[handle] = True
+        created += 1
+
+    # UM expects a positive number here; use groups *present* in payload.
+    resp_count = found or created or 1
+    logging.info(f"ProductGroup reply OK:{resp_count} (found={found}, created={created})")
+    return Response(f'OK:{resp_count}\r\n', mimetype='text/plain; charset=windows-1252')
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
