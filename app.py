@@ -226,15 +226,15 @@ def _handle_productgroup_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
-    # UM sometimes probes with GET / empty body — still return a non-zero OK so it continues.
+    # UM sometimes probes with GET or empty bodies. Return a positive OK so it continues.
     if request.method == 'GET' or not raw or not raw.strip():
         logging.info("ProductGroup probe/empty payload -> replying OK:1")
         return Response('OK:1\r\n', mimetype='text/plain; charset=windows-1252')
 
     root = _parse_xml(raw, "product group xml")
 
-    found = 0        # groups present in payload
-    created = 0      # groups we actually created in Shopify
+    found = 0
+    created = 0
     existing = get_existing_collections()
 
     for node in root.iter():
@@ -242,25 +242,28 @@ def _handle_productgroup_post():
             continue
         found += 1
 
-        gid_el   = node.find('id') or node.find('groupno') or node.find('qvalue')
-        title_el = node.find('description') or node.find('name') or node.find('title')
-        if not (gid_el is not None and gid_el.text and title_el is not None and title_el.text):
-            logging.warning("Skipping productgroup; missing id/description")
+        # tolerant: look for child tags in any case OR attributes on the node
+        group_id = (
+            _gettext(node, "id", "groupno", "groupid", "qvalue", "no")
+            or next((node.attrib[k] for k in ("id", "groupno", "groupid", "qvalue", "no") if k in node.attrib and node.attrib[k].strip()), None)
+        )
+        title = (
+            _gettext(node, "description", "name", "title")
+            or next((node.attrib[k] for k in ("description", "name", "title") if k in node.attrib and node.attrib[k].strip()), None)
+        )
+
+        if not group_id or not title:
+            logging.warning("Skipping productgroup; missing id/description (after tolerant lookup)")
             continue
 
-        group_id = gid_el.text.strip()
-        title    = title_el.text.strip()
-        handle   = f"group-{group_id}".lower().replace(" ", "-")
+        handle = f"group-{group_id.strip()}".lower().replace(" ", "-")
 
-        if handle in existing:
-            logging.info(f"Collection '{handle}' already exists. Skipping create.")
-            continue
+        if handle not in existing:
+            create_collection(title.strip(), handle)
+            existing[handle] = True
+            created += 1
 
-        create_collection(title, handle)
-        existing[handle] = True
-        created += 1
-
-    # UM expects a positive number here; use groups *present* in payload.
+    # Reply with a non-zero OK so UM proceeds to products.
     resp_count = found or created or 1
     logging.info(f"ProductGroup reply OK:{resp_count} (found={found}, created={created})")
     return Response(f'OK:{resp_count}\r\n', mimetype='text/plain; charset=windows-1252')
