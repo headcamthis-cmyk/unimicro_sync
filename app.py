@@ -174,8 +174,10 @@ def _handle_product_post():
 
         quantity = None
         if qty_text is not None:
-            try: quantity = int(float(qty_text.replace(',', '.')))
-            except Exception: quantity = None
+            try:
+                quantity = int(float(qty_text.replace(',', '.')))
+            except Exception:
+                quantity = None
 
         missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity}.items() if v in (None, "")]
         if missing:
@@ -205,7 +207,8 @@ def _handle_product_post():
             updated += 1
         else:
             product_id, inventory_item_id = create_product(title, sku, price_norm)
-            if product_id: assign_product_to_collection(product_id, collection_id)
+            if product_id:
+                assign_product_to_collection(product_id, collection_id)
             if inventory_item_id is not None and quantity is not None:
                 update_inventory_level(inventory_item_id, quantity)
             created += 1
@@ -260,9 +263,9 @@ def _handle_files_post():
         return Response('ERROR', mimetype='text/plain', status=500)
 
 # -------- Route aliases --------
-# Support .asp/.aspx and common path variants (including accidental double 'twinxml').
+# Accept .asp/.aspx and common path variants (including accidental double 'twinxml').
 
-# PRODUCTS
+# PRODUCTS (single product)
 @app.route('/twinxml/postproduct.asp', methods=['POST'])
 @app.route('/twinxml/postproduct.aspx', methods=['POST'])
 @app.route('/postproduct.asp', methods=['POST'])
@@ -272,6 +275,34 @@ def _handle_files_post():
 @app.route('/twinxml/twinxml/postproduct.asp', methods=['POST'])
 @app.route('/twinxml/twinxml/postproduct.aspx', methods=['POST'])
 def postproduct_router():
+    return _handle_product_post()
+
+# PRODUCTS (bulk / list variants → same handler)
+@app.route('/twinxml/productlist.asp', methods=['POST'])
+@app.route('/twinxml/productlist.aspx', methods=['POST'])
+@app.route('/productlist.asp', methods=['POST'])
+@app.route('/productlist.aspx', methods=['POST'])
+@app.route('/twinxml/postproductlist.asp', methods=['POST'])
+@app.route('/twinxml/postproductlist.aspx', methods=['POST'])
+@app.route('/postproductlist.asp', methods=['POST'])
+@app.route('/postproductlist.aspx', methods=['POST'])
+@app.route('/twinxml/products.asp', methods=['POST'])
+@app.route('/twinxml/products.aspx', methods=['POST'])
+@app.route('/products.asp', methods=['POST'])
+@app.route('/products.aspx', methods=['POST'])
+@app.route('/product/twinxml/productlist.asp', methods=['POST'])
+@app.route('/product/twinxml/productlist.aspx', methods=['POST'])
+@app.route('/product/twinxml/postproductlist.asp', methods=['POST'])
+@app.route('/product/twinxml/postproductlist.aspx', methods=['POST'])
+@app.route('/product/twinxml/products.asp', methods=['POST'])
+@app.route('/product/twinxml/products.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/productlist.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/productlist.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postproductlist.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postproductlist.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/products.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/products.aspx', methods=['POST'])
+def productlist_router():
     return _handle_product_post()
 
 # PRODUCT GROUPS
