@@ -227,29 +227,31 @@ def _handle_productgroup_post():
 
     raw = request.get_data()
     if request.method == 'GET' or not raw or not raw.strip():
-        logging.info("ProductGroup endpoint called with empty body/preflight; returning OK")
-        return ok()
+        # Preflight / no payload: say zero processed but OK
+        return Response('OK:0', mimetype='text/plain')
 
     root = _parse_xml(raw, "product group xml")
 
+    processed = 0
     existing = get_existing_collections()
-    for pg in root.findall(".//productgroup"):
-        gid_el = pg.find("id") or pg.find("groupno") or pg.find("qvalue")
-        title_el = pg.find("description")
-        if gid_el is None or title_el is None:
-            logging.warning(f"Skipping productgroup; missing id/description. Children: {[c.tag for c in pg]}")
+    for pg in root.iter():
+        tag = pg.tag.split('}', 1)[-1].lower()
+        if tag != 'productgroup':
             continue
 
-        group_id = gid_el.text.strip()
-        title = title_el.text.strip()
+        gid = (pg.find('id') or pg.find('groupno') or pg.find('qvalue'))
+        title = (pg.find('description') or pg.find('name') or pg.find('title'))
+        if not (gid is not None and gid.text and title is not None and title.text):
+            continue
+
+        group_id = gid.text.strip()
         handle = f"group-{group_id}".lower().replace(" ", "-")
+        if handle not in existing:
+            create_collection(title.text.strip(), handle)
+            processed += 1
 
-        if handle in existing:
-            logging.info(f"Collection '{handle}' already exists. Skipping.")
-            continue
-        create_collection(title, handle)
-
-    return ok()
+    # Some UM builds like an explicit OK:count reply
+    return Response(f'OK:{processed}', mimetype='text/plain')
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
