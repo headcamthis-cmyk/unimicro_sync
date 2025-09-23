@@ -18,8 +18,8 @@ def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
 
 def ok_txt(body="OK"):
-    # UM is happiest with exact "OK" in text/plain (windows-1252). No XML, no counters.
-    return Response(body, mimetype="text/plain; charset=windows-1252")
+    # exact plain text + CRLF; UM can be picky about line endings
+    return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
 @app.before_request
 def _log_every_request():
@@ -95,7 +95,7 @@ def _get_from_extendedinfo(node, key_names: set):
 
     keys_lower = {k.lower() for k in key_names}
     for e in ext.iter():
-        attrs = { (k or '').lower(): (v.strip() if isinstance(v, str) else v) for k, v in e.attrib.items() }
+        attrs = {(k or '').lower(): (v.strip() if isinstance(v, str) else v) for k, v in e.attrib.items()}
         name = attrs.get('qname') or attrs.get('name') or attrs.get('key') or attrs.get('field') or attrs.get('id')
         if name and name.lower() in keys_lower:
             val = attrs.get('qvalue') or attrs.get('value') or (e.text.strip() if e.text else None)
@@ -300,7 +300,7 @@ def _handle_product_post():
             created += 1
 
     logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
-    return ok_txt()  # exact OK
+    return ok_txt()  # exact OK\r\n
 
 def _handle_productgroup_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -345,8 +345,9 @@ def _handle_productgroup_post():
             existing[handle] = True
             created += 1
 
-    logging.info(f"ProductGroup processed: found={found}, created={created}")
-    return ok_txt()  # exact OK
+    resp_count = found or created or 0
+    logging.info(f"ProductGroup processed: found={found}, created={created} -> replying 'OK:{resp_count}'")
+    return ok_txt(f"OK:{resp_count}")  # "OK:<count>\r\n"
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -365,7 +366,7 @@ def _handle_files_post():
         return ok_txt()
     except Exception as e:
         logging.exception(f"postfiles failed: {e}")
-        return Response('ERROR', mimetype='text/plain; charset=windows-1252', status=500)
+        return Response('ERROR\r\n', mimetype='text/plain; charset=windows-1252', status=500)
 
 # -------- Route aliases --------
 # PRODUCTS (single)
