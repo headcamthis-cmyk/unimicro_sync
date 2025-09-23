@@ -266,7 +266,7 @@ def _handle_files_post():
 # Accept .asp/.aspx and common path variants (including accidental double 'twinxml').
 
 # PRODUCTS (single product)
-@app.route('/twinxml/postproduct.asp', methods=['POST'])
+@app.route('/twinxml/postproduct.asp', methods=['GET', 'POST'])
 @app.route('/twinxml/postproduct.aspx', methods=['POST'])
 @app.route('/postproduct.asp', methods=['POST'])
 @app.route('/postproduct.aspx', methods=['POST'])
@@ -355,6 +355,47 @@ def _orders_ok_xml():
 @app.route('/twinxml/twinxml/orders.aspx', methods=['GET', 'POST'])
 def orders():
     return _orders_ok_xml()
+# ---- CATCH-ALL for surprise Uni Micro endpoints -----------------
+# Accept GET/POST and route anything that *looks like* products/articles/items to the product handler.
+# Also cover product groups, orders, and status as safe no-ops so UM doesn't abort.
+
+def _looks_like_product(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in [
+        "postproduct", "productlist", "products",
+        "postproductlist", "product",            # generic 'product'
+        "postarticle", "articles", "article",
+        "postitem", "items", "item",
+        "uploadproduct", "sendproduct", "exportproducts"
+    ])
+
+def _looks_like_group(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ["productgroup", "postproductgroup", "groups", "group"])
+
+@app.route('/twinxml/<path:name>.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/<path:name>.aspx', methods=['GET', 'POST'])
+@app.route('/product/twinxml/<path:name>.asp', methods=['GET', 'POST'])
+@app.route('/product/twinxml/<path:name>.aspx', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/<path:name>.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/<path:name>.aspx', methods=['GET', 'POST'])
+def twinxml_fallback(name):
+    try:
+        # Normalize and decide where to route
+        if _looks_like_product(name):
+            return _handle_product_post()
+        if _looks_like_group(name):
+            return _handle_productgroup_post()
+        n = name.lower()
+        if "order" in n:
+            return Response("<Orders/>", mimetype="text/xml")
+        if "status" in n:
+            return ok()
+    except Exception:
+        logging.exception(f"twinxml_fallback error for name='{name}'")
+
+    # Default: don't fail UM preflights
+    return ok()
 
 # Entrypoint
 if __name__ == '__main__':
