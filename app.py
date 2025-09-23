@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 
 # -------- Shopify config --------
 SHOPIFY_DOMAIN = 'allsupermotoas.myshopify.com'
-SHOPIFY_TOKEN = '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'
+SHOPIFY_TOKEN = os.environ.get('SHOPIFY_TOKEN', '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')
 SHOPIFY_API_VERSION = '2024-10'
 SHOPIFY_LOCATION_ID = '16764928067'  # inventory location
 
@@ -55,6 +55,28 @@ def _gettext(node, *names):
         for n in names:
             if tag == n.lower() and child.text and child.text.strip():
                 return child.text.strip()
+    return None
+
+def _get_from_node(node, names, attr_names=None):
+    """Return a value for any of the tag names OR attributes (case/namespace tolerant)."""
+    # child elements (any depth)
+    v = _gettext(node, *names)
+    if v:
+        return v
+    # attributes on matching child elements
+    if attr_names:
+        want = {n.lower() for n in names}
+        for child in node.iter():
+            tag = child.tag.split('}', 1)[-1].lower()
+            if tag in want:
+                for a in attr_names:
+                    if a in child.attrib and child.attrib[a].strip():
+                        return child.attrib[a].strip()
+    # attributes on the node itself
+    if attr_names:
+        for a in attr_names:
+            if a in node.attrib and node.attrib[a].strip():
+                return node.attrib[a].strip()
     return None
 
 # -------- Shopify helpers --------
@@ -141,91 +163,135 @@ def update_inventory_level(inventory_item_id, quantity):
     else:
         logging.warning(f"Inventory update failed: {r.status_code} - {r.text}")
 
-# -------- Handlers (core logic reused by multiple routes) --------
-def _get_from_node(node, names, attr_names=None):
-    # try child elements by name (any depth, any case)
-    v = _gettext(node, *names)
-    if v:
-        return v
-    # try attributes on matching child elements
-    if attr_names:
-        want = {n.lower() for n in names}
-        for child in node.iter():
-            tag = child.tag.split('}', 1)[-1].lower()
-            if tag in want:
-                for a in attr_names:
-                    if a in child.attrib and child.attrib[a].strip():
-                        return child.attrib[a].strip()
-    # try attributes on the product node itself
-    if attr_names:
-        for a in attr_names:
-            if a in node.attrib and node.attrib[a].strip():
-                return node.attrib[a].strip()
-    return None
+# -------- Handlers --------
+def _handle_product_post():
+    username = request.args.get('user'); password = request.args.get('pass')
+    if not is_authenticated(username, password):
+        return Response('Unauthorized', status=401)
 
-# inside _handle_product_post(), for each <product> p:
-sku = _get_from_node(p,
-    ["productno","productident","articleno","itemno","sku"],
-    ["id","no","sku"]
-)
-title = _get_from_node(p,
-    ["description","name","title"],
-    ["description","name","title"]
-)
-price = _get_from_node(p,
-    ["price","salesprice","price1","netprice"],
-    ["price","salesprice","netprice","value"]
-)
-qty_text = _get_from_node(p,
-    ["quantityonhand","quantity","stock","instock","physicalstock","qty"],
-    ["quantity","qty","stock","onhand","value"]
-)
-group_id = _get_from_node(p,
-    ["productgroup","productgroupno","groupno","groupid","pgid","qvalue"],
-    ["productgroup","groupno","groupid","pgid","qvalue"]
-)
+    raw = request.get_data()
+    if request.method == 'GET' or not raw or not raw.strip():
+        logging.info("Product endpoint called with empty body/preflight; returning OK")
+        return ok()
 
-quantity = None
-if qty_text not in (None, ""):
-    try:
-        quantity = int(float(str(qty_text).replace(',', '.')))
-    except Exception:
+    root = _parse_xml(raw, "product xml")
+    collections = get_existing_collections()
+    logging.info(f"Loaded {len(collections)} collections")
+
+    total = created = updated = skipped = 0
+
+    # Count products for visibility
+    count_products = 0
+    for node in root.iter():
+        if node.tag.split('}', 1)[-1].lower() == 'product':
+            count_products += 1
+    logging.info(f"Detected {count_products} <product> nodes")
+
+    for p in root.iter():
+        if p.tag.split('}', 1)[-1].lower() != 'product':
+            continue
+        total += 1
+
+        sku = _get_from_node(p, ["productno","productident","articleno","itemno","sku"], ["id","no","sku"])
+        title = _get_from_node(p, ["description","name","title"], ["description","name","title"])
+        price = _get_from_node(p, ["price","salesprice","price1","netprice"], ["price","salesprice","netprice","value"])
+        qty_text = _get_from_node(p, ["quantityonhand","quantity","stock","instock","physicalstock","qty"], ["quantity","qty","stock","onhand","value"])
+        group_id = _get_from_node(p, ["productgroup","productgroupno","groupno","groupid","pgid","qvalue"], ["productgroup","groupno","groupid","pgid","qvalue"])
+
+        # Quantity is optional
         quantity = None
+        if qty_text not in (None, ""):
+            try:
+                quantity = int(float(str(qty_text).replace(',', '.')))
+            except Exception:
+                quantity = None
 
-# only require SKU, title, price and group_id
-missing = [k for k, v in {
-    "sku": sku, "title": title, "price": price, "group_id": group_id
-}.items() if v in (None, "")]
-if missing:
-    skipped += 1
-    logging.warning(f"Skipping product; missing {missing}. Children: {[c.tag.split('}',1)[-1] for c in p]}")
-    continue
+        # Require only these fields
+        missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id}.items() if v in (None, "")]
+        if missing:
+            child_names = [c.tag.split('}',1)[-1] for c in p]
+            logging.warning(f"Skipping product; missing {missing}. Children: {child_names}")
+            skipped += 1
+            continue
+
+        handle = f"group-{str(group_id).strip()}".lower().replace(" ", "-")
+        collection_id = collections.get(handle)
+        if not collection_id:
+            logging.warning(f"No collection for handle '{handle}' (group_id={group_id}). Skipping SKU {sku}.")
+            skipped += 1
+            continue
+
+        # Normalize price
+        try:
+            price_norm = str(float(str(price).replace(',', '.')))
+        except Exception:
+            price_norm = str(price)
+
+        existing = find_product_by_sku(sku)
+        if existing:
+            if str(existing.get('current_price')) != price_norm:
+                update_product_price(existing['variant_id'], price_norm)
+            if quantity is not None:
+                update_inventory_level(existing['inventory_item_id'], quantity)
+            assign_product_to_collection(existing['product_id'], collection_id)
+            updated += 1
+        else:
+            product_id, inventory_item_id = create_product(title, sku, price_norm)
+            if product_id:
+                assign_product_to_collection(product_id, collection_id)
+            if inventory_item_id is not None and quantity is not None:
+                update_inventory_level(inventory_item_id, quantity)
+            created += 1
+
+    logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
+    return ok()
+
 def _handle_productgroup_post():
     username = request.args.get('user'); password = request.args.get('pass')
     if not is_authenticated(username, password):
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
+    # Return a positive OK even for probes/empty to let UM continue
+    if request.method == 'GET' or not raw or not raw.strip():
+        logging.info("ProductGroup probe/empty payload -> replying OK:1")
+        return Response('OK:1\r\n', mimetype='text/plain; charset=windows-1252')
+
     root = _parse_xml(raw, "product group xml")
 
+    found = 0
+    created = 0
     existing = get_existing_collections()
-    for pg in root.findall(".//productgroup"):
-        gid_el = pg.find("id") or pg.find("groupno") or pg.find("qvalue")
-        title_el = pg.find("description")
-        if gid_el is None or title_el is None:
-            logging.warning(f"Skipping productgroup; missing id/description. Children: {[c.tag for c in pg]}")
+
+    for node in root.iter():
+        if node.tag.split('}', 1)[-1].lower() != 'productgroup':
+            continue
+        found += 1
+
+        group_id = (
+            _gettext(node, "id","groupno","groupid","qvalue","no")
+            or next((node.attrib[k] for k in ("id","groupno","groupid","qvalue","no")
+                     if k in node.attrib and node.attrib[k].strip()), None)
+        )
+        title = (
+            _gettext(node, "description","name","title")
+            or next((node.attrib[k] for k in ("description","name","title")
+                     if k in node.attrib and node.attrib[k].strip()), None)
+        )
+
+        if not group_id or not title:
+            logging.warning("Skipping productgroup; missing id/description (after tolerant lookup)")
             continue
 
-        group_id = gid_el.text.strip()
-        title = title_el.text.strip()
-        handle = f"group-{group_id}".lower().replace(" ", "-")
+        handle = f"group-{group_id.strip()}".lower().replace(" ", "-")
+        if handle not in existing:
+            create_collection(title.strip(), handle)
+            existing[handle] = True
+            created += 1
 
-        if handle in existing:
-            logging.info(f"Collection '{handle}' already exists. Skipping.")
-            continue
-        create_collection(title, handle)
-
-    return ok()
+    resp_count = found or created or 1
+    logging.info(f"ProductGroup reply OK:{resp_count} (found={found}, created={created})")
+    return Response(f'OK:{resp_count}\r\n', mimetype='text/plain; charset=windows-1252')
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -247,25 +313,55 @@ def _handle_files_post():
         return Response('ERROR', mimetype='text/plain', status=500)
 
 # -------- Route aliases --------
-# Per Uni docs, twinxml is appended automatically and default names are .asp (but can be .aspx). Support all combos. :contentReference[oaicite:2]{index=2}
-
-# PRODUCTS
-@app.route('/twinxml/postproduct.asp', methods=['POST'])
-@app.route('/twinxml/postproduct.aspx', methods=['POST'])
-@app.route('/postproduct.asp', methods=['POST'])
-@app.route('/postproduct.aspx', methods=['POST'])
-@app.route('/product/twinxml/postproduct.asp', methods=['POST'])
-@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+# PRODUCTS (single)
+@app.route('/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproduct.aspx', methods=['GET','POST'])
+@app.route('/postproduct.asp', methods=['GET','POST'])
+@app.route('/postproduct.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproduct.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproduct.aspx', methods=['GET','POST'])
 def postproduct_router():
     return _handle_product_post()
 
+# PRODUCTS (bulk/list → same handler)
+@app.route('/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/productlist.asp', methods=['GET','POST'])
+@app.route('/productlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/postproductlist.asp', methods=['GET','POST'])
+@app.route('/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/twinxml/products.aspx', methods=['GET','POST'])
+@app.route('/products.asp', methods=['GET','POST'])
+@app.route('/products.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/products.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/products.aspx', methods=['GET','POST'])
+def productlist_router():
+    return _handle_product_post()
+
 # PRODUCT GROUPS
-@app.route('/twinxml/postproductgroup.asp', methods=['POST'])
-@app.route('/twinxml/postproductgroup.aspx', methods=['POST'])
-@app.route('/postproductgroup.asp', methods=['POST'])
-@app.route('/postproductgroup.aspx', methods=['POST'])
-@app.route('/product/twinxml/postproductgroup.asp', methods=['POST'])
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+@app.route('/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductgroup.aspx', methods=['GET','POST'])
 def postproductgroup_router():
     return _handle_productgroup_post()
 
@@ -276,26 +372,96 @@ def postproductgroup_router():
 @app.route('/postfiles.aspx', methods=['POST'])
 @app.route('/product/twinxml/postfiles.asp', methods=['POST'])
 @app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.aspx', methods=['POST'])
 def postfiles_router():
     return _handle_files_post()
 
 # STATUS
-@app.route('/twinxml/status.asp', methods=['GET', 'POST'])
-@app.route('/twinxml/status.aspx', methods=['GET', 'POST'])
-@app.route('/status.asp', methods=['GET', 'POST'])
-@app.route('/status.aspx', methods=['GET', 'POST'])
-@app.route('/product/twinxml/status.asp', methods=['GET', 'POST'])
-@app.route('/product/twinxml/status.aspx', methods=['GET', 'POST'])
+@app.route('/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/twinxml/status.aspx', methods=['GET','POST'])
+@app.route('/status.asp', methods=['GET','POST'])
+@app.route('/status.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/status.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/status.aspx', methods=['GET','POST'])
 def status():
     return ok()
 
-# ORDERS placeholder (still “OK”)
-@app.route('/twinxml/orders.asp', methods=['GET', 'POST'])
-@app.route('/orders.asp', methods=['GET', 'POST'])
-@app.route('/product/twinxml/orders.asp', methods=['GET', 'POST'])
+# ORDERS placeholder (return minimal XML so UM doesn’t abort)
+def _orders_ok_xml():
+    return Response("<Orders/>", mimetype="text/xml")
+
+@app.route('/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/twinxml/orders.aspx', methods=['GET','POST'])
+@app.route('/orders.asp', methods=['GET','POST'])
+@app.route('/orders.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/orders.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/orders.aspx', methods=['GET','POST'])
 def orders():
+    return _orders_ok_xml()
+
+# ---- Fallbacks to catch any odd paths/casing -------------------------------
+def _looks_like_product(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in [
+        "postproduct", "productlist", "products", "postproductlist", "product",
+        "postarticle", "articles", "article", "postitem", "items", "item",
+        "uploadproduct", "sendproduct", "exportproducts"
+    ])
+
+def _looks_like_group(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ["productgroup", "postproductgroup", "groups", "group"])
+
+@app.route('/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/twinxml/<path:name>.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/<path:name>.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/<path:name>.aspx', methods=['GET','POST'])
+def twinxml_fallback(name):
+    logging.info(f"FALLBACK hit name='{name}' method={request.method} len={request.content_length}")
+    try:
+        if _looks_like_product(name):
+            logging.info("→ Routing to _handle_product_post() from fallback")
+            return _handle_product_post()
+        if _looks_like_group(name):
+            logging.info("→ Routing to _handle_productgroup_post() from fallback")
+            return _handle_productgroup_post()
+        n = name.lower()
+        if "order" in n:
+            return _orders_ok_xml()
+        if "status" in n:
+            return ok()
+    except Exception:
+        logging.exception(f"twinxml_fallback error for name='{name}'")
     return ok()
 
-# Entrypoint
+# Super fallback (any path)
+@app.route('/<path:anything>', methods=['GET','POST'])
+def any_fallback(anything):
+    p = request.path
+    lower = p.lower()
+    logging.info(f"SUPER_FALLBACK hit path='{p}' method={request.method} len={request.content_length}")
+    try:
+        if _looks_like_product(lower):
+            logging.info("→ SUPER_FALLBACK routing to _handle_product_post()")
+            return _handle_product_post()
+        if _looks_like_group(lower):
+            logging.info("→ SUPER_FALLBACK routing to _handle_productgroup_post()")
+            return _handle_productgroup_post()
+        if "order" in lower:
+            return _orders_ok_xml()
+        if "status" in lower:
+            return ok()
+    except Exception:
+        logging.exception(f"any_fallback error for path='{p}'")
+    return ok()
+
+# Entrypoint (unused on gunicorn, harmless locally)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
