@@ -405,6 +405,40 @@ def twinxml_fallback(name):
     # Default: don't fail UM preflights
     return ok()
 
+# ----- SUPER FALLBACK (case-insensitive, catches any odd path) -------------
+@app.route('/<path:anything>', methods=['GET','POST'])
+def any_fallback(anything):
+    p = request.path
+    lower = p.lower()
+    logging.info(f"SUPER_FALLBACK hit path='{p}' method={request.method} len={request.content_length}")
+
+    try:
+        # Any product-ish endpoint -> product handler
+        if any(k in lower for k in [
+            "postproduct", "productlist", "products", "postproductlist", "product",
+            "postarticle", "articles", "article",
+            "postitem", "items", "item",
+            "uploadproduct", "sendproduct", "exportproducts"
+        ]):
+            logging.info("→ SUPER_FALLBACK routing to _handle_product_post()")
+            return _handle_product_post()
+
+        # Product group variants
+        if any(k in lower for k in ["productgroup", "postproductgroup", "groups", "group"]):
+            logging.info("→ SUPER_FALLBACK routing to _handle_productgroup_post()")
+            return _handle_productgroup_post()
+
+        # Orders / status probes -> harmless OK
+        if "order" in lower:
+            return Response("<Orders/>", mimetype="text/xml")
+        if "status" in lower:
+            return ok()
+    except Exception:
+        logging.exception(f"any_fallback error for path='{p}'")
+
+    # Default no-op so UM never aborts preflights
+    return ok()
+    
 # Entrypoint
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
