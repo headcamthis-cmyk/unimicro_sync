@@ -226,32 +226,37 @@ def _handle_productgroup_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
+    # Some UM calls do a GET or send empty bodies as a probe. Reply success with zero processed.
     if request.method == 'GET' or not raw or not raw.strip():
-        # Preflight / no payload: say zero processed but OK
-        return Response('OK:0', mimetype='text/plain')
+        return Response('OK:0\r\n', mimetype='text/plain; charset=windows-1252')
 
     root = _parse_xml(raw, "product group xml")
 
     processed = 0
     existing = get_existing_collections()
-    for pg in root.iter():
-        tag = pg.tag.split('}', 1)[-1].lower()
-        if tag != 'productgroup':
+
+    # accept any casing/namespace and nested locations
+    for node in root.iter():
+        if node.tag.split('}', 1)[-1].lower() != 'productgroup':
             continue
 
-        gid = (pg.find('id') or pg.find('groupno') or pg.find('qvalue'))
-        title = (pg.find('description') or pg.find('name') or pg.find('title'))
-        if not (gid is not None and gid.text and title is not None and title.text):
+        gid_el   = node.find('id') or node.find('groupno') or node.find('qvalue')
+        title_el = node.find('description') or node.find('name') or node.find('title')
+        if not (gid_el is not None and title_el is not None and gid_el.text and title_el.text):
             continue
 
-        group_id = gid.text.strip()
-        handle = f"group-{group_id}".lower().replace(" ", "-")
+        group_id = gid_el.text.strip()
+        title    = title_el.text.strip()
+        handle   = f"group-{group_id}".lower().replace(" ", "-")
+
         if handle not in existing:
-            create_collection(title.text.strip(), handle)
+            create_collection(title, handle)
             processed += 1
+            # keep our cache current so duplicates in same payload don't re-create
+            existing[handle] = True
 
-    # Some UM builds like an explicit OK:count reply
-    return Response(f'OK:{processed}', mimetype='text/plain')
+    # UM likes an explicit "OK:<count>" success token
+    return Response(f'OK:{processed}\r\n', mimetype='text/plain; charset=windows-1252')
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
