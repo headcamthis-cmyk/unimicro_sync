@@ -17,16 +17,9 @@ SHOPIFY_LOCATION_ID = '16764928067'  # inventory location
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
 
-def ok_xml(body="OK", count=None):
-    """
-    Return minimal, well-formed XML with the correct content type.
-    If count is provided, include it both as attribute and inner text for maximum compatibility.
-    """
-    if count is not None:
-        xml = f'<OK count="{int(count)}">{int(count)}</OK>'
-    else:
-        xml = f"<OK>{body}</OK>"
-    return Response(xml, mimetype="text/xml")
+def ok_txt(body="OK"):
+    # UM is happiest with exact "OK" in text/plain (windows-1252). No XML, no counters.
+    return Response(body, mimetype="text/plain; charset=windows-1252")
 
 @app.before_request
 def _log_every_request():
@@ -92,7 +85,6 @@ def _get_from_extendedinfo(node, key_names: set):
     Look inside <extendedinfo> for attributes like qname/name/key with values in qvalue/value/text.
     Returns the first matching value for any key in key_names.
     """
-    # find the <extendedinfo> block first
     ext = None
     for child in node.iter():
         if child.tag.split('}', 1)[-1].lower() == 'extendedinfo':
@@ -203,8 +195,8 @@ def _handle_product_post():
 
     raw = request.get_data()
     if request.method == 'GET' or not raw or not raw.strip():
-        logging.info("Product endpoint called with empty body/preflight; returning OK (xml)")
-        return ok_xml()
+        logging.info("Product endpoint called with empty body/preflight; returning OK (txt)")
+        return ok_txt()
 
     root = _parse_xml(raw, "product xml")
     collections = get_existing_collections()
@@ -249,9 +241,8 @@ def _handle_product_post():
             except Exception:
                 quantity = None
 
-        # Detect inventory-only payloads (e.g., Source=UniStorageSync): SKU + quantity, but no title/price/group
+        # Inventory-only payloads: SKU + quantity, but no title/price/group
         inventory_only = (sku not in (None, "")) and (quantity is not None) and not any([title, price, group_id])
-
         if inventory_only:
             existing = find_product_by_sku(sku)
             if existing:
@@ -263,8 +254,7 @@ def _handle_product_post():
                 skipped += 1
                 continue
 
-        # Non-inventory-only:
-        # For updates/creates we need at least SKU and (title or price).
+        # For non-inventory: need at least SKU and (title or price)
         if not sku or (not title and not price):
             child_names = [c.tag.split('}',1)[-1] for c in p]
             logging.warning(f"Skipping product; missing required fields (need sku and title or price). Children: {child_names}")
@@ -279,7 +269,7 @@ def _handle_product_post():
             except Exception:
                 price_norm = str(price)
 
-        # Resolve collection if group is present; otherwise proceed without assigning
+        # Resolve collection if group present; otherwise proceed without assignment
         collection_id = None
         if group_id not in (None, ""):
             handle = f"group-{str(group_id).strip()}".lower().replace(" ", "-")
@@ -297,7 +287,6 @@ def _handle_product_post():
                 assign_product_to_collection(existing['product_id'], collection_id)
             updated += 1
         else:
-            # To create we need a title; default price to 0 if absent
             if not title:
                 logging.warning(f"Cannot create product SKU '{sku}' without a title. Skipping.")
                 skipped += 1
@@ -311,8 +300,7 @@ def _handle_product_post():
             created += 1
 
     logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
-    # Reply with how many <product> nodes were present; UM batch flows often expect a positive number.
-    return ok_xml(count=count_products)
+    return ok_txt()  # exact OK
 
 def _handle_productgroup_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -320,10 +308,10 @@ def _handle_productgroup_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
-    # Return a positive OK even for probes/empty to let UM continue
+    # Be permissive for probes/empty
     if request.method == 'GET' or not raw or not raw.strip():
-        logging.info("ProductGroup probe/empty payload -> replying OK:1 (xml)")
-        return ok_xml(count=1)
+        logging.info("ProductGroup probe/empty payload -> replying OK")
+        return ok_txt()
 
     root = _parse_xml(raw, "product group xml")
 
@@ -357,9 +345,8 @@ def _handle_productgroup_post():
             existing[handle] = True
             created += 1
 
-    resp_count = found or created or 1
-    logging.info(f"ProductGroup reply OK:{resp_count} (found={found}, created={created})")
-    return ok_xml(count=resp_count)
+    logging.info(f"ProductGroup processed: found={found}, created={created}")
+    return ok_txt()  # exact OK
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -375,10 +362,10 @@ def _handle_files_post():
         else:
             raw = request.get_data()
             logging.info(f"Image upload (no multipart) path={request.path} size={len(raw)} bytes")
-        return ok_xml()
+        return ok_txt()
     except Exception as e:
         logging.exception(f"postfiles failed: {e}")
-        return Response('<ERROR/>', mimetype='text/xml', status=500)
+        return Response('ERROR', mimetype='text/plain; charset=windows-1252', status=500)
 
 # -------- Route aliases --------
 # PRODUCTS (single)
@@ -455,7 +442,7 @@ def postfiles_router():
 @app.route('/twinxml/twinxml/status.asp', methods=['GET','POST'])
 @app.route('/twinxml/twinxml/status.aspx', methods=['GET','POST'])
 def status():
-    return ok_xml()
+    return ok_txt()
 
 # ORDERS placeholder (return minimal XML so UM doesn’t abort)
 def _orders_ok_xml():
@@ -504,10 +491,10 @@ def twinxml_fallback(name):
         if "order" in n:
             return _orders_ok_xml()
         if "status" in n:
-            return ok_xml()
+            return ok_txt()
     except Exception:
         logging.exception(f"twinxml_fallback error for name='{name}'")
-    return ok_xml()
+    return ok_txt()
 
 # Super fallback (any path)
 @app.route('/<path:anything>', methods=['GET','POST'])
@@ -525,10 +512,10 @@ def any_fallback(anything):
         if "order" in lower:
             return _orders_ok_xml()
         if "status" in lower:
-            return ok_xml()
+            return ok_txt()
     except Exception:
         logging.exception(f"any_fallback error for path='{p}'")
-    return ok_xml()
+    return ok_txt()
 
 # Entrypoint (unused on gunicorn, harmless locally)
 if __name__ == '__main__':
