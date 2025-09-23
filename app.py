@@ -17,8 +17,16 @@ SHOPIFY_LOCATION_ID = '16764928067'  # inventory location
 def is_authenticated(username, password):
     return username == 'synall' and password == 'synall'
 
-def ok():
-    return Response('OK', mimetype='text/plain')
+def ok_xml(body="OK", count=None):
+    """
+    Return minimal, well-formed XML with the correct content type.
+    If count is provided, include it both as attribute and inner text for maximum compatibility.
+    """
+    if count is not None:
+        xml = f'<OK count="{int(count)}">{int(count)}</OK>'
+    else:
+        xml = f"<OK>{body}</OK>"
+    return Response(xml, mimetype="text/xml")
 
 @app.before_request
 def _log_every_request():
@@ -45,7 +53,7 @@ def _parse_xml(raw_bytes, what="payload"):
         return ET.fromstring(raw_bytes.decode('utf-8', errors='replace'))
 
 def _gettext(node, *names):
-    # Try direct and nested; case- and namespace-tolerant
+    # Try direct and nested; case-/namespace-tolerant
     for n in names:
         el = node.find(n) or node.find(n.lower()) or node.find(f".//{n}")
         if el is not None and el.text and el.text.strip():
@@ -77,6 +85,30 @@ def _get_from_node(node, names, attr_names=None):
         for a in attr_names:
             if a in node.attrib and node.attrib[a].strip():
                 return node.attrib[a].strip()
+    return None
+
+def _get_from_extendedinfo(node, key_names: set):
+    """
+    Look inside <extendedinfo> for attributes like qname/name/key with values in qvalue/value/text.
+    Returns the first matching value for any key in key_names.
+    """
+    # find the <extendedinfo> block first
+    ext = None
+    for child in node.iter():
+        if child.tag.split('}', 1)[-1].lower() == 'extendedinfo':
+            ext = child
+            break
+    if ext is None:
+        return None
+
+    keys_lower = {k.lower() for k in key_names}
+    for e in ext.iter():
+        attrs = { (k or '').lower(): (v.strip() if isinstance(v, str) else v) for k, v in e.attrib.items() }
+        name = attrs.get('qname') or attrs.get('name') or attrs.get('key') or attrs.get('field') or attrs.get('id')
+        if name and name.lower() in keys_lower:
+            val = attrs.get('qvalue') or attrs.get('value') or (e.text.strip() if e.text else None)
+            if val not in (None, ''):
+                return val
     return None
 
 # -------- Shopify helpers --------
@@ -171,8 +203,8 @@ def _handle_product_post():
 
     raw = request.get_data()
     if request.method == 'GET' or not raw or not raw.strip():
-        logging.info("Product endpoint called with empty body/preflight; returning OK")
-        return ok()
+        logging.info("Product endpoint called with empty body/preflight; returning OK (xml)")
+        return ok_xml()
 
     root = _parse_xml(raw, "product xml")
     collections = get_existing_collections()
@@ -192,11 +224,22 @@ def _handle_product_post():
             continue
         total += 1
 
+        # Primary extraction
         sku = _get_from_node(p, ["productno","productident","articleno","itemno","sku"], ["id","no","sku"])
         title = _get_from_node(p, ["description","name","title"], ["description","name","title"])
         price = _get_from_node(p, ["price","salesprice","price1","netprice"], ["price","salesprice","netprice","value"])
         qty_text = _get_from_node(p, ["quantityonhand","quantity","stock","instock","physicalstock","qty"], ["quantity","qty","stock","onhand","value"])
         group_id = _get_from_node(p, ["productgroup","productgroupno","groupno","groupid","pgid","qvalue"], ["productgroup","groupno","groupid","pgid","qvalue"])
+
+        # Fallbacks via <extendedinfo>
+        if not title:
+            title = _get_from_extendedinfo(p, {"description","name","title"})
+        if not price:
+            price = _get_from_extendedinfo(p, {"price","salesprice","price1","netprice"})
+        if not group_id:
+            group_id = _get_from_extendedinfo(p, {"productgroup","productgroupno","groupno","groupid","pgid","qvalue"})
+        if qty_text in (None, ""):
+            qty_text = _get_from_extendedinfo(p, {"quantityonhand","quantity","stock","instock","physicalstock","qty"})
 
         # Quantity is optional
         quantity = None
@@ -206,45 +249,70 @@ def _handle_product_post():
             except Exception:
                 quantity = None
 
-        # Require only these fields
-        missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id}.items() if v in (None, "")]
-        if missing:
+        # Detect inventory-only payloads (e.g., Source=UniStorageSync): SKU + quantity, but no title/price/group
+        inventory_only = (sku not in (None, "")) and (quantity is not None) and not any([title, price, group_id])
+
+        if inventory_only:
+            existing = find_product_by_sku(sku)
+            if existing:
+                update_inventory_level(existing['inventory_item_id'], quantity)
+                updated += 1
+                continue
+            else:
+                logging.warning(f"Inventory-only payload for SKU '{sku}', but product not found in Shopify. Skipping create.")
+                skipped += 1
+                continue
+
+        # Non-inventory-only:
+        # For updates/creates we need at least SKU and (title or price).
+        if not sku or (not title and not price):
             child_names = [c.tag.split('}',1)[-1] for c in p]
-            logging.warning(f"Skipping product; missing {missing}. Children: {child_names}")
+            logging.warning(f"Skipping product; missing required fields (need sku and title or price). Children: {child_names}")
             skipped += 1
             continue
 
-        handle = f"group-{str(group_id).strip()}".lower().replace(" ", "-")
-        collection_id = collections.get(handle)
-        if not collection_id:
-            logging.warning(f"No collection for handle '{handle}' (group_id={group_id}). Skipping SKU {sku}.")
-            skipped += 1
-            continue
+        # Normalize price if present
+        price_norm = None
+        if price not in (None, ""):
+            try:
+                price_norm = str(float(str(price).replace(',', '.')))
+            except Exception:
+                price_norm = str(price)
 
-        # Normalize price
-        try:
-            price_norm = str(float(str(price).replace(',', '.')))
-        except Exception:
-            price_norm = str(price)
+        # Resolve collection if group is present; otherwise proceed without assigning
+        collection_id = None
+        if group_id not in (None, ""):
+            handle = f"group-{str(group_id).strip()}".lower().replace(" ", "-")
+            collection_id = collections.get(handle)
+            if not collection_id:
+                logging.info(f"No Shopify collection for handle '{handle}'. Will proceed without assignment.")
 
         existing = find_product_by_sku(sku)
         if existing:
-            if str(existing.get('current_price')) != price_norm:
+            if price_norm is not None and str(existing.get('current_price')) != price_norm:
                 update_product_price(existing['variant_id'], price_norm)
             if quantity is not None:
                 update_inventory_level(existing['inventory_item_id'], quantity)
-            assign_product_to_collection(existing['product_id'], collection_id)
+            if collection_id:
+                assign_product_to_collection(existing['product_id'], collection_id)
             updated += 1
         else:
-            product_id, inventory_item_id = create_product(title, sku, price_norm)
-            if product_id:
+            # To create we need a title; default price to 0 if absent
+            if not title:
+                logging.warning(f"Cannot create product SKU '{sku}' without a title. Skipping.")
+                skipped += 1
+                continue
+            create_price = price_norm if price_norm is not None else "0"
+            product_id, inventory_item_id = create_product(title, sku, create_price)
+            if product_id and collection_id:
                 assign_product_to_collection(product_id, collection_id)
             if inventory_item_id is not None and quantity is not None:
                 update_inventory_level(inventory_item_id, quantity)
             created += 1
 
     logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
-    return ok()
+    # Reply with how many <product> nodes were present; UM batch flows often expect a positive number.
+    return ok_xml(count=count_products)
 
 def _handle_productgroup_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -254,8 +322,8 @@ def _handle_productgroup_post():
     raw = request.get_data()
     # Return a positive OK even for probes/empty to let UM continue
     if request.method == 'GET' or not raw or not raw.strip():
-        logging.info("ProductGroup probe/empty payload -> replying OK:1")
-        return Response('OK:1\r\n', mimetype='text/plain; charset=windows-1252')
+        logging.info("ProductGroup probe/empty payload -> replying OK:1 (xml)")
+        return ok_xml(count=1)
 
     root = _parse_xml(raw, "product group xml")
 
@@ -291,7 +359,7 @@ def _handle_productgroup_post():
 
     resp_count = found or created or 1
     logging.info(f"ProductGroup reply OK:{resp_count} (found={found}, created={created})")
-    return Response(f'OK:{resp_count}\r\n', mimetype='text/plain; charset=windows-1252')
+    return ok_xml(count=resp_count)
 
 def _handle_files_post():
     username = request.args.get('user'); password = request.args.get('pass')
@@ -307,10 +375,10 @@ def _handle_files_post():
         else:
             raw = request.get_data()
             logging.info(f"Image upload (no multipart) path={request.path} size={len(raw)} bytes")
-        return ok()
+        return ok_xml()
     except Exception as e:
         logging.exception(f"postfiles failed: {e}")
-        return Response('ERROR', mimetype='text/plain', status=500)
+        return Response('<ERROR/>', mimetype='text/xml', status=500)
 
 # -------- Route aliases --------
 # PRODUCTS (single)
@@ -387,7 +455,7 @@ def postfiles_router():
 @app.route('/twinxml/twinxml/status.asp', methods=['GET','POST'])
 @app.route('/twinxml/twinxml/status.aspx', methods=['GET','POST'])
 def status():
-    return ok()
+    return ok_xml()
 
 # ORDERS placeholder (return minimal XML so UM doesn’t abort)
 def _orders_ok_xml():
@@ -436,10 +504,10 @@ def twinxml_fallback(name):
         if "order" in n:
             return _orders_ok_xml()
         if "status" in n:
-            return ok()
+            return ok_xml()
     except Exception:
         logging.exception(f"twinxml_fallback error for name='{name}'")
-    return ok()
+    return ok_xml()
 
 # Super fallback (any path)
 @app.route('/<path:anything>', methods=['GET','POST'])
@@ -457,10 +525,10 @@ def any_fallback(anything):
         if "order" in lower:
             return _orders_ok_xml()
         if "status" in lower:
-            return ok()
+            return ok_xml()
     except Exception:
         logging.exception(f"any_fallback error for path='{p}'")
-    return ok()
+    return ok_xml()
 
 # Entrypoint (unused on gunicorn, harmless locally)
 if __name__ == '__main__':
