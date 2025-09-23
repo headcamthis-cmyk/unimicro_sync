@@ -45,7 +45,7 @@ def _parse_xml(raw_bytes, what="payload"):
         return ET.fromstring(raw_bytes.decode('utf-8', errors='replace'))
 
 def _gettext(node, *names):
-    # Try direct and nested; case- and namespace-tolerant
+    # Try direct and nested; case-/namespace-tolerant
     for n in names:
         el = node.find(n) or node.find(n.lower()) or node.find(f".//{n}")
         if el is not None and el.text and el.text.strip():
@@ -260,7 +260,7 @@ def _handle_files_post():
         return Response('ERROR', mimetype='text/plain', status=500)
 
 # -------- Route aliases --------
-# Per Uni docs, twinxml is appended automatically and default names are .asp (but can be .aspx). Support all combos. :contentReference[oaicite:2]{index=2}
+# Support .asp/.aspx and common path variants (including accidental double 'twinxml').
 
 # PRODUCTS
 @app.route('/twinxml/postproduct.asp', methods=['POST'])
@@ -269,6 +269,8 @@ def _handle_files_post():
 @app.route('/postproduct.aspx', methods=['POST'])
 @app.route('/product/twinxml/postproduct.asp', methods=['POST'])
 @app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postproduct.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postproduct.aspx', methods=['POST'])
 def postproduct_router():
     return _handle_product_post()
 
@@ -279,6 +281,8 @@ def postproduct_router():
 @app.route('/postproductgroup.aspx', methods=['POST'])
 @app.route('/product/twinxml/postproductgroup.asp', methods=['POST'])
 @app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postproductgroup.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postproductgroup.aspx', methods=['POST'])
 def postproductgroup_router():
     return _handle_productgroup_post()
 
@@ -289,25 +293,37 @@ def postproductgroup_router():
 @app.route('/postfiles.aspx', methods=['POST'])
 @app.route('/product/twinxml/postfiles.asp', methods=['POST'])
 @app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.aspx', methods=['POST'])
 def postfiles_router():
     return _handle_files_post()
 
-# STATUS
+# STATUS (no-op OK)
 @app.route('/twinxml/status.asp', methods=['GET', 'POST'])
 @app.route('/twinxml/status.aspx', methods=['GET', 'POST'])
 @app.route('/status.asp', methods=['GET', 'POST'])
 @app.route('/status.aspx', methods=['GET', 'POST'])
 @app.route('/product/twinxml/status.asp', methods=['GET', 'POST'])
 @app.route('/product/twinxml/status.aspx', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/status.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/status.aspx', methods=['GET', 'POST'])
 def status():
     return ok()
 
-# ORDERS placeholder (still “OK”)
+# ORDERS placeholder (return minimal XML so UM doesn't abort)
+def _orders_ok_xml():
+    return Response("<Orders/>", mimetype="text/xml")
+
 @app.route('/twinxml/orders.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/orders.aspx', methods=['GET', 'POST'])
 @app.route('/orders.asp', methods=['GET', 'POST'])
+@app.route('/orders.aspx', methods=['GET', 'POST'])
 @app.route('/product/twinxml/orders.asp', methods=['GET', 'POST'])
+@app.route('/product/twinxml/orders.aspx', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/orders.asp', methods=['GET', 'POST'])
+@app.route('/twinxml/twinxml/orders.aspx', methods=['GET', 'POST'])
 def orders():
-    return ok()
+    return _orders_ok_xml()
 
 # Entrypoint
 if __name__ == '__main__':
