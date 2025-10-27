@@ -142,64 +142,77 @@ def update_inventory_level(inventory_item_id, quantity):
         logging.warning(f"Inventory update failed: {r.status_code} - {r.text}")
 
 # -------- Handlers (core logic reused by multiple routes) --------
-def _get_from_node(node, names, attr_names=None):
-    # try child elements by name (any depth, any case)
-    v = _gettext(node, *names)
-    if v:
-        return v
-    # try attributes on matching child elements
-    if attr_names:
-        want = {n.lower() for n in names}
-        for child in node.iter():
-            tag = child.tag.split('}', 1)[-1].lower()
-            if tag in want:
-                for a in attr_names:
-                    if a in child.attrib and child.attrib[a].strip():
-                        return child.attrib[a].strip()
-    # try attributes on the product node itself
-    if attr_names:
-        for a in attr_names:
-            if a in node.attrib and node.attrib[a].strip():
-                return node.attrib[a].strip()
-    return None
+def _handle_product_post():
+    username = request.args.get('user'); password = request.args.get('pass')
+    if not is_authenticated(username, password):
+        return Response('Unauthorized', status=401)
 
-# inside _handle_product_post(), for each <product> p:
-sku = _get_from_node(p,
-    ["productno","productident","articleno","itemno","sku"],
-    ["id","no","sku"]
-)
-title = _get_from_node(p,
-    ["description","name","title"],
-    ["description","name","title"]
-)
-price = _get_from_node(p,
-    ["price","salesprice","price1","netprice"],
-    ["price","salesprice","netprice","value"]
-)
-qty_text = _get_from_node(p,
-    ["quantityonhand","quantity","stock","instock","physicalstock","qty"],
-    ["quantity","qty","stock","onhand","value"]
-)
-group_id = _get_from_node(p,
-    ["productgroup","productgroupno","groupno","groupid","pgid","qvalue"],
-    ["productgroup","groupno","groupid","pgid","qvalue"]
-)
+    raw = request.get_data()
+    root = _parse_xml(raw, "product xml")
+    collections = get_existing_collections()
+    logging.info(f"Loaded {len(collections)} collections")
 
-quantity = None
-if qty_text not in (None, ""):
-    try:
-        quantity = int(float(str(qty_text).replace(',', '.')))
-    except Exception:
+    total = created = updated = skipped = 0
+
+    # Optional visibility: how many <product> nodes?
+    count_products = 0
+    for node in root.iter():
+        if node.tag.split('}', 1)[-1].lower() == 'product':
+            count_products += 1
+    logging.info(f"Detected {count_products} <product> nodes")
+
+    for p in root.iter():
+        if p.tag.split('}', 1)[-1].lower() != 'product':
+            continue
+        total += 1
+
+        sku = _gettext(p, "productno", "productident", "articleno", "itemno", "sku")
+        title = _gettext(p, "description", "name", "title")
+        price = _gettext(p, "price", "salesprice", "price1")
+        qty_text = _gettext(p, "quantityonhand", "stock", "instock", "physicalstock", "qty")
+        group_id = _gettext(p, "productgroup", "productgroupno", "groupno", "groupid", "pgid", "qvalue")
+
         quantity = None
+        if qty_text is not None:
+            try: quantity = int(float(qty_text.replace(',', '.')))
+            except Exception: quantity = None
 
-# only require SKU, title, price and group_id
-missing = [k for k, v in {
-    "sku": sku, "title": title, "price": price, "group_id": group_id
-}.items() if v in (None, "")]
-if missing:
-    skipped += 1
-    logging.warning(f"Skipping product; missing {missing}. Children: {[c.tag.split('}',1)[-1] for c in p]}")
-    continue
+        missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity}.items() if v in (None, "")]
+        if missing:
+            skipped += 1
+            logging.warning(f"Skipping product; missing {missing}. Children: {[c.tag for c in p]}")
+            continue
+
+        handle = f"group-{group_id}".lower().replace(" ", "-")
+        collection_id = collections.get(handle)
+        if not collection_id:
+            skipped += 1
+            logging.warning(f"No collection for handle '{handle}' (group_id={group_id}). Skipping SKU {sku}.")
+            continue
+
+        try:
+            price_norm = str(float(str(price).replace(',', '.')))
+        except Exception:
+            price_norm = str(price)
+
+        existing = find_product_by_sku(sku)
+        if existing:
+            if str(existing['current_price']) != price_norm:
+                update_product_price(existing['variant_id'], price_norm)
+            if quantity is not None:
+                update_inventory_level(existing['inventory_item_id'], quantity)
+            assign_product_to_collection(existing['product_id'], collection_id)
+            updated += 1
+        else:
+            product_id, inventory_item_id = create_product(title, sku, price_norm)
+            if product_id: assign_product_to_collection(product_id, collection_id)
+            if inventory_item_id is not None and quantity is not None:
+                update_inventory_level(inventory_item_id, quantity)
+            created += 1
+
+    logging.info(f"Products processed: total={total}, created={created}, updated={updated}, skipped={skipped}")
+    return ok()
+
 def _handle_productgroup_post():
     username = request.args.get('user'); password = request.args.get('pass')
     if not is_authenticated(username, password):
