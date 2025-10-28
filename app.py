@@ -56,7 +56,7 @@ SHOPIFY_TOKEN = (os.environ.get('SHOPIFY_TOKEN') or _HARDCODED_SHOPIFY_TOKEN).st
 SHOPIFY_API_VERSION = (os.environ.get('SHOPIFY_API_VERSION') or _HARDCODED_API_VERSION).strip()
 SHOPIFY_LOCATION_ID = (os.environ.get('SHOPIFY_LOCATION_ID') or _HARDCODED_LOCATION_ID).strip()
 
-if not SHOPIFY_TOKEN or SHOPIFY_TOKEN == "YOUR_SHOPIFY_ACCESS_TOKEN":
+if not SHOPIFY_TOKEN or SHOPIFY_TOKEN == "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":
     logging.warning("SHOPIFY_TOKEN is not set (or still placeholder) — API calls will fail!")
 
 BASE_URL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
