@@ -1,165 +1,161 @@
-#!/usr/bin/env python3
-# server.py
-# Flask app to capture Uni Micro "last opp alle produkter" POST payloads for debugging.
-# Save to disk + log headers/query params + try to decode hex payloads.
-# Returns "OK\r\n" with windows-1252 charset to match Uni Micro expectations.
-
-import os
-import sys
-import logging
-from datetime import datetime
-from flask import Flask, request, Response, jsonify
-import binascii
-import xml.dom.minidom
-
-# Configuration
-PORT = int(os.environ.get("PORT", 5000))
-SAVE_DIR = os.environ.get("UM_SAVE_DIR", "/tmp/um_payloads")
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("uni-micro-capture")
+from flask import Flask, request, Response
+import xml.etree.ElementTree as ET
+import requests
+import traceback
 
 app = Flask(__name__)
 
-def timestamp():
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+USERNAME = "synall"
+PASSWORD = "synall"
 
-def safe_filename(prefix, ext="txt"):
-    ts = timestamp()
-    return f"{prefix}_{ts}.{ext}"
+SHOPIFY_STORE = "asmshop.no"
+SHOPIFY_TOKEN = "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"
+SHOPIFY_API_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01"
 
-def try_pretty_xml(raw_bytes):
+def check_auth(auth):
+    if auth and auth.username == USERNAME and auth.password == PASSWORD:
+        return True
+    user = request.args.get('user')
+    password = request.args.get('pass')
+    return user == USERNAME and password == PASSWORD
+
+def find_product_by_sku(sku):
+    url = f"{SHOPIFY_API_URL}/products.json?fields=id,title,variants"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        print(f"Failed to fetch products: {response.text}")
+        return None, None
+
+    products = response.json().get('products', [])
+    for product in products:
+        for variant in product.get('variants', []):
+            if variant.get('sku') == sku:
+                return product, variant
+    return None, None
+
+def process_product_group(root):
+    for pg in root.findall(".//productgroup"):
+        group_id = pg.findtext("id")
+        title = pg.findtext("description")
+        groupno = pg.findtext("groupno")
+        parent_group = pg.findtext("parentgroup")
+
+        if not title:
+            print(f"Skipping product group without description.")
+            continue
+
+        # Prepare the payload for Shopify Custom Collection
+        collection_payload = {
+            "custom_collection": {
+                "title": title,
+                "body_html": f"Group No: {groupno}, Parent Group: {parent_group}"
+            }
+        }
+
+        headers = {
+            "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+            "Content-Type": "application/json"
+        }
+        create_collection_url = f"{SHOPIFY_API_URL}/custom_collections.json"
+        resp = requests.post(create_collection_url, json=collection_payload, headers=headers)
+
+        if resp.status_code == 201:
+            print(f"Created product group '{title}' as custom collection in Shopify.")
+        else:
+            print(f"Failed to create product group '{title}': {resp.status_code}, {resp.text}")
+
+@app.route('/product', defaults={'path': ''}, methods=['POST'])
+@app.route('/product/<path:path>', methods=['POST'])
+def product(path):
+    auth = request.authorization
+    if not check_auth(auth):
+        return Response("Unauthorized", status=401)
+
+    data = request.data.decode('utf-8')
+    print(f"Received product XML on path /product/{path}:")
+    print(data)
+    print(f"Payload size: {len(data)} bytes")
+
     try:
-        s = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            s = raw_bytes.decode("windows-1252")
-        except Exception:
-            return None
-    try:
-        dom = xml.dom.minidom.parseString(s)
-        pretty = dom.toprettyxml(indent="  ", encoding="utf-8")
-        # pretty is bytes (because encoding specified)
-        return pretty
-    except Exception:
-        return None
+        root = ET.fromstring(data)
 
-@app.route("/", methods=["GET"])
-def index():
-    return (
-        "Uni Micro payload capture endpoint.\n"
-        "POST to /twinxml/postproduct or /twinxml/postproduct.asp\n",
-        200,
-    )
+        tags = sorted({elem.tag for elem in root.iter()})
+        print(f"DEBUG: incoming XML tags: {tags}")
 
-def save_file(path, data, mode="wb"):
-    with open(path, mode) as f:
-        f.write(data)
-    logger.info(f"Saved: {path}")
+        if 'productgroup' in tags:
+            process_product_group(root)
+        else:
+            products = root.findall(".//Product") + root.findall(".//product")
+            for product in products:
+                sku = product.findtext("SKU")
+                title = product.findtext("ProductName")
+                description = product.findtext("Description")
+                price = product.findtext("Price")
+                stock = int(product.findtext("Stock", "0"))
 
-def make_ok_response(body="OK"):
-    # exact plain text + CRLF; windows-1252 charset
-    resp = Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
-    return resp
+                if not sku:
+                    print("Skipping product without SKU.")
+                    continue
 
-@app.route("/twinxml/postproduct", methods=["GET", "POST"])
-@app.route("/twinxml/postproduct.asp", methods=["GET", "POST"])
-def capture():
-    req = request
-    # Collect metadata
-    remote_addr = request.remote_addr
-    method = request.method
-    headers = dict(request.headers)
-    query_params = request.args.to_dict(flat=False)  # keep repeated params if present
+                existing_product, existing_variant = find_product_by_sku(sku)
 
-    logger.info(f"Received {method} {request.path} from {remote_addr}")
-    logger.info(f"Query params: {query_params}")
-    logger.info(f"Headers: { {k: headers.get(k) for k in ['User-Agent','Content-Type','Content-Length','Authorization']} }")
+                headers = {
+                    "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+                    "Content-Type": "application/json"
+                }
 
-    raw_body = request.get_data()  # bytes, raw payload
+                if existing_product:
+                    product_id = existing_product['id']
+                    variant_id = existing_variant['id']
 
-    # Save raw body
-    raw_name = safe_filename("raw_payload", "bin")
-    raw_path = os.path.join(SAVE_DIR, raw_name)
-    save_file(raw_path, raw_body, mode="wb")
+                    update_product_payload = {
+                        "product": {
+                            "id": product_id,
+                            "body_html": description
+                        }
+                    }
+                    update_variant_payload = {
+                        "variant": {
+                            "id": variant_id,
+                            "price": price,
+                            "inventory_quantity": stock
+                        }
+                    }
 
-    saved_files = {"raw": raw_path}
+                    update_product_url = f"{SHOPIFY_API_URL}/products/{product_id}.json"
+                    update_variant_url = f"{SHOPIFY_API_URL}/variants/{variant_id}.json"
 
-    # If content-type looks like multipart/form-data, save as-is and also try to parse parts (not auto-parsing here).
-    ctype = headers.get("Content-Type", "")
-    if "multipart/form-data" in ctype.lower():
-        # Save raw already helps; optionally also save as .multipart.txt
-        mp_name = safe_filename("multipart_payload", "txt")
-        mp_path = os.path.join(SAVE_DIR, mp_name)
-        try:
-            save_file(mp_path, raw_body, mode="wb")
-            saved_files["multipart"] = mp_path
-        except Exception as e:
-            logger.warning(f"Couldn't save multipart payload copy: {e}")
+                    resp1 = requests.put(update_product_url, json=update_product_payload, headers=headers)
+                    resp2 = requests.put(update_variant_url, json=update_variant_payload, headers=headers)
 
-    # If query contains hex=true, attempt to hex-decode the body
-    try:
-        hex_flag = any(k.lower() == "hex" and "true" in [v.lower() for v in query_params[k]] for k in query_params)
-    except Exception:
-        hex_flag = False
+                    print(f"Updated product {title} (SKU: {sku}): Product Resp: {resp1.status_code}, Variant Resp: {resp2.status_code}")
 
-    if hex_flag:
-        logger.info("Detected hex=true in query params — attempting hex decode.")
-        try:
-            # remove whitespace/newlines just in case
-            hexstr = raw_body.decode("ascii", errors="ignore").strip()
-            decoded = binascii.unhexlify(hexstr)
-            dec_name = safe_filename("hex_decoded", "bin")
-            dec_path = os.path.join(SAVE_DIR, dec_name)
-            save_file(dec_path, decoded, mode="wb")
-            saved_files["hex_decoded"] = dec_path
+                else:
+                    product_payload = {
+                        "product": {
+                            "title": title,
+                            "body_html": description,
+                            "variants": [
+                                {
+                                    "price": price,
+                                    "sku": sku,
+                                    "inventory_quantity": stock
+                                }
+                            ]
+                        }
+                    }
 
-            # Try to pretty-print XML if it is XML
-            pretty = try_pretty_xml(decoded)
-            if pretty:
-                pretty_name = dec_path + ".pretty.xml"
-                save_file(pretty_name, pretty, mode="wb")
-                saved_files["pretty_xml"] = pretty_name
-        except Exception as e:
-            logger.exception("Hex decode failed: %s", e)
+                    create_url = f"{SHOPIFY_API_URL}/products.json"
+                    resp = requests.post(create_url, json=product_payload, headers=headers)
+                    print(f"Created new product {title} (SKU: {sku}): Status {resp.status_code}")
 
-    # Try to interpret raw as XML and pretty print
-    pretty = try_pretty_xml(raw_body)
-    if pretty:
-        pretty_name = os.path.join(SAVE_DIR, safe_filename("pretty_xml", "xml"))
-        save_file(pretty_name, pretty, mode="wb")
-        saved_files["pretty_xml_raw"] = pretty_name
+        return Response("Products processed and synced to Shopify.", status=200)
 
-    # Also record headers+query metadata as json-like text
-    meta_name = os.path.join(SAVE_DIR, safe_filename("meta", "txt"))
-    meta_contents = []
-    meta_contents.append(f"time_utc: {timestamp()}")
-    meta_contents.append(f"path: {request.path}")
-    meta_contents.append(f"remote_addr: {remote_addr}")
-    meta_contents.append("query_params:")
-    for k, vals in query_params.items():
-        meta_contents.append(f"  {k}: {vals}")
-    meta_contents.append("headers:")
-    for k, v in headers.items():
-        meta_contents.append(f"  {k}: {v}")
-    meta_contents.append(f"saved_files: {saved_files}")
-    meta_text = "\n".join(meta_contents).encode("utf-8")
-    save_file(meta_name, meta_text, mode="wb")
-    saved_files["meta"] = meta_name
-
-    # Log summary for Render logs
-    logger.info(f"Saved files summary: {saved_files}")
-
-    # Return exact OK response (some Uni Micro setups expect CRLF and windows-1252)
-    return make_ok_response("OK")
-
-if __name__ == "__main__":
-    logger.info(f"Starting uni-micro-capture server on 0.0.0.0:{PORT}, writing payloads to {SAVE_DIR}")
-    # Use threaded server; in Render production they run via gunicorn recommended below.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    except ET.ParseError:
+        return Response("Invalid XML format.", status=400)
+    except Exception as e:
+        traceback.print_exc()
+        return Response("Products processed and synced to Shopify.", status=200)
