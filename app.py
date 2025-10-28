@@ -12,7 +12,7 @@ Notes
 • Basic auth: username/password = synall / synall (adjust below if needed)
 • Render: set environment vars in the service (DO NOT hardcode secrets):
     SHOPIFY_DOMAIN      e.g. "asmshop.no" (or "allsupermotoas.myshopify.com")
-    SHOPIFY_TOKEN       e.g. "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"
+    SHOPIFY_TOKEN       e.g. "shpat_***"
     SHOPIFY_API_VERSION e.g. "2024-10"
     SHOPIFY_LOCATION_ID e.g. "16764928067"
 • Returns plain text with CRLF (\r\n) because Uni Micro can be picky
@@ -47,7 +47,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 #   SHOPIFY_LOCATION_ID (numeric location id for inventory)
 # OPTION B: hardcode below (only for testing/dev). These are used if env vars are missing.
 _HARDCODED_SHOPIFY_DOMAIN = "asmshop.no"                 # or "allsupermotoas.myshopify.com"
-_HARDCODED_SHOPIFY_TOKEN = "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"   # replace for local tests only
+_HARDCODED_SHOPIFY_TOKEN = "YOUR_SHOPIFY_ACCESS_TOKEN"   # replace for local tests only
 _HARDCODED_API_VERSION   = "2024-10"
 _HARDCODED_LOCATION_ID   = "16764928067"                 # your Shopify location id
 
