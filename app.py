@@ -1,427 +1,165 @@
-"""
-Uni Micro → Shopify sync (Render-ready)
+#!/usr/bin/env python3
+# server.py
+# Flask app to capture Uni Micro "last opp alle produkter" POST payloads for debugging.
+# Save to disk + log headers/query params + try to decode hex payloads.
+# Returns "OK\r\n" with windows-1252 charset to match Uni Micro expectations.
 
-This revision is the last known-good Flask app that actually CREATED
-Shopify products and product groups (custom collections) from Uni Micro's
-TwinXML posts. It focuses on:
-  • /twinxml/postproductgroup.aspx  → Upsert Custom Collection
-  • /twinxml/postproduct.aspx       → Upsert Product (+variant) by SKU, assign to collection, set inventory + price
-
-Notes
------
-• Basic auth: username/password = synall / synall (adjust below if needed)
-• Render: set environment vars in the service (DO NOT hardcode secrets):
-    SHOPIFY_DOMAIN      e.g. "asmshop.no" (or "allsupermotoas.myshopify.com")
-    SHOPIFY_TOKEN       e.g. "shpat_***"
-    SHOPIFY_API_VERSION e.g. "2024-10"
-    SHOPIFY_LOCATION_ID e.g. "16764928067"
-• Returns plain text with CRLF (\r\n) because Uni Micro can be picky
-• Idempotency is by SKU for products; for collections by ProductGroupNo
-• Minimal error handling with clear logs (INFO level)
-
-Procfile (create this as a separate file on Render):
-  web: gunicorn -w 2 -k gthread -t 120 app:app
-
-requirements.txt (create separately):
-  Flask==3.0.3
-  gunicorn==23.0.0
-  requests==2.32.3
-
-"""
-from __future__ import annotations
 import os
+import sys
 import logging
-from typing import Dict, List, Optional, Tuple
-from flask import Flask, request, Response
-import xml.etree.ElementTree as ET
-import requests
+from datetime import datetime
+from flask import Flask, request, Response, jsonify
+import binascii
+import xml.dom.minidom
+
+# Configuration
+PORT = int(os.environ.get("PORT", 5000))
+SAVE_DIR = os.environ.get("UM_SAVE_DIR", "/tmp/um_payloads")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("uni-micro-capture")
 
 app = Flask(__name__)
-# Accept both with and without trailing slashes globally
-app.url_map.strict_slashes = False
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# -------- Shopify config --------
-# OPTION A (recommended): set these as Render Environment Variables
-#   SHOPIFY_DOMAIN (e.g. asmshop.no or allsupermotoas.myshopify.com)
-#   SHOPIFY_TOKEN  (Admin API access token from your custom app)
-#   SHOPIFY_API_VERSION (e.g. 2024-10)
-#   SHOPIFY_LOCATION_ID (numeric location id for inventory)
-# OPTION B: hardcode below (only for testing/dev). These are used if env vars are missing.
-_HARDCODED_SHOPIFY_DOMAIN = "asmshop.no"                 # or "allsupermotoas.myshopify.com"
-_HARDCODED_SHOPIFY_TOKEN = "YOUR_SHOPIFY_ACCESS_TOKEN"   # replace for local tests only
-_HARDCODED_API_VERSION   = "2024-10"
-_HARDCODED_LOCATION_ID   = "16764928067"                 # your Shopify location id
+def timestamp():
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-SHOPIFY_DOMAIN = (os.environ.get('SHOPIFY_DOMAIN') or _HARDCODED_SHOPIFY_DOMAIN).strip()
-SHOPIFY_TOKEN = (os.environ.get('SHOPIFY_TOKEN') or _HARDCODED_SHOPIFY_TOKEN).strip()
-SHOPIFY_API_VERSION = (os.environ.get('SHOPIFY_API_VERSION') or _HARDCODED_API_VERSION).strip()
-SHOPIFY_LOCATION_ID = (os.environ.get('SHOPIFY_LOCATION_ID') or _HARDCODED_LOCATION_ID).strip()
+def safe_filename(prefix, ext="txt"):
+    ts = timestamp()
+    return f"{prefix}_{ts}.{ext}"
 
-if not SHOPIFY_TOKEN or SHOPIFY_TOKEN == "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":
-    logging.warning("SHOPIFY_TOKEN is not set (or still placeholder) — API calls will fail!")
-
-BASE_URL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
-
-session = requests.Session()
-session.headers.update({
-    'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-})
-
-# -------- Utils --------
-def is_authenticated(username: str, password: str) -> bool:
-    return username == 'synall' and password == 'synall'
-
-
-def ok_txt(body: str = "OK") -> Response:
-    # exact plain text + CRLF; UM can be picky about line endings
-    return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
-
-
-@app.before_request
-def _log_every_request():
+def try_pretty_xml(raw_bytes):
     try:
-        logging.info(f"REQ {request.method} {request.path}")
+        s = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            s = raw_bytes.decode("windows-1252")
+        except Exception:
+            return None
+    try:
+        dom = xml.dom.minidom.parseString(s)
+        pretty = dom.toprettyxml(indent="  ", encoding="utf-8")
+        # pretty is bytes (because encoding specified)
+        return pretty
     except Exception:
-        pass
-
-
-def _auth_fail() -> Response:
-    return Response("NOT AUTHORIZED\r\n", status=401, mimetype="text/plain; charset=windows-1252")
-
-
-# -------- Helpers for Uni variations --------
-
-def _read_auth_from_request() -> tuple[str, str]:
-    """Accept both Uni variations: username/password and user/pass, case-insensitive.
-    Also supports HTTP Basic auth if present.
-    """
-    from flask import request as _rq
-    user = ''
-    pw = ''
-    args_ci = {k.lower(): v for k, v in _rq.args.items()}
-    user = args_ci.get('username') or args_ci.get('user') or ''
-    pw = args_ci.get('password') or args_ci.get('pass') or ''
-    if (not user or not pw) and _rq.authorization:
-        user = user or (_rq.authorization.username or '')
-        pw = pw or (_rq.authorization.password or '')
-    return user, pw
-
-
-def _get_xml_bytes() -> bytes:
-    """Handle Uni's optional hex payload (?hex=true). If hex=true, request.data contains ASCII hex.
-    Otherwise, return request.data as-is.
-    """
-    from flask import request as _rq
-    args_ci = {k.lower(): v for k, v in _rq.args.items()}
-    if str(args_ci.get('hex', 'false')).lower() in ('1', 'true', 'yes'):
-        try:
-            hex_str = _rq.data.decode('ascii', errors='ignore').strip()
-            return bytes.fromhex(hex_str)
-        except Exception:
-            logging.exception('Failed to decode hex body; using raw request.data')
-            return _rq.data
-    return _rq.data
-
-# -------- XML helpers --------
-def _parse_xml(body: bytes) -> ET.Element:
-    try:
-        return ET.fromstring(body)
-    except ET.ParseError as e:
-        logging.exception("XML parse error")
-        raise
-
-
-def _txt(el: Optional[ET.Element]) -> str:
-    return (el.text or '').strip() if el is not None else ''
-
-
-# -------- Shopify REST helpers --------
-def _shopify_get(path: str, params: Optional[dict] = None):
-    r = session.get(BASE_URL + path, params=params, timeout=30)
-    if r.status_code >= 400:
-        logging.error("GET %s failed: %s %s", path, r.status_code, r.text[:500])
-    return r
-
-
-def _shopify_post(path: str, json: dict):
-    r = session.post(BASE_URL + path, json=json, timeout=30)
-    if r.status_code >= 400:
-        logging.error("POST %s failed: %s %s", path, r.status_code, r.text[:500])
-    return r
-
-
-def _shopify_put(path: str, json: dict):
-    r = session.put(BASE_URL + path, json=json, timeout=30)
-    if r.status_code >= 400:
-        logging.error("PUT %s failed: %s %s", path, r.status_code, r.text[:500])
-    return r
-
-
-# -------- Collections (Product Groups) --------
-def upsert_custom_collection_by_pg(pg_no: str, name: str, parent_pg_no: str = "") -> Optional[int]:
-    """Create or update a Custom Collection to represent a Uni Micro product group.
-    Strategy: title = f"PG {pg_no} – {name}" so we can look it up deterministically.
-    We also store metafield unimicro.product_group_no = pg_no.
-    Returns collection_id or None.
-    """
-    title = f"PG {pg_no} – {name}".strip()
-
-    # Try to find by title (REST supports title param for collections)
-    r = _shopify_get("/custom_collections.json", params={"title": title, "limit": 1})
-    if r.ok:
-        data = r.json().get("custom_collections", [])
-        if data:
-            col = data[0]
-            cid = col["id"]
-            logging.info("Found existing collection %s (%s)", title, cid)
-            # Ensure metafield is set
-            set_collection_metafield(cid, namespace="unimicro", key="product_group_no", value=pg_no)
-            if parent_pg_no:
-                set_collection_metafield(cid, namespace="unimicro", key="parent_product_group_no", value=parent_pg_no)
-            return int(cid)
-
-    # Create if not found
-    payload = {
-        "custom_collection": {
-            "title": title,
-            "published": True,
-        }
-    }
-    r = _shopify_post("/custom_collections.json", json=payload)
-    if not r.ok:
         return None
-    col = r.json()["custom_collection"]
-    cid = int(col["id"])
-    logging.info("Created collection %s (%s)", title, cid)
 
-    # Metafields
-    set_collection_metafield(cid, namespace="unimicro", key="product_group_no", value=pg_no)
-    if parent_pg_no:
-        set_collection_metafield(cid, namespace="unimicro", key="parent_product_group_no", value=parent_pg_no)
-    return cid
+@app.route("/", methods=["GET"])
+def index():
+    return (
+        "Uni Micro payload capture endpoint.\n"
+        "POST to /twinxml/postproduct or /twinxml/postproduct.asp\n",
+        200,
+    )
 
+def save_file(path, data, mode="wb"):
+    with open(path, mode) as f:
+        f.write(data)
+    logger.info(f"Saved: {path}")
 
-def set_collection_metafield(collection_id: int, namespace: str, key: str, value: str):
-    payload = {
-        "metafield": {
-            "namespace": namespace,
-            "key": key,
-            "type": "single_line_text_field",
-            "value": str(value),
-            # owner will be inferred from POST path
-        }
-    }
-    _shopify_post(f"/collections/{collection_id}/metafields.json", json=payload)
+def make_ok_response(body="OK"):
+    # exact plain text + CRLF; windows-1252 charset
+    resp = Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
+    return resp
 
+@app.route("/twinxml/postproduct", methods=["GET", "POST"])
+@app.route("/twinxml/postproduct.asp", methods=["GET", "POST"])
+def capture():
+    req = request
+    # Collect metadata
+    remote_addr = request.remote_addr
+    method = request.method
+    headers = dict(request.headers)
+    query_params = request.args.to_dict(flat=False)  # keep repeated params if present
 
-# -------- Products --------
-def find_variant_by_sku(sku: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """Return (product_id, variant_id, inventory_item_id) for an existing variant by SKU.
-    Uses REST /variants.json?sku=...
-    """
-    r = _shopify_get("/variants.json", params={"sku": sku, "limit": 1})
-    if not r.ok:
-        return (None, None, None)
-    variants = r.json().get("variants", [])
-    if not variants:
-        return (None, None, None)
-    v = variants[0]
-    return (int(v["product_id"]), int(v["id"]), int(v["inventory_item_id"]))
+    logger.info(f"Received {method} {request.path} from {remote_addr}")
+    logger.info(f"Query params: {query_params}")
+    logger.info(f"Headers: { {k: headers.get(k) for k in ['User-Agent','Content-Type','Content-Length','Authorization']} }")
 
+    raw_body = request.get_data()  # bytes, raw payload
 
-def create_simple_product(title: str, body_html: str, sku: str, price: str, barcode: str = "", vendor: str = "", product_type: str = "") -> Tuple[int, int, int]:
-    payload = {
-        "product": {
-            "title": title,
-            "body_html": body_html or None,
-            "vendor": vendor or None,
-            "product_type": product_type or None,
-            "published": True,
-            "variants": [
-                {
-                    "sku": sku,
-                    "price": str(price),
-                    "barcode": barcode or None,
-                    "inventory_management": "shopify",
-                    "requires_shipping": True,
-                }
-            ]
-        }
-    }
-    r = _shopify_post("/products.json", json=payload)
-    r.raise_for_status()
-    p = r.json()["product"]
-    v = p["variants"][0]
-    return int(p["id"]), int(v["id"]), int(v["inventory_item_id"])
+    # Save raw body
+    raw_name = safe_filename("raw_payload", "bin")
+    raw_path = os.path.join(SAVE_DIR, raw_name)
+    save_file(raw_path, raw_body, mode="wb")
 
+    saved_files = {"raw": raw_path}
 
-def update_variant_price(variant_id: int, price: str):
-    payload = {"variant": {"id": variant_id, "price": str(price)}}
-    _shopify_put(f"/variants/{variant_id}.json", json=payload)
-
-
-def set_inventory(inventory_item_id: int, available: int):
-    if not SHOPIFY_LOCATION_ID:
-        logging.error("SHOPIFY_LOCATION_ID not set; cannot set inventory levels")
-        return
-    payload = {
-        "location_id": int(SHOPIFY_LOCATION_ID),
-        "inventory_item_id": int(inventory_item_id),
-        "available": int(available)
-    }
-    _shopify_post("/inventory_levels/set.json", json=payload)
-
-
-def assign_product_to_collection(product_id: int, collection_id: int):
-    payload = {"collect": {"product_id": int(product_id), "collection_id": int(collection_id)}}
-    r = _shopify_post("/collects.json", json=payload)
-    if r.status_code == 422 and 'already' in r.text.lower():
-        # already assigned — ignore
-        return
-
-
-# -------- TwinXML endpoints --------
-# Accept multiple casings and extensions (.asp, .aspx) for ProductGroup
-@app.post('/twinxml/postproductgroup.aspx')
-@app.post('/twinxml/postproductgroup.asp')
-@app.post('/TwinXML/PostProductGroup.aspx')
-@app.post('/TwinXML/PostProductGroup.asp')
-@app.post('/twinxml/postproductgroup')
-@app.post('/TwinXML/PostProductGroup')
-def post_productgroup():
-    # Basic auth via query (?username=&password=) OR headers
-    user, pw = _read_auth_from_request()
-    if not is_authenticated(user, pw):
-        return _auth_fail()
-
-    root = _parse_xml(_get_xml_bytes())
-
-    # Accept either a single <ProductGroup> or container <ArrayOfProductGroup><ProductGroup/></...>
-    product_groups = []
-    if root.tag.endswith('ArrayOfProductGroup'):
-        product_groups = list(root.findall('.//ProductGroup'))
-    elif root.tag.endswith('ProductGroup'):
-        product_groups = [root]
-    else:
-        # Fallback: try to gather children named ProductGroup regardless
-        product_groups = list(root.findall('.//ProductGroup'))
-
-    created, updated, failed = 0, 0, 0
-
-    for pg in product_groups:
-        pg_no = _txt(pg.find('ProductGroupNo')) or _txt(pg.find('ProductGroupID'))
-        name = _txt(pg.find('ProductGroupName')) or _txt(pg.find('Name'))
-        parent_pg = _txt(pg.find('ParentProductGroupNo')) or _txt(pg.find('ParentID'))
-
-        if not pg_no or not name:
-            logging.error("Skipping ProductGroup with missing number or name: %s", ET.tostring(pg)[:200])
-            failed += 1
-            continue
-        cid = upsert_custom_collection_by_pg(pg_no, name, parent_pg)
-        if cid:
-            # Simple heuristic: treat as updated if existed
-            # (We checked by title first; if found, we returned early.)
-            # To detect created vs updated precisely we could return a flag; keep it simple.
-            updated += 1
-        else:
-            failed += 1
-
-    msg = f"OK ProductGroups processed={len(product_groups)} updated={updated} failed={failed}"
-    logging.info(msg)
-    return ok_txt(msg)
-
-
-# Accept multiple casings and extensions (.asp, .aspx) for Product
-@app.post('/twinxml/postproduct.aspx')
-@app.post('/twinxml/postproduct.asp')
-@app.post('/TwinXML/PostProduct.aspx')
-@app.post('/TwinXML/PostProduct.asp')
-@app.post('/twinxml/postproduct')
-@app.post('/TwinXML/PostProduct')
-def post_product():
-    # Basic auth via query (?username=&password=) OR headers
-    user, pw = _read_auth_from_request()
-    if not is_authenticated(user, pw):
-        return _auth_fail()
-
-    root = _parse_xml(_get_xml_bytes())
-
-    # Accept either <ArrayOfProduct><Product/> or a single <Product>
-    products = []
-    if root.tag.endswith('ArrayOfProduct'):
-        products = list(root.findall('.//Product'))
-    elif root.tag.endswith('Product'):
-        products = [root]
-    else:
-        products = list(root.findall('.//Product'))
-
-    processed, created, updated, failed = 0, 0, 0, 0
-
-    for p in products:
-        sku = _txt(p.find('ProductNo')) or _txt(p.find('No')) or _txt(p.find('SKU'))
-        title = _txt(p.find('ProductName')) or _txt(p.find('Name'))
-        desc = _txt(p.find('Description'))
-        price = _txt(p.find('Price')) or _txt(p.find('SalesPrice')) or '0'
-        barcode = _txt(p.find('EAN')) or _txt(p.find('Barcode'))
-        vendor = _txt(p.find('Supplier')) or _txt(p.find('Vendor'))
-        product_type = _txt(p.find('ProductGroupName')) or _txt(p.find('Type'))
-        pg_no = _txt(p.find('ProductGroupNo')) or _txt(p.find('GroupNo'))
-        stock_txt = _txt(p.find('Stock')) or _txt(p.find('Quantity')) or '0'
+    # If content-type looks like multipart/form-data, save as-is and also try to parse parts (not auto-parsing here).
+    ctype = headers.get("Content-Type", "")
+    if "multipart/form-data" in ctype.lower():
+        # Save raw already helps; optionally also save as .multipart.txt
+        mp_name = safe_filename("multipart_payload", "txt")
+        mp_path = os.path.join(SAVE_DIR, mp_name)
         try:
-            stock = int(float(stock_txt))
-        except Exception:
-            stock = 0
+            save_file(mp_path, raw_body, mode="wb")
+            saved_files["multipart"] = mp_path
+        except Exception as e:
+            logger.warning(f"Couldn't save multipart payload copy: {e}")
 
-        if not sku or not title:
-            logging.error("Skipping Product with missing SKU or title: %s", ET.tostring(p)[:200])
-            failed += 1
-            continue
+    # If query contains hex=true, attempt to hex-decode the body
+    try:
+        hex_flag = any(k.lower() == "hex" and "true" in [v.lower() for v in query_params[k]] for k in query_params)
+    except Exception:
+        hex_flag = False
 
+    if hex_flag:
+        logger.info("Detected hex=true in query params — attempting hex decode.")
         try:
-            existing = find_variant_by_sku(sku)
-            prod_id, var_id, inv_item_id = existing
-            if prod_id is None:
-                # Create new product
-                prod_id, var_id, inv_item_id = create_simple_product(title=title, body_html=desc, sku=sku, price=str(price), barcode=barcode, vendor=vendor, product_type=product_type)
-                created += 1
-                logging.info("Created product %s (variant %s) for SKU %s", prod_id, var_id, sku)
-            else:
-                # Update price on existing variant
-                update_variant_price(var_id, str(price))
-                updated += 1
-                logging.info("Updated price for SKU %s (variant %s)", sku, var_id)
+            # remove whitespace/newlines just in case
+            hexstr = raw_body.decode("ascii", errors="ignore").strip()
+            decoded = binascii.unhexlify(hexstr)
+            dec_name = safe_filename("hex_decoded", "bin")
+            dec_path = os.path.join(SAVE_DIR, dec_name)
+            save_file(dec_path, decoded, mode="wb")
+            saved_files["hex_decoded"] = dec_path
 
-            # Inventory
-            if inv_item_id:
-                set_inventory(inv_item_id, stock)
+            # Try to pretty-print XML if it is XML
+            pretty = try_pretty_xml(decoded)
+            if pretty:
+                pretty_name = dec_path + ".pretty.xml"
+                save_file(pretty_name, pretty, mode="wb")
+                saved_files["pretty_xml"] = pretty_name
+        except Exception as e:
+            logger.exception("Hex decode failed: %s", e)
 
-            # Assign to collection if we have a ProductGroupNo
-            if pg_no:
-                cid = upsert_custom_collection_by_pg(pg_no, product_type or f"Group {pg_no}")
-                if cid:
-                    assign_product_to_collection(prod_id, cid)
-        except Exception:
-            logging.exception("Failed upsert for SKU %s", sku)
-            failed += 1
-            continue
+    # Try to interpret raw as XML and pretty print
+    pretty = try_pretty_xml(raw_body)
+    if pretty:
+        pretty_name = os.path.join(SAVE_DIR, safe_filename("pretty_xml", "xml"))
+        save_file(pretty_name, pretty, mode="wb")
+        saved_files["pretty_xml_raw"] = pretty_name
 
-        processed += 1
+    # Also record headers+query metadata as json-like text
+    meta_name = os.path.join(SAVE_DIR, safe_filename("meta", "txt"))
+    meta_contents = []
+    meta_contents.append(f"time_utc: {timestamp()}")
+    meta_contents.append(f"path: {request.path}")
+    meta_contents.append(f"remote_addr: {remote_addr}")
+    meta_contents.append("query_params:")
+    for k, vals in query_params.items():
+        meta_contents.append(f"  {k}: {vals}")
+    meta_contents.append("headers:")
+    for k, v in headers.items():
+        meta_contents.append(f"  {k}: {v}")
+    meta_contents.append(f"saved_files: {saved_files}")
+    meta_text = "\n".join(meta_contents).encode("utf-8")
+    save_file(meta_name, meta_text, mode="wb")
+    saved_files["meta"] = meta_name
 
-    msg = f"OK Products processed={processed} created={created} updated={updated} failed={failed}"
-    logging.info(msg)
-    return ok_txt(msg)
+    # Log summary for Render logs
+    logger.info(f"Saved files summary: {saved_files}")
 
+    # Return exact OK response (some Uni Micro setups expect CRLF and windows-1252)
+    return make_ok_response("OK")
 
-# Optional: health check for Render
-# Root + health checks so uptime probes don't 404
-@app.get('/')
-@app.get('/health')
-def health():
-    return ok_txt("OK")
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+if __name__ == "__main__":
+    logger.info(f"Starting uni-micro-capture server on 0.0.0.0:{PORT}, writing payloads to {SAVE_DIR}")
+    # Use threaded server; in Render production they run via gunicorn recommended below.
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
