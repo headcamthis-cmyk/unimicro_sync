@@ -45,7 +45,7 @@ def _parse_xml(raw_bytes, what="payload"):
         return ET.fromstring(raw_bytes.decode('utf-8', errors='replace'))
 
 def _gettext(node, *names):
-    # Try direct and nested; case- and namespace-tolerant
+    # Try direct and nested; case-/namespace-tolerant
     for n in names:
         el = node.find(n) or node.find(n.lower()) or node.find(f".//{n}")
         if el is not None and el.text and el.text.strip():
@@ -148,6 +148,10 @@ def _handle_product_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
+    if request.method == 'GET' or not raw or not raw.strip():
+        logging.info("Product endpoint called with empty body/preflight; returning OK")
+        return ok()
+
     root = _parse_xml(raw, "product xml")
     collections = get_existing_collections()
     logging.info(f"Loaded {len(collections)} collections")
@@ -174,8 +178,10 @@ def _handle_product_post():
 
         quantity = None
         if qty_text is not None:
-            try: quantity = int(float(qty_text.replace(',', '.')))
-            except Exception: quantity = None
+            try:
+                quantity = int(float(qty_text.replace(',', '.')))
+            except Exception:
+                quantity = None
 
         missing = [k for k, v in {"sku": sku, "title": title, "price": price, "group_id": group_id, "quantity": quantity}.items() if v in (None, "")]
         if missing:
@@ -205,7 +211,8 @@ def _handle_product_post():
             updated += 1
         else:
             product_id, inventory_item_id = create_product(title, sku, price_norm)
-            if product_id: assign_product_to_collection(product_id, collection_id)
+            if product_id:
+                assign_product_to_collection(product_id, collection_id)
             if inventory_item_id is not None and quantity is not None:
                 update_inventory_level(inventory_item_id, quantity)
             created += 1
@@ -219,6 +226,10 @@ def _handle_productgroup_post():
         return Response('Unauthorized', status=401)
 
     raw = request.get_data()
+    if request.method == 'GET' or not raw or not raw.strip():
+        logging.info("ProductGroup endpoint called with empty body/preflight; returning OK")
+        return ok()
+
     root = _parse_xml(raw, "product group xml")
 
     existing = get_existing_collections()
@@ -260,25 +271,57 @@ def _handle_files_post():
         return Response('ERROR', mimetype='text/plain', status=500)
 
 # -------- Route aliases --------
-# Per Uni docs, twinxml is appended automatically and default names are .asp (but can be .aspx). Support all combos. :contentReference[oaicite:2]{index=2}
+# Accept .asp/.aspx and common path variants (including accidental double 'twinxml').
 
-# PRODUCTS
-@app.route('/twinxml/postproduct.asp', methods=['POST'])
-@app.route('/twinxml/postproduct.aspx', methods=['POST'])
-@app.route('/postproduct.asp', methods=['POST'])
-@app.route('/postproduct.aspx', methods=['POST'])
-@app.route('/product/twinxml/postproduct.asp', methods=['POST'])
-@app.route('/product/twinxml/postproduct.aspx', methods=['POST'])
+# PRODUCTS (single product)
+@app.route('/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproduct.aspx', methods=['GET','POST'])
+@app.route('/postproduct.asp', methods=['GET','POST'])
+@app.route('/postproduct.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproduct.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproduct.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproduct.aspx', methods=['GET','POST'])
 def postproduct_router():
     return _handle_product_post()
 
+# PRODUCTS (bulk / list variants → same handler)
+@app.route('/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/productlist.asp', methods=['GET','POST'])
+@app.route('/productlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/postproductlist.asp', methods=['GET','POST'])
+@app.route('/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/twinxml/products.aspx', methods=['GET','POST'])
+@app.route('/products.asp', methods=['GET','POST'])
+@app.route('/products.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/products.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/productlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/productlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductlist.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductlist.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/products.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/products.aspx', methods=['GET','POST'])
+def productlist_router():
+    return _handle_product_post()
+
 # PRODUCT GROUPS
-@app.route('/twinxml/postproductgroup.asp', methods=['POST'])
-@app.route('/twinxml/postproductgroup.aspx', methods=['POST'])
-@app.route('/postproductgroup.asp', methods=['POST'])
-@app.route('/postproductgroup.aspx', methods=['POST'])
-@app.route('/product/twinxml/postproductgroup.asp', methods=['POST'])
-@app.route('/product/twinxml/postproductgroup.aspx', methods=['POST'])
+@app.route('/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/twinxml/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/postproductgroup.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductgroup.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/postproductgroup.aspx', methods=['GET','POST'])
 def postproductgroup_router():
     return _handle_productgroup_post()
 
@@ -289,26 +332,78 @@ def postproductgroup_router():
 @app.route('/postfiles.aspx', methods=['POST'])
 @app.route('/product/twinxml/postfiles.asp', methods=['POST'])
 @app.route('/product/twinxml/postfiles.aspx', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.asp', methods=['POST'])
+@app.route('/twinxml/twinxml/postfiles.aspx', methods=['POST'])
 def postfiles_router():
     return _handle_files_post()
 
-# STATUS
-@app.route('/twinxml/status.asp', methods=['GET', 'POST'])
-@app.route('/twinxml/status.aspx', methods=['GET', 'POST'])
-@app.route('/status.asp', methods=['GET', 'POST'])
-@app.route('/status.aspx', methods=['GET', 'POST'])
-@app.route('/product/twinxml/status.asp', methods=['GET', 'POST'])
-@app.route('/product/twinxml/status.aspx', methods=['GET', 'POST'])
+# STATUS (no-op OK)
+@app.route('/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/twinxml/status.aspx', methods=['GET','POST'])
+@app.route('/status.asp', methods=['GET','POST'])
+@app.route('/status.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/status.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/status.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/status.aspx', methods=['GET','POST'])
 def status():
     return ok()
 
-# ORDERS placeholder (still “OK”)
-@app.route('/twinxml/orders.asp', methods=['GET', 'POST'])
-@app.route('/orders.asp', methods=['GET', 'POST'])
-@app.route('/product/twinxml/orders.asp', methods=['GET', 'POST'])
+# ORDERS placeholder (return minimal XML so UM doesn't abort)
+def _orders_ok_xml():
+    return Response("<Orders/>", mimetype="text/xml")
+
+@app.route('/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/twinxml/orders.aspx', methods=['GET','POST'])
+@app.route('/orders.asp', methods=['GET','POST'])
+@app.route('/orders.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/orders.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/orders.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/orders.aspx', methods=['GET','POST'])
 def orders():
+    return _orders_ok_xml()
+
+# ---- FINAL catch-all + loud logging ----------------------------------------
+def _looks_like_product(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in [
+        "postproduct", "productlist", "products", "postproductlist", "product",
+        "postarticle", "articles", "article",
+        "postitem", "items", "item",
+        "uploadproduct", "sendproduct", "exportproducts"
+    ])
+
+def _looks_like_group(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ["productgroup", "postproductgroup", "groups", "group"])
+
+@app.route('/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/twinxml/<path:name>.aspx', methods=['GET','POST'])
+@app.route('/product/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/product/twinxml/<path:name>.aspx', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/<path:name>.asp', methods=['GET','POST'])
+@app.route('/twinxml/twinxml/<path:name>.aspx', methods=['GET','POST'])
+def twinxml_fallback(name):
+    logging.info(f"FALLBACK hit name='{name}' method={request.method} len={request.content_length}")
+    try:
+        if _looks_like_product(name):
+            logging.info("→ Routing to _handle_product_post() from fallback")
+            return _handle_product_post()
+        if _looks_like_group(name):
+            logging.info("→ Routing to _handle_productgroup_post() from fallback")
+            return _handle_productgroup_post()
+        n = name.lower()
+        if "order" in n:
+            logging.info("→ Returning empty <Orders/> (fallback)")
+            return Response("<Orders/>", mimetype="text/xml")
+        if "status" in n:
+            logging.info("→ Returning OK (status fallback)")
+            return ok()
+    except Exception:
+        logging.exception(f"twinxml_fallback error for name='{name}'")
+    # Default: don't fail UM preflights
     return ok()
 
 # Entrypoint
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+if __name__
