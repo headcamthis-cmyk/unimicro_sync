@@ -1,3 +1,4 @@
+
 from flask import Flask, request, Response
 import xml.etree.ElementTree as ET
 import requests
@@ -18,10 +19,8 @@ def check_auth(auth):
     password = request.args.get("pass")
     expected_user = USERNAME
     expected_password = PASSWORD
-
     print(f"Auth attempt with user: {user}, password: {password}")
     print(f"Expected user: {expected_user}, expected password: {expected_password}")
-
     return user == expected_user and password == expected_password
 
 def find_product_by_sku(sku):
@@ -52,7 +51,8 @@ def product(path):
         return Response("Unauthorized", status=401)
 
     data = request.data.decode('utf-8')
-    print(f"Received product XML on path /product/{path}:\n{data}")
+    print(f"Received product XML on path /product/{path}:
+{data}")
     print(f"Payload size: {len(data)} bytes")
 
     try:
@@ -60,6 +60,7 @@ def product(path):
         tags = sorted({elem.tag for elem in root.iter()})
         print(f"DEBUG: incoming XML tags: {tags}")
 
+        # Handle product groups
         if 'productgroup' in tags:
             for pg in root.findall(".//productgroup"):
                 group_id = pg.findtext("id")
@@ -84,7 +85,69 @@ def product(path):
                                      json=collection_payload, headers=headers)
                 print(f"Shopify response: {resp.status_code} - {resp.text}")
 
+        # Handle products
+        products = root.findall(".//Product") + root.findall(".//product")
+        for product in products:
+            sku = product.findtext("SKU")
+            title = product.findtext("ProductName")
+            description = product.findtext("Description")
+            price = product.findtext("Price")
+            stock = int(product.findtext("Stock", "0"))
+
+            if not sku:
+                print("Skipping product without SKU.")
+                continue
+
+            existing_product, existing_variant = find_product_by_sku(sku)
+            headers = {
+                "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+                "Content-Type": "application/json"
+            }
+
+            if existing_product:
+                product_id = existing_product['id']
+                variant_id = existing_variant['id']
+
+                update_product_payload = {
+                    "product": {
+                        "id": product_id,
+                        "body_html": description
+                    }
+                }
+                update_variant_payload = {
+                    "variant": {
+                        "id": variant_id,
+                        "price": price,
+                        "inventory_quantity": stock
+                    }
+                }
+
+                resp1 = requests.put(f"{SHOPIFY_API_URL}/products/{product_id}.json",
+                                     json=update_product_payload, headers=headers)
+                resp2 = requests.put(f"{SHOPIFY_API_URL}/variants/{variant_id}.json",
+                                     json=update_variant_payload, headers=headers)
+                print(f"Updated product {title} (SKU: {sku}): Product Resp: {resp1.status_code}, Variant Resp: {resp2.status_code}")
+
+            else:
+                product_payload = {
+                    "product": {
+                        "title": title,
+                        "body_html": description,
+                        "variants": [
+                            {
+                                "price": price,
+                                "sku": sku,
+                                "inventory_quantity": stock
+                            }
+                        ]
+                    }
+                }
+                create_url = f"{SHOPIFY_API_URL}/products.json"
+                resp = requests.post(create_url, json=product_payload, headers=headers)
+                print(f"Created new product {title} (SKU: {sku}): Status {resp.status_code}")
+
         return Response("Products processed and synced to Shopify.", status=200)
+
     except ET.ParseError:
         return Response("Invalid XML format.", status=400)
     except Exception as e:
