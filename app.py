@@ -12,7 +12,7 @@ Notes
 • Basic auth: username/password = synall / synall (adjust below if needed)
 • Render: set environment vars in the service (DO NOT hardcode secrets):
     SHOPIFY_DOMAIN      e.g. "asmshop.no" (or "allsupermotoas.myshopify.com")
-    SHOPIFY_TOKEN       e.g. "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"
+    SHOPIFY_TOKEN       e.g. "shpat_***"
     SHOPIFY_API_VERSION e.g. "2024-10"
     SHOPIFY_LOCATION_ID e.g. "16764928067"
 • Returns plain text with CRLF (\r\n) because Uni Micro can be picky
@@ -37,6 +37,8 @@ import xml.etree.ElementTree as ET
 import requests
 
 app = Flask(__name__)
+# Accept both with and without trailing slashes globally
+app.url_map.strict_slashes = False
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 # -------- Shopify config --------
@@ -47,7 +49,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 #   SHOPIFY_LOCATION_ID (numeric location id for inventory)
 # OPTION B: hardcode below (only for testing/dev). These are used if env vars are missing.
 _HARDCODED_SHOPIFY_DOMAIN = "asmshop.no"                 # or "allsupermotoas.myshopify.com"
-_HARDCODED_SHOPIFY_TOKEN = "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"   # replace for local tests only
+_HARDCODED_SHOPIFY_TOKEN = "YOUR_SHOPIFY_ACCESS_TOKEN"   # replace for local tests only
 _HARDCODED_API_VERSION   = "2024-10"
 _HARDCODED_LOCATION_ID   = "16764928067"                 # your Shopify location id
 
@@ -89,6 +91,39 @@ def _log_every_request():
 def _auth_fail() -> Response:
     return Response("NOT AUTHORIZED\r\n", status=401, mimetype="text/plain; charset=windows-1252")
 
+
+# -------- Helpers for Uni variations --------
+
+def _read_auth_from_request() -> tuple[str, str]:
+    """Accept both Uni variations: username/password and user/pass, case-insensitive.
+    Also supports HTTP Basic auth if present.
+    """
+    from flask import request as _rq
+    user = ''
+    pw = ''
+    args_ci = {k.lower(): v for k, v in _rq.args.items()}
+    user = args_ci.get('username') or args_ci.get('user') or ''
+    pw = args_ci.get('password') or args_ci.get('pass') or ''
+    if (not user or not pw) and _rq.authorization:
+        user = user or (_rq.authorization.username or '')
+        pw = pw or (_rq.authorization.password or '')
+    return user, pw
+
+
+def _get_xml_bytes() -> bytes:
+    """Handle Uni's optional hex payload (?hex=true). If hex=true, request.data contains ASCII hex.
+    Otherwise, return request.data as-is.
+    """
+    from flask import request as _rq
+    args_ci = {k.lower(): v for k, v in _rq.args.items()}
+    if str(args_ci.get('hex', 'false')).lower() in ('1', 'true', 'yes'):
+        try:
+            hex_str = _rq.data.decode('ascii', errors='ignore').strip()
+            return bytes.fromhex(hex_str)
+        except Exception:
+            logging.exception('Failed to decode hex body; using raw request.data')
+            return _rq.data
+    return _rq.data
 
 # -------- XML helpers --------
 def _parse_xml(body: bytes) -> ET.Element:
@@ -249,15 +284,20 @@ def assign_product_to_collection(product_id: int, collection_id: int):
 
 
 # -------- TwinXML endpoints --------
+# Accept multiple casings and extensions (.asp, .aspx) for ProductGroup
 @app.post('/twinxml/postproductgroup.aspx')
+@app.post('/twinxml/postproductgroup.asp')
+@app.post('/TwinXML/PostProductGroup.aspx')
+@app.post('/TwinXML/PostProductGroup.asp')
+@app.post('/twinxml/postproductgroup')
+@app.post('/TwinXML/PostProductGroup')
 def post_productgroup():
     # Basic auth via query (?username=&password=) OR headers
-    user = request.args.get('username', '') or request.authorization.username if request.authorization else ''
-    pw = request.args.get('password', '') or request.authorization.password if request.authorization else ''
+    user, pw = _read_auth_from_request()
     if not is_authenticated(user, pw):
         return _auth_fail()
 
-    root = _parse_xml(request.data)
+    root = _parse_xml(_get_xml_bytes())
 
     # Accept either a single <ProductGroup> or container <ArrayOfProductGroup><ProductGroup/></...>
     product_groups = []
@@ -294,15 +334,20 @@ def post_productgroup():
     return ok_txt(msg)
 
 
+# Accept multiple casings and extensions (.asp, .aspx) for Product
 @app.post('/twinxml/postproduct.aspx')
+@app.post('/twinxml/postproduct.asp')
+@app.post('/TwinXML/PostProduct.aspx')
+@app.post('/TwinXML/PostProduct.asp')
+@app.post('/twinxml/postproduct')
+@app.post('/TwinXML/PostProduct')
 def post_product():
     # Basic auth via query (?username=&password=) OR headers
-    user = request.args.get('username', '') or request.authorization.username if request.authorization else ''
-    pw = request.args.get('password', '') or request.authorization.password if request.authorization else ''
+    user, pw = _read_auth_from_request()
     if not is_authenticated(user, pw):
         return _auth_fail()
 
-    root = _parse_xml(request.data)
+    root = _parse_xml(_get_xml_bytes())
 
     # Accept either <ArrayOfProduct><Product/> or a single <Product>
     products = []
@@ -371,6 +416,8 @@ def post_product():
 
 
 # Optional: health check for Render
+# Root + health checks so uptime probes don't 404
+@app.get('/')
 @app.get('/health')
 def health():
     return ok_txt("OK")
