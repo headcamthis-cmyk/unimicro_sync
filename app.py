@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify
 import xml.etree.ElementTree as ET
 import requests
+import re
+import base64
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -15,12 +17,16 @@ ENV = os.environ.get("ENV", "prod")
 UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
-# Shopify
-SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")  # bruk myshopify-domenet
+# Shopify (bruk myshopify-domenet)
+SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
+
+# Feature toggles (kan styres via env om ønskelig)
+ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "true").lower() in ("1","true","yes")
+ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lower() in ("1","true","yes")
 
 # DB
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -147,6 +153,24 @@ def to_int_safe(val):
         except Exception:
             return None
 
+def clean_b64(data):
+    """Fjerner evt. data-URI prefix og whitespace, verifiserer base64."""
+    if not data:
+        return None
+    s = data.strip()
+    m = re.match(r"^data:image/[\w+.-]+;base64,(.*)$", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        s = m.group(1)
+    # fjern whitespace/linjeskift
+    s = re.sub(r"\s+", "", s)
+    # valider at det er base64
+    try:
+        # Ikke dekod hele (kan være stor) – dekod liten prøve
+        base64.b64decode(s[:120] + "==", validate=False)
+    except Exception:
+        return None
+    return s
+
 # ---- handle hex=true + tolerant XML tags ----
 def read_xml_body():
     """
@@ -255,6 +279,66 @@ def shopify_set_inventory(inventory_item_id, available):
         raise RuntimeError(f"Shopify inventory set failed {r.status_code}: {r.text[:500]}")
     return r.json()
 
+def shopify_get_images(product_id):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products/{product_id}/images.json"
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        log.warning("Shopify get images failed %s: %s", r.status_code, r.text[:500])
+        return []
+    return r.json().get("images", [])
+
+def shopify_add_image(product_id, image_b64, filename=None, position=None, alt=None):
+    """Laster opp ett bilde (base64-attachment)."""
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products/{product_id}/images.json"
+    payload = {
+        "image": {
+            "attachment": image_b64
+        }
+    }
+    if filename:
+        payload["image"]["filename"] = filename
+    if position is not None:
+        payload["image"]["position"] = int(position)
+    if alt:
+        payload["image"]["alt"] = alt
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Shopify add image failed {r.status_code}: {r.text[:500]}")
+    return r.json()["image"]
+
+def shopify_create_smart_collection_for_group(groupid):
+    """
+    Oppretter en Smart Collection som automatisk inkluderer produkter som har taggen 'group-<groupid>'.
+    Hvis den finnes fra før, ignorerer vi 422-feil på tittel/handle.
+    """
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/smart_collections.json"
+    title = f"Group {groupid}"
+    handle = f"group-{groupid}"
+    body = {
+        "smart_collection": {
+            "title": title,
+            "handle": handle,
+            "rules": [
+                {"column": "tag", "relation": "equals", "condition": handle}
+            ],
+            "disjunctive": False,
+            "published": True
+        }
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+    if r.status_code in (200, 201):
+        sc = r.json().get("smart_collection", {})
+        log.info("Smart collection created for %s (id=%s)", handle, sc.get("id"))
+        return sc
+    # 422 kan være "title has already been taken" eller handle-konflikt – vi ignorerer
+    if r.status_code == 422:
+        log.info("Smart collection likely exists for %s (422).", handle)
+        return None
+    raise RuntimeError(f"Shopify create smart collection failed {r.status_code}: {r.text[:500]}")
+
 def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
     """
     Forsøk å sette lager. Hvis tracking ikke er aktivert, slå på inventory_management=shopify og prøv igjen.
@@ -265,13 +349,13 @@ def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
     except RuntimeError as e:
         if "does not have inventory tracking enabled" not in str(e):
             raise
-    # Slå på tracking og prøv igjen
     shopify_update_variant(variant_id, {
         "inventory_management": "shopify",
         "inventory_policy": "deny",   # eller "continue"
         "requires_shipping": True
     })
     shopify_set_inventory(inventory_item_id, stock)
+
 
 def upsert_shopify_product_from_row(row):
     sku = row["prodid"]
@@ -281,18 +365,18 @@ def upsert_shopify_product_from_row(row):
     barcode = row["barcode"]
     stock = row["stock"] or 0
     is_active = (row["webactive"] == 1)
+    groupid = row["groupid"]
+    image_b64_raw = row["image_b64"]
 
-    # Minimal trygg payload (uten "status")
+    # Minimal trygg payload (uten "status" i update)
     product_payload = {
         "title": name or sku,
         "body_html": body_html or "",
-        # "published": bool(is_active),  # valgfritt om du vil styre publisering
-        "tags": [f"group-{row['groupid']}"] if row["groupid"] else [],
+        "tags": [f"group-{groupid}"] if groupid else [],
         "variants": [{
             "sku": sku,
             "price": f"{(price or 0):.2f}",
             "barcode": barcode or None,
-            # Viktig: slå på tracking ved opprettelse
             "inventory_management": "shopify",
             "inventory_policy": "deny"
         }]
@@ -313,20 +397,52 @@ def upsert_shopify_product_from_row(row):
             update_payload["tags"] = ",".join(product_payload["tags"])
 
         shopify_update_product(product_id, update_payload)
+        log.info("Shopify UPDATE OK sku=%s product_id=%s admin=%s",
+                 sku, product_id, f"https://{SHOPIFY_DOMAIN}/admin/products/{product_id}")
     else:
         create_payload = dict(product_payload)
         if create_payload["tags"]:
             create_payload["tags"] = ",".join(create_payload["tags"])
+        # Sett status KUN ved opprettelse:
+        create_payload["status"] = "active" if is_active else "draft"
+
         created = shopify_create_product(create_payload)
         product_id = created["id"]
         variant_id = created["variants"][0]["id"]
         inventory_item_id = created["variants"][0]["inventory_item_id"]
+        log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=%s",
+                 sku, product_id, create_payload["status"],
+                 f"https://{SHOPIFY_DOMAIN}/admin/products/{product_id}")
+
+    # Auto: Smart collection for groupid
+    if ENABLE_GROUP_COLLECTIONS and groupid:
+        try:
+            shopify_create_smart_collection_for_group(groupid)
+        except Exception as e:
+            log.warning("Smart collection create failed for group %s: %s", groupid, e)
 
     # Lager (med auto-enable tracking ved behov)
     try:
         ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock)
     except Exception as e:
         log.warning("Inventory set failed for %s after enabling tracking: %s", sku, e)
+
+    # Bildeopplasting (kun hvis ingen bilder finnes fra før)
+    if ENABLE_IMAGE_UPLOAD and image_b64_raw:
+        try:
+            images = shopify_get_images(product_id)
+            if not images:
+                cleaned = clean_b64(image_b64_raw)
+                if cleaned:
+                    fname = f"{sku}.jpg"
+                    shopify_add_image(product_id, cleaned, filename=fname, position=1, alt=name or sku)
+                    log.info("Uploaded image for sku=%s product_id=%s", sku, product_id)
+                else:
+                    log.warning("image_b64 for sku=%s was not valid base64; skipped.", sku)
+            else:
+                log.info("Product %s already has %d image(s); skipping upload.", product_id, len(images))
+        except Exception as e:
+            log.warning("Image upload failed for %s: %s", sku, e)
 
     return product_id, variant_id, inventory_item_id
 
@@ -355,6 +471,40 @@ def debug_last():
     rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 5").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+@app.route("/debug/shopify/variant/<sku>", methods=["GET"])
+def dbg_shopify_variant(sku):
+    try:
+        v = shopify_find_variant_by_sku(sku)
+        if not v:
+            return jsonify({"found": False}), 404
+        pid = v["product_id"]
+        return jsonify({
+            "found": True,
+            "variant_id": v["id"],
+            "product_id": pid,
+            "admin_url": f"https://{SHOPIFY_DOMAIN}/admin/products/{pid}"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/debug/shopify/product/<int:pid>", methods=["GET"])
+def dbg_shopify_product(pid):
+    try:
+        p = shopify_get_product(pid)
+        if not p:
+            return jsonify({"found": False}), 404
+        return jsonify({
+            "found": True,
+            "id": p["id"],
+            "title": p.get("title"),
+            "status": p.get("status"),
+            "tags": p.get("tags"),
+            "variants": [{"id": v["id"], "sku": v.get("sku")} for v in p.get("variants", [])],
+            "admin_url": f"https://{SHOPIFY_DOMAIN}/admin/products/{p['id']}"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # -------- TwinXML: varegrupper --------
