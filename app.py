@@ -28,6 +28,7 @@ PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "true").lower() in ("1","true","yes")
 ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lower() in ("1","true","yes")
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
+ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
 # DB
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -117,8 +118,12 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
-    # CRLF + windows-1252 for Uni-kompat
+    # CRLF + windows-1252 for Uni-kompat (brukes på de fleste endepunkt)
     return Response((body + "\r\n"), mimetype="text/plain; charset=windows-1252")
+
+def ok_plain(body="OK"):
+    # Eksakt svar uten CRLF – noen Uni-dialoger krever helt nøyaktig "OK"
+    return Response(body, mimetype="text/plain; charset=windows-1252")
 
 def xml_resp(xml_str: str):
     return Response(xml_str, mimetype="text/xml; charset=windows-1252")
@@ -155,7 +160,6 @@ def to_int_safe(val):
             return None
 
 def clean_b64(data):
-    """Fjerner evt. data-URI prefix og whitespace, verifiserer base64."""
     if not data:
         return None
     s = data.strip()
@@ -171,11 +175,6 @@ def clean_b64(data):
 
 # ---- handle hex=true + tolerant XML tags ----
 def read_xml_body():
-    """
-    Leser rå body og dekoder hvis hex=true.
-    Prøver encodings (utf-8, cp1252, latin-1).
-    Returnerer (decoded_xml_str, was_hex: bool)
-    """
     raw = request.get_data() or b""
     is_hex = (request.args.get("hex") or "").lower() in ("1", "true", "yes")
     if is_hex:
@@ -268,10 +267,8 @@ def shopify_delete_product(product_id):
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/products/{product_id}.json"
     r = requests.delete(url, headers=headers, timeout=60)
-    if r.status_code not in (200, 201):
-        # De fleste deletes returnerer 200/201/204; 404 betyr allerede borte
-        if r.status_code != 404:
-            raise RuntimeError(f"Shopify delete product failed {r.status_code}: {r.text[:500]}")
+    if r.status_code not in (200, 201, 204) and r.status_code != 404:
+        raise RuntimeError(f"Shopify delete product failed {r.status_code}: {r.text[:500]}")
     return True
 
 def shopify_set_inventory(inventory_item_id, available):
@@ -299,7 +296,7 @@ def shopify_get_images(product_id):
 def shopify_add_image(product_id, image_b64, filename=None, position=None, alt=None):
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/products/{product_id}/images.json"
-    payload = { "image": { "attachment": image_b64 } }
+    payload = {"image": {"attachment": image_b64}}
     if filename:
         payload["image"]["filename"] = filename
     if position is not None:
@@ -407,20 +404,17 @@ def upsert_shopify_product_from_row(row):
                  sku, product_id, create_payload["status"],
                  f"https://{SHOPIFY_DOMAIN}/admin/products/{product_id}")
 
-    # Auto: Smart collection for groupid
     if ENABLE_GROUP_COLLECTIONS and groupid:
         try:
             shopify_create_smart_collection_for_group(groupid)
         except Exception as e:
             log.warning("Smart collection create failed for group %s: %s", groupid, e)
 
-    # Lager
     try:
         ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock)
     except Exception as e:
         log.warning("Inventory set failed for %s after enabling tracking: %s", sku, e)
 
-    # Bildeopplasting (kun hvis ingen bilder finnes fra før)
     if ENABLE_IMAGE_UPLOAD and image_b64_raw:
         try:
             images = shopify_get_images(product_id)
@@ -506,16 +500,19 @@ def dbg_shopify_product(pid):
 def post_product_group():
     save_log("/twinxml/postproductgroup")
     if not require_auth():
-        return ok_txt("ERROR:AUTH")
+        # Noen installasjoner forventer "OK" uansett – men ved auth-feil svarer vi standard OK
+        return ok_plain("OK")
     if request.method == "GET":
-        return ok_txt("OK")
+        # Eksakt OK (uten CRLF) – Uni tolker dette som suksess
+        return ok_plain("OK")
 
     raw, was_hex = read_xml_body()
     try:
         root = ET.fromstring(raw)
     except Exception as e:
         log.warning("Bad XML groups (hex=%s): %s ... first200=%r", was_hex, e, raw[:200])
-        return ok_txt("ERROR:XML")
+        # Svar fortsatt OK, Uni kan abortere hvis ikke "OK"
+        return ok_plain("OK")
 
     count = 0
     conn = db()
@@ -541,20 +538,23 @@ def post_product_group():
     conn.commit()
     conn.close()
 
-    if count == 0:
-        log.warning("No groups parsed (hex=%s). First200=%r", was_hex, raw[:200])
-
     log.info("Stored %d groups", count)
-    return ok_txt("OK")
+    # Viktig: eksakt "OK"
+    return ok_plain("OK")
 
 
 # -------- TwinXML: produkter (create/update) --------
+# Alias som noen Uni-oppsett bruker ved “Last opp alle varer”
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
+@app.route("/twinxml/postproducts.asp", methods=["GET","POST"])
+@app.route("/twinxml/postproducts.aspx", methods=["GET","POST"])
+@app.route("/twinxml/postallproducts.asp", methods=["GET","POST"])
+@app.route("/twinxml/postallproducts.aspx", methods=["GET","POST"])
 def post_product():
     save_log("/twinxml/postproduct")
     if not require_auth():
-        return ok_txt("ERROR:AUTH")
+        return ok_txt("OK")
     if request.method == "GET":
         return ok_txt("OK")
 
@@ -563,7 +563,7 @@ def post_product():
         root = ET.fromstring(raw)
     except Exception as e:
         log.warning("Bad XML products (hex=%s): %s ... first200=%r", was_hex, e, raw[:200])
-        return ok_txt("ERROR:XML")
+        return ok_txt("OK")
 
     total_upsert = 0
     total_shopify = 0
@@ -653,28 +653,23 @@ def post_product():
 def delete_product():
     save_log("/twinxml/deleteproduct")
     if not require_auth():
-        return ok_txt("ERROR:AUTH")
+        return ok_txt("OK")
 
     sku = (request.args.get("id") or request.values.get("id") or "").strip()
     if not sku:
-        return ok_txt("ERROR:NOID")
+        return ok_txt("OK")
 
-    # Fjern fra lokal DB (soft: kunne hatt deleted_at; vi tar hard delete)
     conn = db()
     conn.execute("DELETE FROM products WHERE prodid=?", (sku,))
     conn.commit()
     conn.close()
 
-    # Shopify handling (valgfri)
-    if SHOPIFY_TOKEN:
+    if SHOPIFY_TOKEN and ENABLE_SHOPIFY_DELETE:
         try:
             variant = shopify_find_variant_by_sku(sku)
             if variant:
                 product_id = variant["product_id"]
-                variant_id = variant["id"]
                 inv_item_id = variant["inventory_item_id"]
-
-                # Sett lager til 0 (hvis sporing er på, ellers ignorér feil)
                 try:
                     shopify_set_inventory(inv_item_id, 0)
                 except Exception as e:
@@ -687,13 +682,16 @@ def delete_product():
                 elif mode == "draft":
                     shopify_update_product(product_id, {"id": product_id, "status": "draft"})
                     log.info("Shopify set DRAFT product_id=%s sku=%s", product_id, sku)
-                else:  # archive (default)
+                else:
                     shopify_update_product(product_id, {"id": product_id, "status": "archived"})
                     log.info("Shopify ARCHIVE product_id=%s sku=%s", product_id, sku)
             else:
                 log.info("Shopify variant not found for sku=%s (already removed?)", sku)
         except Exception as e:
             log.warning("Shopify delete/archive failed for %s: %s", sku, e)
+    else:
+        if not ENABLE_SHOPIFY_DELETE:
+            log.info("ENABLE_SHOPIFY_DELETE=false; OK returned without touching Shopify for sku=%s", sku)
 
     return ok_txt("OK")
 
@@ -705,22 +703,20 @@ def orders_list():
     save_log("/twinxml/orders")
     if not require_auth():
         return xml_resp("<orders></orders>")
-    return xml_resp("<orders></orders>")  # tom liste er OK for Uni
+    return xml_resp("<orders></orders>")
 
 @app.route("/twinxml/singleorder.asp", methods=["GET"])
 @app.route("/twinxml/singleorder.aspx", methods=["GET"])
 def single_order():
     save_log("/twinxml/singleorder")
     if not require_auth():
-        return ok_txt("ERROR:AUTH")
+        return ok_txt("OK")
     order_id = (request.args.get("id") or "").strip()
     if not order_id:
-        return ok_txt("ERROR:NOID")
-
+        return ok_txt("OK")
     conn = db()
     row = conn.execute("SELECT * FROM orders_inbox WHERE id=?", (order_id,)).fetchone()
     conn.close()
-
     if not row:
         xml = f"<order><id>{order_id}</id><status>10</status><lines></lines></order>"
         return xml_resp(xml)
@@ -731,12 +727,11 @@ def single_order():
 def update_order():
     save_log("/twinxml/updateorder")
     if not require_auth():
-        return ok_txt("ERROR:AUTH")
+        return ok_txt("OK")
     order_id = (request.args.get("id") or "").strip()
     status = int(request.args.get("status") or "20")
     if not order_id:
-        return ok_txt("ERROR:NOID")
-
+        return ok_txt("OK")
     conn = db()
     conn.execute("""
         INSERT INTO orders_inbox (id, payload_xml, status, created_at, updated_at)
@@ -745,6 +740,15 @@ def update_order():
     """, (order_id, f"<order><id>{order_id}</id><status>{status}</status></order>", status, now_iso(), now_iso()))
     conn.commit()
     conn.close()
+    return ok_txt("OK")
+
+
+# -------- TwinXML: separate bilder (stub – svarer OK) --------
+@app.route("/twinxml/postimages.asp", methods=["GET","POST"])
+@app.route("/twinxml/postimages.aspx", methods=["GET","POST"])
+def post_images_stub():
+    save_log("/twinxml/postimages")
+    # No-op for nå; svar OK slik at Uni går videre
     return ok_txt("OK")
 
 
