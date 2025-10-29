@@ -3,7 +3,7 @@ import logging
 import sqlite3
 import json
 from datetime import datetime, timezone
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 import xml.etree.ElementTree as ET
 import requests
 import re
@@ -11,7 +11,6 @@ import base64
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
-ENV = os.environ.get("ENV", "prod")
 
 # ---------- Uni auth ----------
 UNI_USER = os.environ.get("UNI_USER", "synall")
@@ -26,7 +25,6 @@ PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1
 
 # Feature toggles
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "true").lower() in ("1","true","yes")
-ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lower() in ("1","true","yes")
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
@@ -236,6 +234,27 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
+# ---------- Uni: status (ny) ----------
+@app.route("/twinxml/status.asp", methods=["GET"])
+def status_asp():
+    """
+    Minimal status-XML som Uni refererer til i dokumentasjonen.
+    Returnerer text/xml (ISO-8859-1 kompatibelt innhold).
+    """
+    lastupdate = request.args.get("lastupdate", "")
+    xml = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        "<status>"
+        "<shopname>ASM Shopify</shopname>"
+        "<supportsimages>1</supportsimages>"
+        "<supportscustomers>1</supportscustomers>"
+        "<supportsorders>1</supportsorders>"
+        "<supportsstock>1</supportsstock>"
+        f"<echo_lastupdate>{lastupdate}</echo_lastupdate>"
+        "</status>"
+    )
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+
 # ---------- Uni: svar for varegrupper (tuned) ----------
 def uni_groups_ok():
     """
@@ -253,7 +272,7 @@ def uni_groups_ok():
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
-    # Logg ALT (uansett auth) – Uni bryr seg mest om returformatet
+    # Logg ALT
     conn = db()
     conn.execute(
         "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
@@ -261,11 +280,9 @@ def post_product_group():
          (request.data or b"").decode("utf-8","ignore"), now_iso())
     ); conn.commit(); conn.close()
 
-    # GET: returner OK
     if request.method == "GET":
         return uni_groups_ok()
 
-    # POST: lagre grupper hvis mulig – men svar alltid OK-formatet
     raw, _ = read_xml_body()
     try:
         root = ET.fromstring(raw)
@@ -317,7 +334,6 @@ def post_product():
         return ok_txt("OK")
 
     if not require_auth():
-        # svar OK uansett – enkelte klienter aborterer hvis ikke "OK"
         return ok_txt("OK")
 
     raw, _ = read_xml_body()
@@ -329,7 +345,6 @@ def post_product():
 
     nodes = findall_any(root, [".//product",".//vare",".//item",".//produkt"])
     if not nodes:
-        # fallback: finn noder som har ident-felt
         cands=[]; idtags=["productident","prodid","varenr","sku","itemno"]
         for elem in root.iter():
             ident = findtext_any(elem, idtags).strip()
@@ -381,9 +396,7 @@ def delete_product():
     if not require_auth(): return ok_txt("OK")
     sku = (request.args.get("id") or "").strip()
     if not sku: return ok_txt("OK")
-    # Lokal opprydding
     conn = db(); conn.execute("DELETE FROM products WHERE prodid=?", (sku,)); conn.commit(); conn.close()
-    # Shopify handling
     try:
         if SHOPIFY_TOKEN and ENABLE_SHOPIFY_DELETE:
             v = shopify_find_variant_by_sku(sku)
@@ -399,17 +412,31 @@ def delete_product():
         log.warning("Shopify delete/archive failed for %s: %s", sku, e)
     return ok_txt("OK")
 
+# ---------- (ny) deleteproductgroup + deleteall (stubs) ----------
+@app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
+def delete_product_group():
+    return ok_txt("OK")
+
+@app.route("/twinxml/deleteall.asp", methods=["GET","POST"])
+def delete_all():
+    # Vi kan tømme lokal DB, men svarer uansett OK
+    try:
+        conn = db()
+        conn.execute("DELETE FROM products"); conn.execute("DELETE FROM groups")
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+    return ok_txt("OK")
+
 # ---------- TwinXML catch-all: logg ALT ukjent under /twinxml/ ----------
 @app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
 def twinxml_fallback(rest):
-    # Viktig for å finne eksakt ruten Uni prøver etter varegrupper
     try:
         qs = request.query_string.decode("utf-8", "ignore")
     except Exception:
         qs = ""
     logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s", rest, qs)
-    # Svar som gammel ASP: OK + CRLF (så Uni ikke stopper)
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+    return ok_txt("OK")
 
 # ---------- Main ----------
 if __name__ == "__main__":
