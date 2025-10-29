@@ -142,19 +142,74 @@ def to_int_safe(v):
 
 def uni_groups_ok():
     """
-    Nøyaktig det enkelte Uni-klienter krever:
-    - Body: 'OK' + CRLF (4 bytes)
-    - Content-Type: text/plain; charset=windows-1252
-    - Content-Length: 4
-    - Connection: close
+    Returner et svar som Uni forhåpentligvis godtar for 'postproductgroup'.
+    Styr via env: UNI_GROUPS_RESPONSE_STYLE
+      - ok           -> "OK" (2 bytes)
+      - ok_crlf      -> "OK\r\n" (4 bytes)
+      - ok_lf        -> "OK\n" (3 bytes)           <-- PRØV DENNE NÅ
+      - ok_iso       -> "OK" + ISO-8859-1 header
+      - empty_html   -> 200 text/html; body=0
+      - 204          -> 204 No Content
+      - xml_double   -> XML '<?xml ...><Root><OK>OK</OK></Root>'
+    Default: ok_lf  (flest eldre Uni-klienter liker denne)
     """
-    body = "OK\r\n"
-    resp = Response(body, status=200)
-    resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))  # 4
-    resp.headers["Connection"] = "close"
-    resp.headers["Cache-Control"] = "no-cache"
-    return resp
+    style = (os.environ.get("UNI_GROUPS_RESPONSE_STYLE") or "ok_lf").lower()
+
+    if style == "ok":
+        body = "OK"
+        resp = Response(body, status=200)
+        resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
+        resp.headers["Content-Length"] = "2"
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "ok_crlf":
+        body = "OK\r\n"
+        resp = Response(body, status=200)
+        resp.headers["Content-Type"] = "text/plain; charset=ISO-8859-1"
+        resp.headers["Content-Length"] = str(len(body.encode("iso-8859-1")))  # 4
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "ok_lf":
+        body = "OK\n"
+        resp = Response(body, status=200)
+        resp.headers["Content-Type"] = "text/plain; charset=ISO-8859-1"
+        resp.headers["Content-Length"] = str(len(body.encode("iso-8859-1")))  # 3
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "ok_iso":
+        body = "OK"
+        resp = Response(body, status=200)
+        resp.headers["Content-Type"] = "text/plain; charset=ISO-8859-1"
+        resp.headers["Content-Length"] = "2"
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "empty_html":
+        resp = Response(status=200)
+        resp.headers["Content-Type"] = "text/html; charset=windows-1252"
+        resp.headers["Content-Length"] = "0"
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "204":
+        resp = Response(status=204)
+        resp.headers["Content-Type"] = "text/html; charset=windows-1252"
+        resp.headers["Connection"] = "close"
+        return resp
+
+    if style == "xml_double":
+        xml = '<?xml version="1.0" encoding="ISO-8859-1"?><Root><OK>OK</OK></Root>'
+        resp = Response(xml, status=200)
+        resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
+        resp.headers["Content-Length"] = str(len(xml.encode("iso-8859-1")))
+        resp.headers["Connection"] = "close"
+        return resp
+
+    # fallback
+    return Response("OK\n", mimetype="text/plain; charset=ISO-8859-1")
 
 
 # -------- Shopify client (simplified) --------
