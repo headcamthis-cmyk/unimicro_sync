@@ -142,14 +142,15 @@ def to_int_safe(v):
 
 def uni_groups_ok():
     """
-    Svar nøyaktig 'OK' (2 bytes), 200 OK, text/plain.
-    Ingen CRLF, ingen XML. Content-Length settes eksplisitt til 2.
+    Returner liten XML-body som Uni alltid godtar: <Root><OK>OK</OK></Root>
     """
-    resp = Response("OK", status=200)
-    resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = "2"
-    resp.headers["Connection"] = "close"  # enkelte gamle klienter foretrekker dette
+    xml = '<?xml version="1.0" encoding="ISO-8859-1"?><Root><OK>OK</OK></Root>'
+    resp = Response(xml, status=200)
+    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
+    resp.headers["Content-Length"] = str(len(xml))
+    resp.headers["Connection"] = "close"
     return resp
+
 
 # -------- Shopify client (simplified) --------
 def ensure_shopify_headers():
