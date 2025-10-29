@@ -16,7 +16,7 @@ UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
 # Shopify
-SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "asmshop.no")
+SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")  # bruk myshopify-domenet
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
@@ -110,7 +110,7 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
-    # Viktig: CRLF + windows-1252 for maksimal Uni-kompat
+    # CRLF + windows-1252 for Uni-kompat
     return Response((body + "\r\n"), mimetype="text/plain; charset=windows-1252")
 
 def xml_resp(xml_str: str):
@@ -151,7 +151,7 @@ def to_int_safe(val):
 def read_xml_body():
     """
     Leser rå body og dekoder hvis hex=true.
-    Prøver fornuftige encodings (utf-8, cp1252, latin-1).
+    Prøver encodings (utf-8, cp1252, latin-1).
     Returnerer (decoded_xml_str, was_hex: bool)
     """
     raw = request.get_data() or b""
@@ -160,7 +160,6 @@ def read_xml_body():
         try:
             raw = bytes.fromhex(raw.decode("ascii"))
         except Exception:
-            # fall back hvis ikke ekte hex
             pass
     for enc in ("utf-8", "cp1252", "latin-1"):
         try:
@@ -227,13 +226,21 @@ def shopify_create_product(payload):
 def shopify_update_product(product_id, payload):
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/products/{product_id}.json"
-    # Sørg for riktig wrapper og at vi ikke sender tomme felter
     clean = {k: v for k, v in payload.items() if v is not None and v != ""}
     r = requests.put(url, headers=headers, data=json.dumps({"product": clean}), timeout=60)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Shopify update product failed {r.status_code}: {r.text[:500]}")
     return r.json()["product"]
 
+def shopify_update_variant(variant_id, payload):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/variants/{variant_id}.json"
+    clean = {k: v for k, v in payload.items() if v is not None and v != ""}
+    wrapper = {"variant": {"id": int(variant_id), **clean}}
+    r = requests.put(url, headers=headers, data=json.dumps(wrapper), timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Shopify update variant failed {r.status_code}: {r.text[:500]}")
+    return r.json()["variant"]
 
 def shopify_set_inventory(inventory_item_id, available):
     headers = ensure_shopify_headers()
@@ -248,6 +255,24 @@ def shopify_set_inventory(inventory_item_id, available):
         raise RuntimeError(f"Shopify inventory set failed {r.status_code}: {r.text[:500]}")
     return r.json()
 
+def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
+    """
+    Forsøk å sette lager. Hvis tracking ikke er aktivert, slå på inventory_management=shopify og prøv igjen.
+    """
+    try:
+        shopify_set_inventory(inventory_item_id, stock)
+        return
+    except RuntimeError as e:
+        if "does not have inventory tracking enabled" not in str(e):
+            raise
+    # Slå på tracking og prøv igjen
+    shopify_update_variant(variant_id, {
+        "inventory_management": "shopify",
+        "inventory_policy": "deny",   # eller "continue"
+        "requires_shipping": True
+    })
+    shopify_set_inventory(inventory_item_id, stock)
+
 def upsert_shopify_product_from_row(row):
     sku = row["prodid"]
     name = row["name"]
@@ -257,18 +282,19 @@ def upsert_shopify_product_from_row(row):
     stock = row["stock"] or 0
     is_active = (row["webactive"] == 1)
 
-    # Minimal og trygg payload
+    # Minimal trygg payload (uten "status")
     product_payload = {
         "title": name or sku,
         "body_html": body_html or "",
-        # Ikke send "status"
-        # Bruk gjerne published hvis du vil styre publisering:
-        # "published": bool(is_active),
+        # "published": bool(is_active),  # valgfritt om du vil styre publisering
         "tags": [f"group-{row['groupid']}"] if row["groupid"] else [],
         "variants": [{
             "sku": sku,
             "price": f"{(price or 0):.2f}",
-            "barcode": barcode or None
+            "barcode": barcode or None,
+            # Viktig: slå på tracking ved opprettelse
+            "inventory_management": "shopify",
+            "inventory_policy": "deny"
         }]
     }
 
@@ -278,7 +304,6 @@ def upsert_shopify_product_from_row(row):
         variant_id = variant["id"]
         inventory_item_id = variant["inventory_item_id"]
 
-        # Hent eksisterende for å slippe å overskrive unødvendig
         update_payload = {
             "id": product_id,
             "title": product_payload["title"],
@@ -287,11 +312,8 @@ def upsert_shopify_product_from_row(row):
         if product_payload["tags"]:
             update_payload["tags"] = ",".join(product_payload["tags"])
 
-        # Ikke send "status" her. Valgfritt: update_payload["published"] = bool(is_active)
-
         shopify_update_product(product_id, update_payload)
     else:
-        # Create
         create_payload = dict(product_payload)
         if create_payload["tags"]:
             create_payload["tags"] = ",".join(create_payload["tags"])
@@ -300,14 +322,13 @@ def upsert_shopify_product_from_row(row):
         variant_id = created["variants"][0]["id"]
         inventory_item_id = created["variants"][0]["inventory_item_id"]
 
-    # Lager
+    # Lager (med auto-enable tracking ved behov)
     try:
-        shopify_set_inventory(inventory_item_id, stock)
+        ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock)
     except Exception as e:
-        log.warning("Inventory set failed for %s: %s", sku, e)
+        log.warning("Inventory set failed for %s after enabling tracking: %s", sku, e)
 
     return product_id, variant_id, inventory_item_id
-
 
 
 # -------- Request logging --------
@@ -344,7 +365,6 @@ def post_product_group():
     if not require_auth():
         return ok_txt("ERROR:AUTH")
     if request.method == "GET":
-        # enkelte oppsett tester GET; svar "OK"
         return ok_txt("OK")
 
     raw, was_hex = read_xml_body()
@@ -393,7 +413,7 @@ def post_product():
     if not require_auth():
         return ok_txt("ERROR:AUTH")
     if request.method == "GET":
-        return ok_txt("OK")  # tåler GET-test
+        return ok_txt("OK")
 
     raw, was_hex = read_xml_body()
     try:
@@ -406,16 +426,16 @@ def post_product():
     total_shopify = 0
     conn = db()
 
-    # 1) Prøv vanlige paths
+    # 1) Vanlige paths
     product_nodes = findall_any(root, [
         ".//product", ".//vare", ".//item", ".//produkt"
     ])
-    # 2) Heuristikk: enhver node som har et varenr-felt behandles som "produkt"
+    # 2) Heuristikk: enhver node som har varenr-felt behandles som produkt
     if not product_nodes:
         candidates = []
         id_tags = ["prodid","varenr","sku","itemno","productident"]
         for elem in root.iter():
-            if not list(elem):  # hopper tomme bladnoder
+            if not list(elem):  # hopp bladnoder
                 continue
             ident = findtext_any(elem, id_tags).strip()
             if ident:
@@ -427,14 +447,12 @@ def post_product():
         return ok_txt("OK")
 
     for p in product_nodes:
-        # Varenr / SKU
         prodid = (findtext_any(p, ["prodid","varenr","sku","itemno","productident"]).strip())
         if not prodid:
             snippet = ET.tostring(p, encoding="unicode")[:200]
             log.warning("Product-like node without ident. First200=%r", snippet)
             continue
 
-        # Navn / beskrivelse (Uni bruker ofte 'descrip')
         name      = (findtext_any(p, ["name","varenavn","title","description","productname","descrip"]).strip())
         price     = to_float_safe(findtext_any(p, ["price","pris","salesprice","price_incl_vat","newprice","webprice"]))
         vatcode   = (findtext_any(p, ["vatcode","mvakode"]).strip())
@@ -494,7 +512,6 @@ def post_product():
 def orders_list():
     save_log("/twinxml/orders")
     if not require_auth():
-        # Returner tom liste i stedet for 401 – noen Uni-oppsett blir sære.
         return xml_resp("<orders></orders>")
     return xml_resp("<orders></orders>")  # tom liste er OK for Uni
 
