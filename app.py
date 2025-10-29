@@ -234,13 +234,8 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
-# ---------- Uni: status (oppdatert m/Root & OK) ----------
 @app.route("/twinxml/status.asp", methods=["GET"])
 def status_asp():
-    """
-    Minimal status-XML i <Root> med <OK>OK</OK>, text/xml (ISO-8859-1).
-    Enkelte Uni-versjoner krever akkurat dette før de går videre til varer.
-    """
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
         "<Root>"
@@ -250,6 +245,9 @@ def status_asp():
         "<supportscustomers>1</supportscustomers>"
         "<supportsorders>1</supportsorders>"
         "<supportsstock>1</supportsstock>"
+        "<supportsproducts>1</supportsproducts>"
+        "<supportsproductgroups>1</supportsproductgroups>"
+        "<supportsdeletes>1</supportsdeletes>"
         "</Root>"
     )
     return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
