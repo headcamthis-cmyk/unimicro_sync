@@ -140,7 +140,6 @@ def to_int_safe(v):
         try: return int(float(v))
         except: return None
 
-# --- Uni groups OK helper ---
 def uni_groups_ok():
     """
     Returner 204 No Content – mange Uni-versjoner forventer dette på gruppe-POST.
