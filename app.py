@@ -18,7 +18,7 @@ UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # settes i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
@@ -37,7 +37,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ---- normalize '//' in PATH (Uni kan sende dobbelt-slash)
+# ---- normalize '//' i PATH (Uni kan sende dobbelt-slash)
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -234,9 +234,13 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
-# ---------- Uni: status (ny) ----------
+# ---------- Uni: status (oppdatert m/Root & OK) ----------
 @app.route("/twinxml/status.asp", methods=["GET"])
 def status_asp():
+    """
+    Minimal status-XML i <Root> med <OK>OK</OK>, text/xml (ISO-8859-1).
+    Enkelte Uni-versjoner krever akkurat dette før de går videre til varer.
+    """
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
         "<Root>"
@@ -407,14 +411,13 @@ def delete_product():
         log.warning("Shopify delete/archive failed for %s: %s", sku, e)
     return ok_txt("OK")
 
-# ---------- (ny) deleteproductgroup + deleteall (stubs) ----------
+# ---------- (stubs) deleteproductgroup + deleteall ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
     return ok_txt("OK")
 
 @app.route("/twinxml/deleteall.asp", methods=["GET","POST"])
 def delete_all():
-    # Vi kan tømme lokal DB, men svarer uansett OK
     try:
         conn = db()
         conn.execute("DELETE FROM products"); conn.execute("DELETE FROM groups")
@@ -423,7 +426,7 @@ def delete_all():
         pass
     return ok_txt("OK")
 
-# ---------- TwinXML catch-all: logg ALT ukjent under /twinxml/ ----------
+# ---------- TwinXML catch-all ----------
 @app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
 def twinxml_fallback(rest):
     try:
