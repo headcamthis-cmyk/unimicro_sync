@@ -225,7 +225,9 @@ def upsert_shopify_product_from_row(r):
 @app.before_request
 def _log_req():
     try:
-        log.info("REQ %s %s?%s", request.method, request.path, request.query_string.decode())
+        ref = request.headers.get("Referer", "-")
+        log.info("REQ %s %s?%s  Referer=%s", request.method, request.path,
+                 request.query_string.decode(errors="ignore"), ref)
     except Exception:
         pass
 
@@ -458,6 +460,15 @@ def delete_all():
     except Exception:
         pass
     return ok_txt("OK")
+
+# ---------- fallback for feilkonfigurert "asp"/".asp" ----------
+@app.route("/twinxml/asp", methods=["GET","POST","HEAD"])
+@app.route("/twinxml/.asp", methods=["GET","POST","HEAD"])
+def bare_asp_placeholder():
+    logging.warning("Placeholder ASP hit. Likely a blank filename in Uni Sideadministrasjon. QS=%s",
+                    request.query_string.decode("utf-8","ignore"))
+    xml = '<?xml version="1.0" encoding="ISO-8859-1"?><Root><OK>OK</OK></Root>'
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
 
 # ---------- Catch-all: ruter alle "post*" til produkt-handler ----------
 @app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
