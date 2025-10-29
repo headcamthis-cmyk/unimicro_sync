@@ -234,8 +234,12 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
-@app.route("/twinxml/status.asp", methods=["GET"])
+@app.route("/twinxml/status.asp", methods=["GET","POST","HEAD"])
 def status_asp():
+    """
+    Uni kaller status.asp både med GET og POST. Returnér gyldig XML i <Root>.
+    """
+    lastupdate = request.args.get("lastupdate", "")
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
         "<Root>"
@@ -248,9 +252,13 @@ def status_asp():
         "<supportsproducts>1</supportsproducts>"
         "<supportsproductgroups>1</supportsproductgroups>"
         "<supportsdeletes>1</supportsdeletes>"
+        f"<echo_lastupdate>{lastupdate}</echo_lastupdate>"
         "</Root>"
     )
-    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+    resp = Response(xml, status=200)
+    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
+    resp.headers["Connection"] = "close"
+    return resp
 
 # ---------- Uni: svar for varegrupper (tuned) ----------
 def uni_groups_ok():
