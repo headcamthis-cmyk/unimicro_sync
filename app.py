@@ -237,21 +237,16 @@ def index(): return ok_txt("OK")
 # ---------- Uni: status (ny) ----------
 @app.route("/twinxml/status.asp", methods=["GET"])
 def status_asp():
-    """
-    Minimal status-XML som Uni refererer til i dokumentasjonen.
-    Returnerer text/xml (ISO-8859-1 kompatibelt innhold).
-    """
-    lastupdate = request.args.get("lastupdate", "")
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
-        "<status>"
+        "<Root>"
+        "<OK>OK</OK>"
         "<shopname>ASM Shopify</shopname>"
         "<supportsimages>1</supportsimages>"
         "<supportscustomers>1</supportscustomers>"
         "<supportsorders>1</supportsorders>"
         "<supportsstock>1</supportsstock>"
-        f"<echo_lastupdate>{lastupdate}</echo_lastupdate>"
-        "</status>"
+        "</Root>"
     )
     return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
 
