@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import requests
 import re
 import base64
+import binascii
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -79,6 +80,7 @@ init_db()
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
+    # Klassisk ASP-aktig OK med CRLF + riktig Content-Length settes der det trengs
     return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
 def require_auth():
@@ -86,14 +88,36 @@ def require_auth():
 
 def read_xml_body():
     raw = request.get_data() or b""
-    is_hex = (request.args.get("hex") or "").lower() in ("1","true","yes")
-    if is_hex:
+    is_hex_param = (request.args.get("hex") or "").lower() in ("1","true","yes")
+    if is_hex_param:
+        # Hele body kan være hex-kodet
         try: raw = bytes.fromhex(raw.decode("ascii"))
         except Exception: pass
+    # prøv typiske encodings fra Uni
     for enc in ("utf-8","cp1252","latin-1","iso-8859-1"):
-        try: return raw.decode(enc), is_hex
+        try: return raw.decode(enc), is_hex_param
         except Exception: continue
-    return raw.decode("utf-8","ignore"), is_hex
+    return raw.decode("utf-8","ignore"), is_hex_param
+
+HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+def maybe_hex_to_text(s: str) -> str:
+    """
+    Hvis feltet ser ut som ren hex (partall antall tegn og kun 0-9A-F), dekode til tekst.
+    Uni dokumenterer at longdesc kan være hex i XML. Vi forsøker ISO-8859-1 først.
+    """
+    if not s: return s
+    st = s.strip()
+    if len(st) >= 2 and len(st) % 2 == 0 and HEX_RE.fullmatch(st) is not None:
+        try:
+            b = binascii.unhexlify(st)
+            for enc in ("iso-8859-1","cp1252","utf-8"):
+                try: return b.decode(enc)
+                except Exception: continue
+            return b.decode("utf-8","ignore")
+        except Exception:
+            return s
+    return s
 
 def findtext_any(e, tags, default=""):
     for t in tags:
@@ -175,9 +199,10 @@ def ensure_tracking_and_set_inventory(vid, iid, qty):
 def upsert_shopify_product_from_row(r):
     sku=r["prodid"]; name=r["name"]; price=r["price"]; stock=r["stock"] or 0
     web = (r["webactive"]==1); groupid=r["groupid"]; html=r["body_html"]; img=r["image_b64"]
+    body_html = maybe_hex_to_text(html) if html else ""
     payload = {
         "title": name or sku,
-        "body_html": html or "",
+        "body_html": body_html or "",
         "tags": [f"group-{groupid}"] if groupid else [],
         "variants": [{
             "sku": sku,
@@ -293,12 +318,25 @@ def postfiles_asp():
 def postdiscountsystem_asp():
     return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
 
+# ---------- deletetable.asp (stub – Uni rydder rabatt-tabeller) ----------
+@app.route("/twinxml/deletetable.asp", methods=["GET","POST","HEAD"])
+def deletetable_asp():
+    name = (request.args.get("name") or "").lower()
+    logging.info("Uni requested deletetable for: %s", name)
+    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+
+# ---------- postdiscount.asp (videresend til produkt-parser) ----------
+@app.route("/twinxml/postdiscount.asp", methods=["GET","POST","HEAD"])
+@app.route("/twinxml/postdiscount.aspx", methods=["GET","POST","HEAD"])
+def postdiscount_asp():
+    return post_product()
+
 # ---------- Uni: svar for varegrupper ----------
 def uni_groups_ok():
     body = "OK\r\n"
     resp = Response(body, status=200)
     resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))
+    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))  # 4
     resp.headers["Connection"] = "close"
     return resp
 
@@ -376,8 +414,10 @@ def post_product():
         log.warning("Bad XML products: %s ... first200=%r", e, raw[:200])
         return ok_txt("OK")
 
+    # Finn produktnoder
     nodes = findall_any(root, [".//product",".//vare",".//item",".//produkt"])
     if not nodes:
+        # fallback: plukk alle noder som inneholder et ident-felt
         cands=[]; idtags=["productident","prodid","varenr","sku","itemno"]
         for elem in root.iter():
             ident = findtext_any(elem, idtags).strip()
@@ -390,10 +430,16 @@ def post_product():
         sku = findtext_any(p,["productident","prodid","varenr","sku","itemno"]).strip()
         if not sku: continue
         name = findtext_any(p,["description","name","varenavn","title","productname"]).strip()
+
+        # Pris / lager / gruppering
         price= to_float_safe(findtext_any(p,["price","pris","salesprice","price_incl_vat","newprice","webprice"]))
         grp  = findtext_any(p,["productgroup","groupid","gruppeid","groupno"]).strip()
         stock= to_int_safe(findtext_any(p,["quantityonhand","stock","quantity","qty","lager","onhand"]))
-        body = findtext_any(p,["desc","body_html","longtext","description","infohtml"]) or ""
+
+        # Beskrivelse: longdesc/desc kan være hex i XML → dekode
+        longdesc = findtext_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml"]) or ""
+        longdesc = maybe_hex_to_text(longdesc)
+
         img  = findtext_any(p,["image_b64","image","bilde_b64"]) or None
         web  = 1 if (findtext_any(p,["publish","webactive","active","is_web"],"1").strip().lower() in ("1","true","yes")) else 0
 
@@ -408,13 +454,13 @@ def post_product():
             name=excluded.name, price=excluded.price, groupid=excluded.groupid, stock=excluded.stock,
             body_html=excluded.body_html, image_b64=excluded.image_b64, webactive=excluded.webactive,
             payload_xml=excluded.payload_xml, updated_at=excluded.updated_at
-        """,(sku,name,price,None,grp,None,stock,body,img,web,raw,None,None,None,now_iso()))
+        """,(sku,name,price,None,grp,None,stock,longdesc,img,web,raw,None,None,None,now_iso()))
         upserted += 1
 
         if SHOPIFY_TOKEN:
             try:
                 row = c.execute("SELECT * FROM products WHERE prodid=?", (sku,)).fetchone()
-                pid = upsert_shopify_product_from_row(row); _ = pid
+                _pid = upsert_shopify_product_from_row(row)
                 synced += 1
             except Exception as e:
                 log.error("Shopify sync failed for %s: %s", sku, e)
