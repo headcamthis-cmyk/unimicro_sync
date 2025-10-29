@@ -142,12 +142,13 @@ def to_int_safe(v):
 
 def uni_groups_ok():
     """
-    Returner 204 No Content – mange Uni-versjoner forventer dette på gruppe-POST.
+    Svar nøyaktig 'OK' (2 bytes), 200 OK, text/plain.
+    Ingen CRLF, ingen XML. Content-Length settes eksplisitt til 2.
     """
-    resp = Response(status=204)
-    # bevar gammel-ASP vibe:
-    resp.headers["Content-Type"] = "text/html; charset=windows-1252"
-    resp.headers["Connection"] = "close"
+    resp = Response("OK", status=200)
+    resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
+    resp.headers["Content-Length"] = "2"
+    resp.headers["Connection"] = "close"  # enkelte gamle klienter foretrekker dette
     return resp
 
 # -------- Shopify client (simplified) --------
