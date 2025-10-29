@@ -252,12 +252,15 @@ def upsert_shopify_product_from_row(row):
     body_html = row["body_html"]
     barcode = row["barcode"]
     stock = row["stock"] or 0
-    webactive = "active" if (row["webactive"] == 1) else "draft"
+    is_active = (row["webactive"] == 1)
 
-    payload = {
+    # Minimal og trygg payload
+    product_payload = {
         "title": name or sku,
         "body_html": body_html or "",
-        "status": webactive,
+        # Ikke send "status"
+        # Bruk gjerne published hvis du vil styre publisering:
+        # "published": bool(is_active),
         "tags": [f"group-{row['groupid']}"] if row["groupid"] else [],
         "variants": [{
             "sku": sku,
@@ -271,26 +274,37 @@ def upsert_shopify_product_from_row(row):
         product_id = variant["product_id"]
         variant_id = variant["id"]
         inventory_item_id = variant["inventory_item_id"]
+
+        # Hent eksisterende for å slippe å overskrive unødvendig
         update_payload = {
             "id": product_id,
-            "title": payload["title"],
-            "body_html": payload["body_html"],
-            "status": payload["status"],
-            "tags": ",".join(payload["tags"]) if payload["tags"] else ""
+            "title": product_payload["title"],
+            "body_html": product_payload["body_html"],
         }
+        if product_payload["tags"]:
+            update_payload["tags"] = ",".join(product_payload["tags"])
+
+        # Ikke send "status" her. Valgfritt: update_payload["published"] = bool(is_active)
+
         shopify_update_product(product_id, update_payload)
     else:
-        created = shopify_create_product(payload)
+        # Create
+        create_payload = dict(product_payload)
+        if create_payload["tags"]:
+            create_payload["tags"] = ",".join(create_payload["tags"])
+        created = shopify_create_product(create_payload)
         product_id = created["id"]
         variant_id = created["variants"][0]["id"]
         inventory_item_id = created["variants"][0]["inventory_item_id"]
 
+    # Lager
     try:
         shopify_set_inventory(inventory_item_id, stock)
     except Exception as e:
         log.warning("Inventory set failed for %s: %s", sku, e)
 
     return product_id, variant_id, inventory_item_id
+
 
 
 # -------- Request logging --------
