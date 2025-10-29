@@ -24,9 +24,10 @@ SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
 
-# Feature toggles (kan styres via env om ønskelig)
+# Feature toggles
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "true").lower() in ("1","true","yes")
 ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lower() in ("1","true","yes")
+SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 
 # DB
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -161,11 +162,8 @@ def clean_b64(data):
     m = re.match(r"^data:image/[\w+.-]+;base64,(.*)$", s, flags=re.IGNORECASE | re.DOTALL)
     if m:
         s = m.group(1)
-    # fjern whitespace/linjeskift
     s = re.sub(r"\s+", "", s)
-    # valider at det er base64
     try:
-        # Ikke dekod hele (kan være stor) – dekod liten prøve
         base64.b64decode(s[:120] + "==", validate=False)
     except Exception:
         return None
@@ -266,6 +264,16 @@ def shopify_update_variant(variant_id, payload):
         raise RuntimeError(f"Shopify update variant failed {r.status_code}: {r.text[:500]}")
     return r.json()["variant"]
 
+def shopify_delete_product(product_id):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products/{product_id}.json"
+    r = requests.delete(url, headers=headers, timeout=60)
+    if r.status_code not in (200, 201):
+        # De fleste deletes returnerer 200/201/204; 404 betyr allerede borte
+        if r.status_code != 404:
+            raise RuntimeError(f"Shopify delete product failed {r.status_code}: {r.text[:500]}")
+    return True
+
 def shopify_set_inventory(inventory_item_id, available):
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/inventory_levels/set.json"
@@ -289,14 +297,9 @@ def shopify_get_images(product_id):
     return r.json().get("images", [])
 
 def shopify_add_image(product_id, image_b64, filename=None, position=None, alt=None):
-    """Laster opp ett bilde (base64-attachment)."""
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/products/{product_id}/images.json"
-    payload = {
-        "image": {
-            "attachment": image_b64
-        }
-    }
+    payload = { "image": { "attachment": image_b64 } }
     if filename:
         payload["image"]["filename"] = filename
     if position is not None:
@@ -309,10 +312,6 @@ def shopify_add_image(product_id, image_b64, filename=None, position=None, alt=N
     return r.json()["image"]
 
 def shopify_create_smart_collection_for_group(groupid):
-    """
-    Oppretter en Smart Collection som automatisk inkluderer produkter som har taggen 'group-<groupid>'.
-    Hvis den finnes fra før, ignorerer vi 422-feil på tittel/handle.
-    """
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/smart_collections.json"
     title = f"Group {groupid}"
@@ -333,16 +332,12 @@ def shopify_create_smart_collection_for_group(groupid):
         sc = r.json().get("smart_collection", {})
         log.info("Smart collection created for %s (id=%s)", handle, sc.get("id"))
         return sc
-    # 422 kan være "title has already been taken" eller handle-konflikt – vi ignorerer
     if r.status_code == 422:
         log.info("Smart collection likely exists for %s (422).", handle)
         return None
     raise RuntimeError(f"Shopify create smart collection failed {r.status_code}: {r.text[:500]}")
 
 def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
-    """
-    Forsøk å sette lager. Hvis tracking ikke er aktivert, slå på inventory_management=shopify og prøv igjen.
-    """
     try:
         shopify_set_inventory(inventory_item_id, stock)
         return
@@ -351,7 +346,7 @@ def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
             raise
     shopify_update_variant(variant_id, {
         "inventory_management": "shopify",
-        "inventory_policy": "deny",   # eller "continue"
+        "inventory_policy": "deny",
         "requires_shipping": True
     })
     shopify_set_inventory(inventory_item_id, stock)
@@ -368,7 +363,6 @@ def upsert_shopify_product_from_row(row):
     groupid = row["groupid"]
     image_b64_raw = row["image_b64"]
 
-    # Minimal trygg payload (uten "status" i update)
     product_payload = {
         "title": name or sku,
         "body_html": body_html or "",
@@ -403,7 +397,6 @@ def upsert_shopify_product_from_row(row):
         create_payload = dict(product_payload)
         if create_payload["tags"]:
             create_payload["tags"] = ",".join(create_payload["tags"])
-        # Sett status KUN ved opprettelse:
         create_payload["status"] = "active" if is_active else "draft"
 
         created = shopify_create_product(create_payload)
@@ -421,7 +414,7 @@ def upsert_shopify_product_from_row(row):
         except Exception as e:
             log.warning("Smart collection create failed for group %s: %s", groupid, e)
 
-    # Lager (med auto-enable tracking ved behov)
+    # Lager
     try:
         ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock)
     except Exception as e:
@@ -555,7 +548,7 @@ def post_product_group():
     return ok_txt("OK")
 
 
-# -------- TwinXML: produkter --------
+# -------- TwinXML: produkter (create/update) --------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
 def post_product():
@@ -576,16 +569,14 @@ def post_product():
     total_shopify = 0
     conn = db()
 
-    # 1) Vanlige paths
     product_nodes = findall_any(root, [
         ".//product", ".//vare", ".//item", ".//produkt"
     ])
-    # 2) Heuristikk: enhver node som har varenr-felt behandles som produkt
     if not product_nodes:
         candidates = []
         id_tags = ["prodid","varenr","sku","itemno","productident"]
         for elem in root.iter():
-            if not list(elem):  # hopp bladnoder
+            if not list(elem):
                 continue
             ident = findtext_any(elem, id_tags).strip()
             if ident:
@@ -653,6 +644,57 @@ def post_product():
     conn.close()
 
     log.info("Upserted %d products (Shopify updated %d)", total_upsert, total_shopify)
+    return ok_txt("OK")
+
+
+# -------- TwinXML: delete product --------
+@app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
+@app.route("/twinxml/deleteproduct.aspx", methods=["GET","POST"])
+def delete_product():
+    save_log("/twinxml/deleteproduct")
+    if not require_auth():
+        return ok_txt("ERROR:AUTH")
+
+    sku = (request.args.get("id") or request.values.get("id") or "").strip()
+    if not sku:
+        return ok_txt("ERROR:NOID")
+
+    # Fjern fra lokal DB (soft: kunne hatt deleted_at; vi tar hard delete)
+    conn = db()
+    conn.execute("DELETE FROM products WHERE prodid=?", (sku,))
+    conn.commit()
+    conn.close()
+
+    # Shopify handling (valgfri)
+    if SHOPIFY_TOKEN:
+        try:
+            variant = shopify_find_variant_by_sku(sku)
+            if variant:
+                product_id = variant["product_id"]
+                variant_id = variant["id"]
+                inv_item_id = variant["inventory_item_id"]
+
+                # Sett lager til 0 (hvis sporing er på, ellers ignorér feil)
+                try:
+                    shopify_set_inventory(inv_item_id, 0)
+                except Exception as e:
+                    log.info("Inventory zeroing for %s skipped/failed: %s", sku, e)
+
+                mode = SHOPIFY_DELETE_MODE
+                if mode == "delete":
+                    shopify_delete_product(product_id)
+                    log.info("Shopify DELETE product_id=%s sku=%s", product_id, sku)
+                elif mode == "draft":
+                    shopify_update_product(product_id, {"id": product_id, "status": "draft"})
+                    log.info("Shopify set DRAFT product_id=%s sku=%s", product_id, sku)
+                else:  # archive (default)
+                    shopify_update_product(product_id, {"id": product_id, "status": "archived"})
+                    log.info("Shopify ARCHIVE product_id=%s sku=%s", product_id, sku)
+            else:
+                log.info("Shopify variant not found for sku=%s (already removed?)", sku)
+        except Exception as e:
+            log.warning("Shopify delete/archive failed for %s: %s", sku, e)
+
     return ok_txt("OK")
 
 
