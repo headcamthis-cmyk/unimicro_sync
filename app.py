@@ -233,7 +233,7 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
-# ---------- status.asp (nå GET/POST/HEAD + <Root>) ----------
+# ---------- status.asp (GET/POST/HEAD + <Root>) ----------
 @app.route("/twinxml/status.asp", methods=["GET","POST","HEAD"])
 def status_asp():
     lastupdate = request.args.get("lastupdate", "")
@@ -257,69 +257,39 @@ def status_asp():
     resp.headers["Connection"] = "close"
     return resp
 
-# --- ORDERS: tom liste (Uni sjekker ofte denne før upload) ---
+# ---------- orders.asp (tom liste) ----------
 @app.route("/twinxml/orders.asp", methods=["GET","POST","HEAD"])
 def orders_asp():
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
-        "<Root>"
-        "<orders count=\"0\"></orders>"
-        "</Root>"
+        "<Root><orders count=\"0\"></orders></Root>"
     )
     return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
 
-# --- SINGLE ORDER: ikke i bruk her, men noen Uni-bygg pinger likevel ---
+# ---------- singleorder.asp (stub) ----------
 @app.route("/twinxml/singleorder.asp", methods=["GET","POST","HEAD"])
 def singleorder_asp():
-    xml = (
-        '<?xml version="1.0" encoding="ISO-8859-1"?>'
-        "<Root><order/></Root>"
-    )
+    xml = '<?xml version="1.0" encoding="ISO-8859-1"?><Root><order/></Root>'
     return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
 
-# --- PRODUCTLIST: tom liste som “ser ekte ut” ---
+# ---------- productlist.asp (gyldig tom liste) ----------
 @app.route("/twinxml/productlist.asp", methods=["GET","POST","HEAD"])
 def productlist_asp():
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
-        "<Root>"
-        "<OK>OK</OK>"
-        "<products count=\"0\"></products>"
-        "</Root>"
+        "<Root><OK>OK</OK><products count=\"0\"></products></Root>"
     )
     return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
 
-# --- POSTFILES: bilder (stub) ---
+# ---------- postfiles.asp (stub) ----------
 @app.route("/twinxml/postfiles.asp", methods=["GET","POST","HEAD"])
 def postfiles_asp():
-    # No-op/stub: svar OK slik at Uni ikke stopper pga manglende bildeside
     return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
 
-# --- POSTDISCOUNTSYSTEM: rabatter (stub) ---
+# ---------- postdiscountsystem.asp (stub) ----------
 @app.route("/twinxml/postdiscountsystem.asp", methods=["GET","POST","HEAD"])
 def postdiscountsystem_asp():
     return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
-
-# ---------- PRODUKTLISTE (viktig for at Uni starter vare-opplasting) ----------
-@app.route("/twinxml/productlist.asp", methods=["GET","POST"])
-def productlist_asp():
-    """
-    Returner en gyldig tom produktliste for Uni. 
-    Dette får enkelte versjoner til å fortsette med postproduct.asp.
-    """
-    xml = (
-        '<?xml version="1.0" encoding="ISO-8859-1"?>'
-        "<Root>"
-        "<OK>OK</OK>"
-        "<products>"
-        "<product><id>0</id><productident>dummy</productident></product>"
-        "</products>"
-        "</Root>"
-    )
-    resp = Response(xml, status=200)
-    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
-    resp.headers["Connection"] = "close"
-    return resp
 
 # ---------- Uni: svar for varegrupper ----------
 def uni_groups_ok():
@@ -442,7 +412,6 @@ def post_product():
         if SHOPIFY_TOKEN:
             try:
                 row = c.execute("SELECT * FROM products WHERE prodid=?", (sku,)).fetchone()
-                # sync til Shopify
                 pid = upsert_shopify_product_from_row(row); _ = pid
                 synced += 1
             except Exception as e:
