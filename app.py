@@ -142,13 +142,18 @@ def to_int_safe(v):
 
 def uni_groups_ok():
     """
-    Returner liten XML-body som Uni alltid godtar: <Root><OK>OK</OK></Root>
+    Nøyaktig det enkelte Uni-klienter krever:
+    - Body: 'OK' + CRLF (4 bytes)
+    - Content-Type: text/plain; charset=windows-1252
+    - Content-Length: 4
+    - Connection: close
     """
-    xml = '<?xml version="1.0" encoding="ISO-8859-1"?><Root><OK>OK</OK></Root>'
-    resp = Response(xml, status=200)
-    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
-    resp.headers["Content-Length"] = str(len(xml))
+    body = "OK\r\n"
+    resp = Response(body, status=200)
+    resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
+    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))  # 4
     resp.headers["Connection"] = "close"
+    resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
