@@ -381,4 +381,64 @@ def orders_list():
 # Enkeltordre henting
 @app.route("/twinxml/singleorder.asp", methods=["GET"])
 @app.route("/twinxml/singleorder.aspx", methods=["GET"])
-def single_or_
+def single_order():
+    save_log("/twinxml/singleorder")
+    if not require_auth():
+        return ok_txt("ERROR:AUTH")
+    order_id = (request.args.get("id") or "").strip()
+    if not order_id:
+        return ok_txt("ERROR:NOID")
+
+    conn = db()
+    row = conn.execute("SELECT * FROM orders_inbox WHERE id=?", (order_id,)).fetchone()
+    conn.close()
+
+    # Dummy/minimal XML hvis ikke funnet, for å teste Uni flyt
+    if not row:
+        xml = f"<order><id>{order_id}</id><status>10</status><lines></lines></order>"
+        return xml_resp(xml)
+
+    return xml_resp(row["payload_xml"])
+
+# Kvittering / statusoppdatering
+@app.route("/twinxml/updateorder.asp", methods=["GET"])
+@app.route("/twinxml/updateorder.aspx", methods=["GET"])
+def update_order():
+    save_log("/twinxml/updateorder")
+    if not require_auth():
+        return ok_txt("ERROR:AUTH")
+    order_id = (request.args.get("id") or "").strip()
+    status = int(request.args.get("status") or "20")
+    if not order_id:
+        return ok_txt("ERROR:NOID")
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO orders_inbox (id, payload_xml, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at
+    """, (order_id, f"<order><id>{order_id}</id><status>{status}</status></order>", status, now_iso(), now_iso()))
+    conn.commit()
+    conn.close()
+    return ok_txt("OK")
+
+# ------------ Fallback catch-all for tvilsomme doble slasher ------------
+@app.route("/", defaults={"u_path": ""}, methods=["GET","POST"])
+@app.route("/<path:u_path>", methods=["GET","POST"])
+def catch_all(u_path):
+    # Hvis Uni sender rare paths med flere slashes: vi prøver å route manuelt
+    path = "/" + u_path
+    if "twinxml/orders" in path:
+        return orders_list()
+    if "twinxml/singleorder" in path:
+        return single_order()
+    if "twinxml/updateorder" in path:
+        return update_order()
+    if "twinxml/postproductgroup" in path and request.method == "POST":
+        return post_product_group()
+    if "twinxml/postproduct" in path and request.method == "POST":
+        return post_product()
+    return Response("Not Found\r\n", status=404, mimetype="text/plain; charset=windows-1252")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
