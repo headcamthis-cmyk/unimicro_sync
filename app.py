@@ -424,14 +424,38 @@ def delete_all():
         pass
     return ok_txt("OK")
 
-# ---------- TwinXML catch-all ----------
+# ---------- TwinXML catch-all: ruter post* til produkt-handler ----------
 @app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
 def twinxml_fallback(rest):
+    """
+    Fanger opp ukjente Uni-endepunkt.
+    - Alt som ser ut som en opplasting (post*.asp/.aspx eller inneholder 'product'/'item')
+      sendes videre til post_product()-handleren.
+    - Alt annet svarer vi "OK" for å ikke stoppe Uni.
+    """
     try:
         qs = request.query_string.decode("utf-8", "ignore")
     except Exception:
         qs = ""
-    logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s", rest, qs)
+
+    path_l = rest.lower()
+
+    is_product_upload = (
+        path_l.startswith("post") or
+        "product" in path_l or
+        "item" in path_l or
+        "price" in path_l or
+        "stock" in path_l or
+        "inventory" in path_l
+    )
+
+    logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s  (upload=%s)", rest, qs, is_product_upload)
+
+    if is_product_upload and request.method in ("POST", "GET"):
+        # kall vår eksisterende handler direkte
+        return post_product()
+
+    # Ellers svar 'OK' så Uni ikke feiler
     return ok_txt("OK")
 
 # ---------- Main ----------
