@@ -143,15 +143,11 @@ def to_int_safe(v):
 # --- Uni groups OK helper ---
 def uni_groups_ok():
     """
-    Returner et svar som etterligner klassisk ASP:
-    - 200 OK
-    - Content-Type: text/html; charset=windows-1252
-    - Content-Length: 0 (helt tom body)
+    Returner 204 No Content – mange Uni-versjoner forventer dette på gruppe-POST.
     """
-    resp = Response(status=200)
+    resp = Response(status=204)
+    # bevar gammel-ASP vibe:
     resp.headers["Content-Type"] = "text/html; charset=windows-1252"
-    resp.headers["Content-Length"] = "0"
-    # (valgfritt, men kan hjelpe gamle klienter)
     resp.headers["Connection"] = "close"
     return resp
 
