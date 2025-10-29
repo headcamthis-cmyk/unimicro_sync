@@ -473,7 +473,7 @@ def post_product():
                              sku, pid, SHOPIFY_DOMAIN, pid)
                 else:
                     cp=dict(product_payload)
-                    if cp["tags"]: cp["tags"]=","".join(cp["tags"])
+                    cp["tags"] = ",".join([t for t in cp.get("tags", []) if t])
                     cp["status"]="active"  # alle varer som kommer fra Uni = web-aktive
                     created=shopify_create_product(cp)
                     pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
