@@ -13,13 +13,13 @@ APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
 ENV = os.environ.get("ENV", "prod")
 
-# Uni auth
+# ---------- Uni auth ----------
 UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
-# Shopify config
+# ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
@@ -27,10 +27,10 @@ PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1
 # Feature toggles
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "true").lower() in ("1","true","yes")
 ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lower() in ("1","true","yes")
-SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()
+SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
-# DB
+# ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -39,7 +39,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# --- normalize '//' in PATH (Uni kan sende dobbelt-slash)
+# ---- normalize '//' in PATH (Uni kan sende dobbelt-slash)
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -48,7 +48,7 @@ class DoubleSlashFix:
         return self.app(environ, start_response)
 app.wsgi_app = DoubleSlashFix(app.wsgi_app)
 
-# -------- DB helpers --------
+# ---------- DB helpers ----------
 def db():
     conn = sqlite3.connect(DB_URL)
     conn.row_factory = sqlite3.Row
@@ -77,10 +77,11 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# -------- Utils --------
+# ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
+    # Klassisk ASP-aktig OK med CRLF
     return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
 def require_auth():
@@ -130,7 +131,7 @@ def clean_b64(data):
     except Exception: return None
     return s
 
-# -------- Shopify (minimal) --------
+# ---------- Shopify (minimal) ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
 def sh_headers():
     if not SHOPIFY_TOKEN: raise RuntimeError("SHOPIFY_TOKEN not set")
@@ -211,7 +212,6 @@ def upsert_shopify_product_from_row(r):
     except Exception as e:
         log.warning("Inventory set failed for %s: %s", sku, e)
 
-    # (valgfritt) første gangs bilde hvis ingen finnes – enkelt og trygt
     if ENABLE_IMAGE_UPLOAD and img:
         try:
             b64 = clean_b64(img)
@@ -224,7 +224,7 @@ def upsert_shopify_product_from_row(r):
 
     return pid
 
-# -------- Request logging --------
+# ---------- Request logging ----------
 @app.before_request
 def _log_req():
     try:
@@ -232,27 +232,24 @@ def _log_req():
     except Exception:
         pass
 
-# -------- Health --------
+# ---------- Health ----------
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
-# -------- Uni: svar for varegrupper (tuned) --------
+# ---------- Uni: svar for varegrupper (tuned) ----------
 def uni_groups_ok():
     """
-    Noen Uni-klienter krever helt spesifikke svar. Denne varianten har vist seg mest kompatibel:
-    - Body: 'OK' + CRLF (4 bytes)
-    - 200 OK
-    - Content-Type: text/plain; charset=windows-1252
-    - Content-Length: 4
+    Returner nøyaktig 'OK\\r\\n' med Content-Length=4.
+    Denne varianten har vist seg mest kompatibel for eldre Uni-klienter.
     """
     body = "OK\r\n"
     resp = Response(body, status=200)
     resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))
+    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))  # 4
     resp.headers["Connection"] = "close"
     return resp
 
-# -------- TwinXML: varegrupper --------
+# ---------- TwinXML: varegrupper ----------
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
@@ -268,7 +265,7 @@ def post_product_group():
     if request.method == "GET":
         return uni_groups_ok()
 
-    # POST: lagre grupper hvis auth OK – men uansett svar samme OK-format
+    # POST: lagre grupper hvis mulig – men svar alltid OK-formatet
     raw, _ = read_xml_body()
     try:
         root = ET.fromstring(raw)
@@ -298,7 +295,7 @@ def post_product_group():
     log.info("Stored %d groups", count)
     return uni_groups_ok()
 
-# -------- TwinXML: PRODUKTER (mange alias – alle peker hit) --------
+# ---------- TwinXML: PRODUKTER (mange alias – alle peker hit) ----------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
 @app.route("/twinxml/postproducts.asp", methods=["GET","POST"])
@@ -377,7 +374,7 @@ def post_product():
     log.info("Upserted %d products (Shopify updated %d)", upserted, synced)
     return ok_txt("OK")
 
-# -------- delete (arkiver/slett) – svarer OK til Uni uansett --------
+# ---------- TwinXML: delete (arkiver/slett) ----------
 @app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/deleteproduct.aspx", methods=["GET","POST"])
 def delete_product():
@@ -386,7 +383,7 @@ def delete_product():
     if not sku: return ok_txt("OK")
     # Lokal opprydding
     conn = db(); conn.execute("DELETE FROM products WHERE prodid=?", (sku,)); conn.commit(); conn.close()
-    # Shopify handling kan toggles via env, men vi svarer uansett OK til Uni
+    # Shopify handling
     try:
         if SHOPIFY_TOKEN and ENABLE_SHOPIFY_DELETE:
             v = shopify_find_variant_by_sku(sku)
@@ -402,5 +399,18 @@ def delete_product():
         log.warning("Shopify delete/archive failed for %s: %s", sku, e)
     return ok_txt("OK")
 
+# ---------- TwinXML catch-all: logg ALT ukjent under /twinxml/ ----------
+@app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
+def twinxml_fallback(rest):
+    # Viktig for å finne eksakt ruten Uni prøver etter varegrupper
+    try:
+        qs = request.query_string.decode("utf-8", "ignore")
+    except Exception:
+        qs = ""
+    logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s", rest, qs)
+    # Svar som gammel ASP: OK + CRLF (så Uni ikke stopper)
+    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+
+# ---------- Main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
