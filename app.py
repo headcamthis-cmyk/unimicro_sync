@@ -142,9 +142,18 @@ def to_int_safe(v):
 
 # --- Uni groups OK helper ---
 def uni_groups_ok():
-    # Uni forventer i praksis *ren tekst* "OK" med CRLF og Windows-1252 encoding.
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
-
+    """
+    Returner et svar som etterligner klassisk ASP:
+    - 200 OK
+    - Content-Type: text/html; charset=windows-1252
+    - Content-Length: 0 (helt tom body)
+    """
+    resp = Response(status=200)
+    resp.headers["Content-Type"] = "text/html; charset=windows-1252"
+    resp.headers["Content-Length"] = "0"
+    # (valgfritt, men kan hjelpe gamle klienter)
+    resp.headers["Connection"] = "close"
+    return resp
 
 # -------- Shopify client (simplified) --------
 def ensure_shopify_headers():
