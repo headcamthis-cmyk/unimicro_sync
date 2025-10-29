@@ -257,6 +257,50 @@ def status_asp():
     resp.headers["Connection"] = "close"
     return resp
 
+# --- ORDERS: tom liste (Uni sjekker ofte denne før upload) ---
+@app.route("/twinxml/orders.asp", methods=["GET","POST","HEAD"])
+def orders_asp():
+    xml = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        "<Root>"
+        "<orders count=\"0\"></orders>"
+        "</Root>"
+    )
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+
+# --- SINGLE ORDER: ikke i bruk her, men noen Uni-bygg pinger likevel ---
+@app.route("/twinxml/singleorder.asp", methods=["GET","POST","HEAD"])
+def singleorder_asp():
+    xml = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        "<Root><order/></Root>"
+    )
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+
+# --- PRODUCTLIST: tom liste som “ser ekte ut” ---
+@app.route("/twinxml/productlist.asp", methods=["GET","POST","HEAD"])
+def productlist_asp():
+    xml = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        "<Root>"
+        "<OK>OK</OK>"
+        "<products count=\"0\"></products>"
+        "</Root>"
+    )
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+
+# --- POSTFILES: bilder (stub) ---
+@app.route("/twinxml/postfiles.asp", methods=["GET","POST","HEAD"])
+def postfiles_asp():
+    # No-op/stub: svar OK slik at Uni ikke stopper pga manglende bildeside
+    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+
+# --- POSTDISCOUNTSYSTEM: rabatter (stub) ---
+@app.route("/twinxml/postdiscountsystem.asp", methods=["GET","POST","HEAD"])
+def postdiscountsystem_asp():
+    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+
+
 # ---------- PRODUKTLISTE (viktig for at Uni starter vare-opplasting) ----------
 @app.route("/twinxml/productlist.asp", methods=["GET","POST"])
 def productlist_asp():
