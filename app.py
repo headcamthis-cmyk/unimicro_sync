@@ -11,37 +11,43 @@ APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
 ENV = os.environ.get("ENV", "prod")
 
+# Uni auth
 UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
+# Shopify
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "asmshop.no")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
-PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() == "true"
+PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
 
+# DB
 DB_URL = os.environ.get("DB_URL", "sync.db")
 
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
 
+# Flask app
 app = Flask(__name__)
 app.url_map.strict_slashes = False  # tolerate trailing slashes
 
-# -------- WSGI middleware to normalize // in PATH_INFO (runs BEFORE routing) --------
+
+# -------- WSGI middleware: normalize '//' in PATH before routing --------
 class DoubleSlashFix:
     def __init__(self, app):
         self.app = app
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
         if "//" in path:
-            fixed = path.replace("//", "/")
-            environ["PATH_INFO"] = fixed
+            environ["PATH_INFO"] = path.replace("//", "/")
         return self.app(environ, start_response)
 
 app.wsgi_app = DoubleSlashFix(app.wsgi_app)
 
-# -------- DB --------
+
+# -------- DB helpers --------
 def db():
     conn = sqlite3.connect(DB_URL)
     conn.row_factory = sqlite3.Row
@@ -89,7 +95,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS orders_inbox (
         id TEXT PRIMARY KEY,
         payload_xml TEXT,
-        status INTEGER DEFAULT 10,
+        status INTEGER DEFAULT 10, -- 10=ny/åpen, 20=importert
         created_at TEXT,
         updated_at TEXT
     )""")
@@ -98,11 +104,13 @@ def init_db():
 
 init_db()
 
+
 # -------- Utils --------
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
+    # Viktig: CRLF + windows-1252 for maksimal Uni-kompat
     return Response((body + "\r\n"), mimetype="text/plain; charset=windows-1252")
 
 def xml_resp(xml_str: str):
@@ -125,14 +133,56 @@ def save_log(endpoint):
         log.warning("save_log failed: %s", e)
 
 def to_float_safe(val):
-    try: return float(str(val).replace(",", "."))
-    except Exception: return None
+    try:
+        return float(str(val).replace(",", "."))
+    except Exception:
+        return None
 
 def to_int_safe(val):
-    try: return int(val)
+    try:
+        return int(val)
     except Exception:
-        try: return int(float(val))
-        except Exception: return None
+        try:
+            return int(float(val))
+        except Exception:
+            return None
+
+# ---- NEW: handle hex=true + tolerant XML tags ----
+def read_xml_body():
+    """
+    Leser rå body og dekoder hvis hex=true.
+    Prøver fornuftige encodings (utf-8, cp1252, latin-1).
+    Returnerer (decoded_xml_str, was_hex: bool)
+    """
+    raw = request.get_data() or b""
+    is_hex = (request.args.get("hex") or "").lower() in ("1", "true", "yes")
+    if is_hex:
+        try:
+            raw = bytes.fromhex(raw.decode("ascii"))
+        except Exception:
+            # fall back hvis ikke ekte hex
+            pass
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc), is_hex
+        except Exception:
+            continue
+    return raw.decode("utf-8", "ignore"), is_hex
+
+def findtext_any(elem, candidates, default=""):
+    for tag in candidates:
+        v = elem.findtext(tag)
+        if v is not None:
+            return v
+    return default
+
+def findall_any(root, candidates_xpath):
+    for xp in candidates_xpath:
+        nodes = root.findall(xp)
+        if nodes:
+            return nodes
+    return []
+
 
 # -------- Shopify client (minimal) --------
 def ensure_shopify_headers():
@@ -242,7 +292,8 @@ def upsert_shopify_product_from_row(row):
 
     return product_id, variant_id, inventory_item_id
 
-# -------- Logging --------
+
+# -------- Request logging --------
 @app.before_request
 def _log_req():
     try:
@@ -250,7 +301,8 @@ def _log_req():
     except Exception:
         pass
 
-# -------- Health/root --------
+
+# -------- Health/root/debug --------
 @app.route("/", methods=["GET"])
 def index():
     return ok_txt("OK")
@@ -266,6 +318,7 @@ def debug_last():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
+
 # -------- TwinXML: varegrupper --------
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
@@ -274,20 +327,25 @@ def post_product_group():
     if not require_auth():
         return ok_txt("ERROR:AUTH")
     if request.method == "GET":
-        return ok_txt("OK")  # noen oppsett tester GET
-    raw = request.data.decode("utf-8", "ignore")
+        # enkelte oppsett tester GET; svar "OK"
+        return ok_txt("OK")
+
+    raw, was_hex = read_xml_body()
     try:
         root = ET.fromstring(raw)
     except Exception as e:
-        log.warning("Bad XML groups: %s", e)
+        log.warning("Bad XML groups (hex=%s): %s ... first200=%r", was_hex, e, raw[:200])
         return ok_txt("ERROR:XML")
 
     count = 0
     conn = db()
-    for g in root.findall(".//group"):
-        groupid = (g.findtext("groupid") or "").strip()
-        groupname = (g.findtext("groupname") or "").strip()
-        parentid = (g.findtext("parentid") or "").strip()
+    group_nodes = findall_any(root, [
+        ".//group", ".//productgroup", ".//gruppe", ".//varegruppe"
+    ])
+    for g in group_nodes:
+        groupid   = (findtext_any(g, ["groupid","id","gruppeid","grpid"]).strip())
+        groupname = (findtext_any(g, ["groupname","name","gruppenavn"]).strip())
+        parentid  = (findtext_any(g, ["parentid","parent","overgruppeid"]).strip())
         if not groupid:
             continue
         conn.execute("""
@@ -302,8 +360,13 @@ def post_product_group():
         count += 1
     conn.commit()
     conn.close()
+
+    if count == 0:
+        log.warning("No groups parsed (hex=%s). First200=%r", was_hex, raw[:200])
+
     log.info("Stored %d groups", count)
     return ok_txt("OK")
+
 
 # -------- TwinXML: produkter --------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
@@ -313,31 +376,35 @@ def post_product():
     if not require_auth():
         return ok_txt("ERROR:AUTH")
     if request.method == "GET":
-        return ok_txt("OK")  # tåle test/GET
+        return ok_txt("OK")  # tåler GET-test
 
-    raw = request.data.decode("utf-8", "ignore")
+    raw, was_hex = read_xml_body()
     try:
         root = ET.fromstring(raw)
     except Exception as e:
-        log.warning("Bad XML products: %s", e)
+        log.warning("Bad XML products (hex=%s): %s ... first200=%r", was_hex, e, raw[:200])
         return ok_txt("ERROR:XML")
 
     total_upsert = 0
     total_shopify = 0
     conn = db()
-    for p in root.findall(".//product"):
-        prodid = (p.findtext("prodid") or "").strip()
+
+    product_nodes = findall_any(root, [
+        ".//product", ".//vare", ".//item", ".//produkt"
+    ])
+    for p in product_nodes:
+        prodid    = (findtext_any(p, ["prodid","varenr","sku","itemno"]).strip())
         if not prodid:
             continue
-        name = (p.findtext("name") or "").strip()
-        price = to_float_safe(p.findtext("price"))
-        vatcode = (p.findtext("vatcode") or "").strip()
-        groupid = (p.findtext("groupid") or "").strip()
-        barcode = (p.findtext("barcode") or "").strip()
-        stock = to_int_safe(p.findtext("stock"))
-        body_html = p.findtext("description") or p.findtext("body_html") or ""
-        image_b64 = p.findtext("image_b64") or None
-        webactive = 1 if (p.findtext("webactive") or "1").strip().lower() in ("1","true") else 0
+        name      = (findtext_any(p, ["name","varenavn","title"]).strip())
+        price     = to_float_safe(findtext_any(p, ["price","pris","salesprice","price_incl_vat"]))
+        vatcode   = (findtext_any(p, ["vatcode","mvakode"]).strip())
+        groupid   = (findtext_any(p, ["groupid","gruppeid","grpid"]).strip())
+        barcode   = (findtext_any(p, ["barcode","ean"]).strip())
+        stock     = to_int_safe(findtext_any(p, ["stock","quantity","qty","lager"]))
+        body_html = findtext_any(p, ["description","body_html","longtext","desc"]) or ""
+        image_b64 = findtext_any(p, ["image_b64","image","bilde_b64"]) or None
+        webactive = 1 if (findtext_any(p, ["webactive","active","is_web"], "1").strip().lower() in ("1","true","yes")) else 0
 
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
@@ -377,17 +444,23 @@ def post_product():
 
     conn.commit()
     conn.close()
+
+    if total_upsert == 0:
+        log.warning("No products parsed (hex=%s). First200=%r", was_hex, raw[:200])
+
     log.info("Upserted %d products (Shopify updated %d)", total_upsert, total_shopify)
     return ok_txt("OK")
 
-# -------- TwinXML: ordre --------
+
+# -------- TwinXML: ordre (MVP stub) --------
 @app.route("/twinxml/orders.asp", methods=["GET"])
 @app.route("/twinxml/orders.aspx", methods=["GET"])
 def orders_list():
     save_log("/twinxml/orders")
     if not require_auth():
+        # Returner tom liste i stedet for 401 – noen Uni-oppsett blir sære.
         return xml_resp("<orders></orders>")
-    return xml_resp("<orders></orders>")  # empty list is fine for Uni
+    return xml_resp("<orders></orders>")  # tom liste er OK for Uni
 
 @app.route("/twinxml/singleorder.asp", methods=["GET"])
 @app.route("/twinxml/singleorder.aspx", methods=["GET"])
@@ -398,9 +471,11 @@ def single_order():
     order_id = (request.args.get("id") or "").strip()
     if not order_id:
         return ok_txt("ERROR:NOID")
+
     conn = db()
     row = conn.execute("SELECT * FROM orders_inbox WHERE id=?", (order_id,)).fetchone()
     conn.close()
+
     if not row:
         xml = f"<order><id>{order_id}</id><status>10</status><lines></lines></order>"
         return xml_resp(xml)
@@ -416,6 +491,7 @@ def update_order():
     status = int(request.args.get("status") or "20")
     if not order_id:
         return ok_txt("ERROR:NOID")
+
     conn = db()
     conn.execute("""
         INSERT INTO orders_inbox (id, payload_xml, status, created_at, updated_at)
@@ -426,5 +502,7 @@ def update_order():
     conn.close()
     return ok_txt("OK")
 
+
+# -------- Main --------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
