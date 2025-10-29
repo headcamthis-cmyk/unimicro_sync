@@ -389,66 +389,48 @@ def post_product():
     total_shopify = 0
     conn = db()
 
-    # Finn produkter (flere varianter støttes)
+    # 1) Prøv vanlige paths
     product_nodes = findall_any(root, [
         ".//product", ".//vare", ".//item", ".//produkt"
     ])
+    # 2) Heuristikk: enhver node som har et varenr-felt behandles som "produkt"
     if not product_nodes:
-        # fallback hvis direkte under root
-        product_nodes = list(root.findall("./product"))
+        candidates = []
+        id_tags = ["prodid","varenr","sku","itemno","productident"]
+        for elem in root.iter():
+            if not list(elem):  # hopper tomme bladnoder
+                continue
+            ident = findtext_any(elem, id_tags).strip()
+            if ident:
+                candidates.append(elem)
+        product_nodes = candidates
+
+    if not product_nodes:
+        log.warning("No product-like nodes found (hex=%s). First200=%r", was_hex, raw[:200])
+        return ok_txt("OK")
 
     for p in product_nodes:
-        # Varenr / SKU (Uni kan bruke 'productident')
-        prodid    = (findtext_any(p, [
-            "prodid", "varenr", "sku", "itemno", "productident"
-        ]).strip())
+        # Varenr / SKU
+        prodid = (findtext_any(p, ["prodid","varenr","sku","itemno","productident"]).strip())
         if not prodid:
-            # logg første 200 tegn for feilsøk
             snippet = ET.tostring(p, encoding="unicode")[:200]
-            log.warning("Product without prodid/SKU. First200=%r", snippet)
+            log.warning("Product-like node without ident. First200=%r", snippet)
             continue
 
-        # Navn / beskrivelse (Uni bruker noen ganger 'descrip')
-        name      = (findtext_any(p, [
-            "name", "varenavn", "title", "description", "productname", "descrip"
-        ]).strip())
+        # Navn / beskrivelse (Uni bruker ofte 'descrip')
+        name      = (findtext_any(p, ["name","varenavn","title","description","productname","descrip"]).strip())
+        price     = to_float_safe(findtext_any(p, ["price","pris","salesprice","price_incl_vat","newprice","webprice"]))
+        vatcode   = (findtext_any(p, ["vatcode","mvakode"]).strip())
+        groupid   = (findtext_any(p, ["groupid","gruppeid","grpid","productgroup","groupno"]).strip())
+        barcode   = (findtext_any(p, ["barcode","ean"]).strip())
+        stock     = to_int_safe(findtext_any(p, ["stock","quantity","qty","lager","onhand"]))
+        body_html = findtext_any(p, ["body_html","longtext","description","desc","infohtml","descrip"]) or ""
+        image_b64 = findtext_any(p, ["image_b64","image","bilde_b64"]) or None
+        webactive = 1 if (findtext_any(p, ["webactive","active","is_web"], "1").strip().lower() in ("1","true","yes")) else 0
 
-        # Pris (inkl. mva hvis PRICE_INCLUDES_VAT=True)
-        price     = to_float_safe(findtext_any(p, [
-            "price", "pris", "salesprice", "price_incl_vat", "newprice", "webprice"
-        ]))
-
-        vatcode   = (findtext_any(p, ["vatcode", "mvakode"]).strip())
-
-        # Varegruppe
-        groupid   = (findtext_any(p, [
-            "groupid", "gruppeid", "grpid", "productgroup", "groupno"
-        ]).strip())
-
-        # Strekkode
-        barcode   = (findtext_any(p, ["barcode", "ean"]).strip())
-
-        # Lager
-        stock     = to_int_safe(findtext_any(p, [
-            "stock", "quantity", "qty", "lager", "onhand"
-        ]))
-
-        # HTML-beskrivelse (lang)
-        body_html = findtext_any(p, [
-            "body_html", "longtext", "description", "desc", "infohtml"
-        ]) or ""
-
-        # Bilde som base64 (hvis Uni sender det)
-        image_b64 = findtext_any(p, ["image_b64", "image", "bilde_b64"]) or None
-
-        # Aktivert for web
-        webactive = 1 if (findtext_any(p, ["webactive", "active", "is_web"], "1").strip().lower() in ("1", "true", "yes")) else 0
-
-        # MVA-håndtering dersom pris er eks. mva i Uni
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
 
-        # Skriv til DB
         conn.execute("""
             INSERT INTO products(prodid, name, price, vatcode, groupid, barcode, stock, body_html,
                                  image_b64, webactive, payload_xml, updated_at)
@@ -469,7 +451,6 @@ def post_product():
               image_b64, webactive, raw, now_iso()))
         total_upsert += 1
 
-        # Direkte til Shopify (hvis token er satt)
         if SHOPIFY_TOKEN:
             try:
                 row = conn.execute("SELECT * FROM products WHERE prodid=?", (prodid,)).fetchone()
@@ -485,9 +466,6 @@ def post_product():
 
     conn.commit()
     conn.close()
-
-    if total_upsert == 0:
-        log.warning("No products parsed after tag fallbacks (hex=%s). First200=%r", was_hex, raw[:200])
 
     log.info("Upserted %d products (Shopify updated %d)", total_upsert, total_shopify)
     return ok_txt("OK")
