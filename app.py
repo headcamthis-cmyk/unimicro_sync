@@ -17,7 +17,7 @@ ENV = os.environ.get("ENV", "prod")
 UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
-# Shopify (bruk myshopify-domenet)
+# Shopify
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
@@ -30,6 +30,10 @@ ENABLE_GROUP_COLLECTIONS = os.environ.get("ENABLE_GROUP_COLLECTIONS", "true").lo
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
+# NEW: kontroll på hva gruppe-endepunktet svarer (for Uni-kompat)
+# values: "empty" (default, tom respons), "plain_ok", "xml_ok"
+UNI_GROUPS_RESPONSE_STYLE = os.environ.get("UNI_GROUPS_RESPONSE_STYLE", "empty").lower()
+
 # DB
 DB_URL = os.environ.get("DB_URL", "sync.db")
 
@@ -40,7 +44,6 @@ log = logging.getLogger(APP_NAME)
 # Flask app
 app = Flask(__name__)
 app.url_map.strict_slashes = False  # tolerate trailing slashes
-
 
 # -------- WSGI middleware: normalize '//' in PATH before routing --------
 class DoubleSlashFix:
@@ -53,7 +56,6 @@ class DoubleSlashFix:
         return self.app(environ, start_response)
 
 app.wsgi_app = DoubleSlashFix(app.wsgi_app)
-
 
 # -------- DB helpers --------
 def db():
@@ -103,7 +105,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS orders_inbox (
         id TEXT PRIMARY KEY,
         payload_xml TEXT,
-        status INTEGER DEFAULT 10, -- 10=ny/åpen, 20=importert
+        status INTEGER DEFAULT 10,
         created_at TEXT,
         updated_at TEXT
     )""")
@@ -112,18 +114,12 @@ def init_db():
 
 init_db()
 
-
 # -------- Utils --------
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
-    # CRLF + windows-1252 for Uni-kompat (brukes på de fleste endepunkt)
     return Response((body + "\r\n"), mimetype="text/plain; charset=windows-1252")
-
-def ok_plain(body="OK"):
-    # Eksakt svar uten CRLF – noen Uni-dialoger krever helt nøyaktig "OK"
-    return Response(body, mimetype="text/plain; charset=windows-1252")
 
 def xml_resp(xml_str: str):
     return Response(xml_str, mimetype="text/xml; charset=windows-1252")
@@ -203,8 +199,7 @@ def findall_any(root, candidates_xpath):
             return nodes
     return []
 
-
-# -------- Shopify client (minimal) --------
+# -------- Shopify client --------
 def ensure_shopify_headers():
     if not SHOPIFY_TOKEN:
         raise RuntimeError("SHOPIFY_TOKEN is not configured")
@@ -348,7 +343,6 @@ def ensure_tracking_and_set_inventory(variant_id, inventory_item_id, stock):
     })
     shopify_set_inventory(inventory_item_id, stock)
 
-
 def upsert_shopify_product_from_row(row):
     sku = row["prodid"]
     name = row["name"]
@@ -425,14 +419,13 @@ def upsert_shopify_product_from_row(row):
                     shopify_add_image(product_id, cleaned, filename=fname, position=1, alt=name or sku)
                     log.info("Uploaded image for sku=%s product_id=%s", sku, product_id)
                 else:
-                    log.warning("image_b64 for sku=%s was not valid base64; skipped.", sku)
+                    log.warning("image_b64 for %s not valid base64; skipped.", sku)
             else:
                 log.info("Product %s already has %d image(s); skipping upload.", product_id, len(images))
         except Exception as e:
             log.warning("Image upload failed for %s: %s", sku, e)
 
     return product_id, variant_id, inventory_item_id
-
 
 # -------- Request logging --------
 @app.before_request
@@ -441,7 +434,6 @@ def _log_req():
         log.info("REQ %s %s?%s", request.method, request.path, request.query_string.decode())
     except Exception:
         pass
-
 
 # -------- Health/root/debug --------
 @app.route("/", methods=["GET"])
@@ -493,26 +485,33 @@ def dbg_shopify_product(pid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# -------- Helper for Uni groups OK style --------
+def uni_groups_ok():
+    if UNI_GROUPS_RESPONSE_STYLE == "plain_ok":
+        return Response("OK", mimetype="text/plain; charset=windows-1252")
+    if UNI_GROUPS_RESPONSE_STYLE == "xml_ok":
+        return Response("<OK/>", mimetype="text/xml; charset=windows-1252")
+    # default: tom respons (Content-Length: 0)
+    return Response(status=200, mimetype="text/plain; charset=windows-1252")
 
 # -------- TwinXML: varegrupper --------
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
     save_log("/twinxml/postproductgroup")
-    if not require_auth():
-        # Noen installasjoner forventer "OK" uansett – men ved auth-feil svarer vi standard OK
-        return ok_plain("OK")
+
     if request.method == "GET":
-        # Eksakt OK (uten CRLF) – Uni tolker dette som suksess
-        return ok_plain("OK")
+        return uni_groups_ok()
+
+    if not require_auth():
+        return uni_groups_ok()
 
     raw, was_hex = read_xml_body()
     try:
         root = ET.fromstring(raw)
     except Exception as e:
         log.warning("Bad XML groups (hex=%s): %s ... first200=%r", was_hex, e, raw[:200])
-        # Svar fortsatt OK, Uni kan abortere hvis ikke "OK"
-        return ok_plain("OK")
+        return uni_groups_ok()
 
     count = 0
     conn = db()
@@ -539,9 +538,7 @@ def post_product_group():
     conn.close()
 
     log.info("Stored %d groups", count)
-    # Viktig: eksakt "OK"
-    return ok_plain("OK")
-
+    return uni_groups_ok()
 
 # -------- TwinXML: produkter (create/update) --------
 # Alias som noen Uni-oppsett bruker ved “Last opp alle varer”
@@ -646,7 +643,6 @@ def post_product():
     log.info("Upserted %d products (Shopify updated %d)", total_upsert, total_shopify)
     return ok_txt("OK")
 
-
 # -------- TwinXML: delete product --------
 @app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/deleteproduct.aspx", methods=["GET","POST"])
@@ -695,7 +691,6 @@ def delete_product():
 
     return ok_txt("OK")
 
-
 # -------- TwinXML: ordre (MVP stub) --------
 @app.route("/twinxml/orders.asp", methods=["GET"])
 @app.route("/twinxml/orders.aspx", methods=["GET"])
@@ -742,15 +737,12 @@ def update_order():
     conn.close()
     return ok_txt("OK")
 
-
 # -------- TwinXML: separate bilder (stub – svarer OK) --------
 @app.route("/twinxml/postimages.asp", methods=["GET","POST"])
 @app.route("/twinxml/postimages.aspx", methods=["GET","POST"])
 def post_images_stub():
     save_log("/twinxml/postimages")
-    # No-op for nå; svar OK slik at Uni går videre
     return ok_txt("OK")
-
 
 # -------- Main --------
 if __name__ == "__main__":
