@@ -300,7 +300,6 @@ def postfiles_asp():
 def postdiscountsystem_asp():
     return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
 
-
 # ---------- PRODUKTLISTE (viktig for at Uni starter vare-opplasting) ----------
 @app.route("/twinxml/productlist.asp", methods=["GET","POST"])
 def productlist_asp():
