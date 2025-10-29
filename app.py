@@ -26,9 +26,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger(APP_NAME)
 
 app = Flask(__name__)
-app.url_map.strict_slashes = False  # tolerate trailing slash diffs
+app.url_map.strict_slashes = False  # tolerate trailing slashes
 
-# ------------ DB ------------
+# -------- WSGI middleware to normalize // in PATH_INFO (runs BEFORE routing) --------
+class DoubleSlashFix:
+    def __init__(self, app):
+        self.app = app
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "/")
+        if "//" in path:
+            fixed = path.replace("//", "/")
+            environ["PATH_INFO"] = fixed
+        return self.app(environ, start_response)
+
+app.wsgi_app = DoubleSlashFix(app.wsgi_app)
+
+# -------- DB --------
 def db():
     conn = sqlite3.connect(DB_URL)
     conn.row_factory = sqlite3.Row
@@ -72,12 +85,11 @@ def init_db():
         body TEXT,
         created_at TEXT
     )""")
-    # Minimal lagring av "ordre" (for test av Uni-orderflyt)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders_inbox (
         id TEXT PRIMARY KEY,
         payload_xml TEXT,
-        status INTEGER DEFAULT 10, -- 10=ny/åpen, 20=importert
+        status INTEGER DEFAULT 10,
         created_at TEXT,
         updated_at TEXT
     )""")
@@ -86,7 +98,7 @@ def init_db():
 
 init_db()
 
-# ------------ Utils ------------
+# -------- Utils --------
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,7 +134,7 @@ def to_int_safe(val):
         try: return int(float(val))
         except Exception: return None
 
-# ------------ Shopify client (minimal) ------------
+# -------- Shopify client (minimal) --------
 def ensure_shopify_headers():
     if not SHOPIFY_TOKEN:
         raise RuntimeError("SHOPIFY_TOKEN is not configured")
@@ -209,7 +221,6 @@ def upsert_shopify_product_from_row(row):
         product_id = variant["product_id"]
         variant_id = variant["id"]
         inventory_item_id = variant["inventory_item_id"]
-        existing = shopify_get_product(product_id) or {}
         update_payload = {
             "id": product_id,
             "title": payload["title"],
@@ -231,17 +242,18 @@ def upsert_shopify_product_from_row(row):
 
     return product_id, variant_id, inventory_item_id
 
-# ------------ Request logging & path normalisering ------------
+# -------- Logging --------
 @app.before_request
-def _log_and_normalize():
-    raw_path = request.environ.get("RAW_URI") or request.full_path or request.path
-    log.info("REQ %s %s?%s", request.method, request.path, request.query_string.decode())
-    # Tolerer // i path ved å “proxy-route” manuelt til riktige views
-    if "//" in request.path:
-        # vi oversetter på stedet (uten redirect) ved å sette PATH_INFO
-        normalized = request.path.replace("//", "/")
-        request.environ["PATH_INFO"] = normalized  # Flask ruter på PATH_INFO
-        log.info("Normalized path %r -> %r", request.path, normalized)
+def _log_req():
+    try:
+        log.info("REQ %s %s?%s", request.method, request.path, request.query_string.decode())
+    except Exception:
+        pass
+
+# -------- Health/root --------
+@app.route("/", methods=["GET"])
+def index():
+    return ok_txt("OK")
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
@@ -254,13 +266,15 @@ def debug_last():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
-# ------------ TwinXML: varegrupper ------------
-@app.route("/twinxml/postproductgroup.asp", methods=["POST"])
-@app.route("/twinxml/postproductgroup.aspx", methods=["POST"])
+# -------- TwinXML: varegrupper --------
+@app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
+@app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
     save_log("/twinxml/postproductgroup")
     if not require_auth():
         return ok_txt("ERROR:AUTH")
+    if request.method == "GET":
+        return ok_txt("OK")  # noen oppsett tester GET
     raw = request.data.decode("utf-8", "ignore")
     try:
         root = ET.fromstring(raw)
@@ -291,13 +305,15 @@ def post_product_group():
     log.info("Stored %d groups", count)
     return ok_txt("OK")
 
-# ------------ TwinXML: produkter ------------
-@app.route("/twinxml/postproduct.asp", methods=["POST"])
-@app.route("/twinxml/postproduct.aspx", methods=["POST"])
+# -------- TwinXML: produkter --------
+@app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
+@app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
 def post_product():
     save_log("/twinxml/postproduct")
     if not require_auth():
         return ok_txt("ERROR:AUTH")
+    if request.method == "GET":
+        return ok_txt("OK")  # tåle test/GET
 
     raw = request.data.decode("utf-8", "ignore")
     try:
@@ -364,21 +380,15 @@ def post_product():
     log.info("Upserted %d products (Shopify updated %d)", total_upsert, total_shopify)
     return ok_txt("OK")
 
-# ------------ TwinXML: ordre (MVP stub som svarer korrekt) ------------
-# Liste "klare" ordrer
+# -------- TwinXML: ordre --------
 @app.route("/twinxml/orders.asp", methods=["GET"])
 @app.route("/twinxml/orders.aspx", methods=["GET"])
 def orders_list():
     save_log("/twinxml/orders")
     if not require_auth():
-        # Noen oppsett forventer 200 med tom liste; vi svarer tom liste for auth-feil også,
-        # men du kan endre til ERROR:AUTH hvis Uni faktisk feiler på det.
         return xml_resp("<orders></orders>")
-    # I MVP har vi ikke en faktisk kø fra Shopify, så vi svarer tom liste:
-    # Vil du teste flyten, legg manuelt inn en fake ordre i orders_inbox.
-    return xml_resp("<orders></orders>")
+    return xml_resp("<orders></orders>")  # empty list is fine for Uni
 
-# Enkeltordre henting
 @app.route("/twinxml/singleorder.asp", methods=["GET"])
 @app.route("/twinxml/singleorder.aspx", methods=["GET"])
 def single_order():
@@ -388,19 +398,14 @@ def single_order():
     order_id = (request.args.get("id") or "").strip()
     if not order_id:
         return ok_txt("ERROR:NOID")
-
     conn = db()
     row = conn.execute("SELECT * FROM orders_inbox WHERE id=?", (order_id,)).fetchone()
     conn.close()
-
-    # Dummy/minimal XML hvis ikke funnet, for å teste Uni flyt
     if not row:
         xml = f"<order><id>{order_id}</id><status>10</status><lines></lines></order>"
         return xml_resp(xml)
-
     return xml_resp(row["payload_xml"])
 
-# Kvittering / statusoppdatering
 @app.route("/twinxml/updateorder.asp", methods=["GET"])
 @app.route("/twinxml/updateorder.aspx", methods=["GET"])
 def update_order():
@@ -411,7 +416,6 @@ def update_order():
     status = int(request.args.get("status") or "20")
     if not order_id:
         return ok_txt("ERROR:NOID")
-
     conn = db()
     conn.execute("""
         INSERT INTO orders_inbox (id, payload_xml, status, created_at, updated_at)
@@ -421,24 +425,6 @@ def update_order():
     conn.commit()
     conn.close()
     return ok_txt("OK")
-
-# ------------ Fallback catch-all for tvilsomme doble slasher ------------
-@app.route("/", defaults={"u_path": ""}, methods=["GET","POST"])
-@app.route("/<path:u_path>", methods=["GET","POST"])
-def catch_all(u_path):
-    # Hvis Uni sender rare paths med flere slashes: vi prøver å route manuelt
-    path = "/" + u_path
-    if "twinxml/orders" in path:
-        return orders_list()
-    if "twinxml/singleorder" in path:
-        return single_order()
-    if "twinxml/updateorder" in path:
-        return update_order()
-    if "twinxml/postproductgroup" in path and request.method == "POST":
-        return post_product_group()
-    if "twinxml/postproduct" in path and request.method == "POST":
-        return post_product()
-    return Response("Not Found\r\n", status=404, mimetype="text/plain; charset=windows-1252")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
