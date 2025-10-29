@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: ""
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
     envVars:
       - key: ENV
         value: prod
@@ -20,6 +20,6 @@ services:
         value: "16764928067"
       - key: PRICE_INCLUDES_VAT
         value: "true"
-      # Sett denne i Render som "Secret File/Env" (ikke commit):
+      # Sett denne i Render dashbordet som Secret:
       # - key: SHOPIFY_TOKEN
       #   sync: false
