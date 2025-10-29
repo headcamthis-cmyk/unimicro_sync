@@ -79,7 +79,6 @@ init_db()
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
-    # Klassisk ASP-aktig OK med CRLF
     return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
 def require_auth():
@@ -234,11 +233,9 @@ def _log_req():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
+# ---------- status.asp (nå GET/POST/HEAD + <Root>) ----------
 @app.route("/twinxml/status.asp", methods=["GET","POST","HEAD"])
 def status_asp():
-    """
-    Uni kaller status.asp både med GET og POST. Returnér gyldig XML i <Root>.
-    """
     lastupdate = request.args.get("lastupdate", "")
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
@@ -260,16 +257,27 @@ def status_asp():
     resp.headers["Connection"] = "close"
     return resp
 
-# ---------- Uni: svar for varegrupper (tuned) ----------
+# ---------- PRODUKTLISTE (viktig for at Uni starter vare-opplasting) ----------
+@app.route("/twinxml/productlist.asp", methods=["GET","POST"])
+def productlist_asp():
+    """
+    Returner gyldig tom produktliste. Uni bruker ofte dette for å se hvilke varer
+    som allerede finnes i nettbutikken før opplasting. Tom liste => last opp alt.
+    """
+    xml = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        "<Root>"
+        "<products count=\"0\"></products>"
+        "</Root>"
+    )
+    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+
+# ---------- Uni: svar for varegrupper ----------
 def uni_groups_ok():
-    """
-    Returner nøyaktig 'OK\\r\\n' med Content-Length=4.
-    Denne varianten har vist seg mest kompatibel for eldre Uni-klienter.
-    """
     body = "OK\r\n"
     resp = Response(body, status=200)
     resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))  # 4
+    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))
     resp.headers["Connection"] = "close"
     return resp
 
@@ -277,7 +285,6 @@ def uni_groups_ok():
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
-    # Logg ALT
     conn = db()
     conn.execute(
         "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
@@ -386,7 +393,9 @@ def post_product():
         if SHOPIFY_TOKEN:
             try:
                 row = c.execute("SELECT * FROM products WHERE prodid=?", (sku,)).fetchone()
-                upsert_shopify_product_from_row(row); synced += 1
+                # sync til Shopify
+                pid = upsert_shopify_product_from_row(row); _ = pid
+                synced += 1
             except Exception as e:
                 log.error("Shopify sync failed for %s: %s", sku, e)
 
@@ -394,7 +403,7 @@ def post_product():
     log.info("Upserted %d products (Shopify updated %d)", upserted, synced)
     return ok_txt("OK")
 
-# ---------- TwinXML: delete (arkiver/slett) ----------
+# ---------- TwinXML: delete ----------
 @app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/deleteproduct.aspx", methods=["GET","POST"])
 def delete_product():
@@ -432,38 +441,22 @@ def delete_all():
         pass
     return ok_txt("OK")
 
-# ---------- TwinXML catch-all: ruter post* til produkt-handler ----------
+# ---------- Catch-all: ruter alle "post*" til produkt-handler ----------
 @app.route("/twinxml/<path:rest>", methods=["GET", "POST", "HEAD"])
 def twinxml_fallback(rest):
-    """
-    Fanger opp ukjente Uni-endepunkt.
-    - Alt som ser ut som en opplasting (post*.asp/.aspx eller inneholder 'product'/'item')
-      sendes videre til post_product()-handleren.
-    - Alt annet svarer vi "OK" for å ikke stoppe Uni.
-    """
     try:
         qs = request.query_string.decode("utf-8", "ignore")
     except Exception:
         qs = ""
-
     path_l = rest.lower()
-
-    is_product_upload = (
+    is_upload = (
         path_l.startswith("post") or
-        "product" in path_l or
-        "item" in path_l or
-        "price" in path_l or
-        "stock" in path_l or
-        "inventory" in path_l
+        "product" in path_l or "item" in path_l or
+        "price" in path_l or "stock" in path_l or "inventory" in path_l
     )
-
-    logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s  (upload=%s)", rest, qs, is_product_upload)
-
-    if is_product_upload and request.method in ("POST", "GET"):
-        # kall vår eksisterende handler direkte
+    logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s  (upload=%s)", rest, qs, is_upload)
+    if is_upload and request.method in ("POST","GET"):
         return post_product()
-
-    # Ellers svar 'OK' så Uni ikke feiler
     return ok_txt("OK")
 
 # ---------- Main ----------
