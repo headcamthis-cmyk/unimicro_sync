@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: uni-shopify-sync
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: python app.py
+    envVars:
+      - key: ENV
+        value: prod
+      - key: UNI_USER
+        value: synall
+      - key: UNI_PASS
+        value: synall
+      - key: SHOPIFY_DOMAIN
+        value: asmshop.no
+      - key: SHOPIFY_API_VERSION
+        value: "2024-10"
+      - key: SHOPIFY_LOCATION_ID
+        value: "16764928067"
+      - key: PRICE_INCLUDES_VAT
+        value: "true"
+      # Sett denne i Render som "Secret File/Env" (ikke commit):
+      # - key: SHOPIFY_TOKEN
+      #   sync: false
