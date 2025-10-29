@@ -1,159 +1,201 @@
-
-from flask import Flask, request, Response
+import os
+import logging
+import sqlite3
+import json
+from datetime import datetime, timezone
+from flask import Flask, request, Response, jsonify
 import xml.etree.ElementTree as ET
 import requests
-import os
-import traceback
 
+# ------------------- Config -------------------
+APP_NAME = "uni-shopify-sync"
+PORT = int(os.environ.get("PORT", "10000"))
+ENV = os.environ.get("ENV", "prod")
+
+# Uni auth (for enkelhets skyld brukes basic sjekk av query params)
+UNI_USER = os.environ.get("UNI_USER", "synall")
+UNI_PASS = os.environ.get("UNI_PASS", "synall")
+
+# Shopify
+SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "asmshop.no")
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # sett i Render dashboard
+SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
+PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() == "true"
+
+# DB
+DB_URL = os.environ.get("DB_URL", "sync.db")
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+log = logging.getLogger(APP_NAME)
+
+# ------------------- App -------------------
 app = Flask(__name__)
 
-USERNAME = os.getenv('USERNAME', 'synall')
-PASSWORD = os.getenv('PASSWORD', 'synall')
+# ------------------- DB Helpers -------------------
+def db():
+    conn = sqlite3.connect(DB_URL)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-SHOPIFY_STORE = "asmshop.no"
-SHOPIFY_TOKEN = "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"
-SHOPIFY_API_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01"
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS groups (
+        groupid TEXT PRIMARY KEY,
+        groupname TEXT,
+        parentid TEXT,
+        payload_xml TEXT,
+        updated_at TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        prodid TEXT PRIMARY KEY,
+        name TEXT,
+        price REAL,
+        vatcode TEXT,
+        groupid TEXT,
+        barcode TEXT,
+        stock INTEGER,
+        body_html TEXT,
+        image_b64 TEXT,
+        webactive INTEGER,
+        payload_xml TEXT,
+        last_shopify_product_id TEXT,
+        last_shopify_variant_id TEXT,
+        last_inventory_item_id TEXT,
+        updated_at TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT,
+        method TEXT,
+        query TEXT,
+        body TEXT,
+        created_at TEXT
+    )""")
+    conn.commit()
+    conn.close()
 
-def check_auth(auth):
-    user = request.args.get("user")
-    password = request.args.get("pass")
-    expected_user = USERNAME
-    expected_password = PASSWORD
-    print(f"Auth attempt with user: {user}, password: {password}")
-    print(f"Expected user: {expected_user}, expected password: {expected_password}")
-    return user == expected_user and password == expected_password
+init_db()
 
-def find_product_by_sku(sku):
-    url = f"{SHOPIFY_API_URL}/products.json?fields=id,title,variants"
-    headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Failed to fetch products: {response.text}")
-        return None, None
+# ------------------- Utils -------------------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-    products = response.json().get('products', [])
-    for product in products:
-        for variant in product.get('variants', []):
-            if variant.get('sku') == sku:
-                return product, variant
-    return None, None
+def ok_txt(body="OK"):
+    # Viktig: Uni kan være pirkete på \r\n og content-type
+    return Response((body + "\r\n"), mimetype="text/plain; charset=windows-1252")
 
-@app.route('/')
-def index():
-    return "UniMicro Sync Service is running.", 200
+def require_auth():
+    u = request.args.get("user")
+    p = request.args.get("pass")
+    return (u == UNI_USER and p == UNI_PASS)
 
-@app.route('/product', defaults={'path': ''}, methods=['POST'])
-@app.route('/product/<path:path>', methods=['POST'])
-def product(path):
-    auth = request.authorization
-    if not check_auth(auth):
-        print(f"Unauthorized access attempt with auth={auth}")
-        return Response("Unauthorized", status=401)
+def save_log(endpoint):
+    conn = db()
+    conn.execute(
+        "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
+        (endpoint, request.method, request.query_string.decode("utf-8", "ignore"),
+         request.data.decode("utf-8", "ignore"), now_iso())
+    )
+    conn.commit()
+    conn.close()
 
-    data = request.data.decode('utf-8')
-    print(f"Received product XML on path /product/{path}:
-{data}")
-    print(f"Payload size: {len(data)} bytes")
+def ensure_shopify_headers():
+    if not SHOPIFY_TOKEN:
+        raise RuntimeError("SHOPIFY_TOKEN is not configured")
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
+def shopify_base():
+    return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
+
+def to_float_safe(val):
     try:
-        root = ET.fromstring(data)
-        tags = sorted({elem.tag for elem in root.iter()})
-        print(f"DEBUG: incoming XML tags: {tags}")
+        return float(str(val).replace(",", "."))
+    except Exception:
+        return None
 
-        # Handle product groups
-        if 'productgroup' in tags:
-            for pg in root.findall(".//productgroup"):
-                group_id = pg.findtext("id")
-                title = pg.findtext("description") or pg.findtext("groupno")
-                parent_group = pg.findtext("parentgroup")
-                if not title:
-                    print("Skipping product group without title")
-                    continue
+def to_int_safe(val):
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return None
 
-                headers = {
-                    "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-                    "Content-Type": "application/json"
-                }
-                collection_payload = {
-                    "custom_collection": {
-                        "title": title,
-                        "body_html": f"Group ID: {group_id}, Parent Group: {parent_group}"
-                    }
-                }
-                print(f"Creating product group in Shopify with payload: {collection_payload}")
-                resp = requests.post(f"{SHOPIFY_API_URL}/custom_collections.json",
-                                     json=collection_payload, headers=headers)
-                print(f"Shopify response: {resp.status_code} - {resp.text}")
+# ------------------- Shopify Client (minimal) -------------------
+def shopify_find_variant_by_sku(sku):
+    """Returnerer første variant som matcher SKU, ellers None"""
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/variants.json"
+    params = {"sku": sku}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    if r.status_code != 200:
+        log.warning("Shopify variants lookup failed %s: %s", r.status_code, r.text[:500])
+        return None
+    data = r.json()
+    variants = data.get("variants", [])
+    return variants[0] if variants else None
 
-        # Handle products
-        products = root.findall(".//Product") + root.findall(".//product")
-        for product in products:
-            sku = product.findtext("SKU")
-            title = product.findtext("ProductName")
-            description = product.findtext("Description")
-            price = product.findtext("Price")
-            stock = int(product.findtext("Stock", "0"))
+def shopify_get_product(product_id):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products/{product_id}.json"
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        log.warning("Shopify get product failed %s: %s", r.status_code, r.text[:500])
+        return None
+    return r.json().get("product")
 
-            if not sku:
-                print("Skipping product without SKU.")
-                continue
+def shopify_create_product(payload):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products.json"
+    r = requests.post(url, headers=headers, data=json.dumps({"product": payload}), timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Shopify create product failed {r.status_code}: {r.text[:500]}")
+    return r.json()["product"]
 
-            existing_product, existing_variant = find_product_by_sku(sku)
-            headers = {
-                "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-                "Content-Type": "application/json"
-            }
+def shopify_update_product(product_id, payload):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/products/{product_id}.json"
+    r = requests.put(url, headers=headers, data=json.dumps({"product": payload}), timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Shopify update product failed {r.status_code}: {r.text[:500]}")
+    return r.json()["product"]
 
-            if existing_product:
-                product_id = existing_product['id']
-                variant_id = existing_variant['id']
+def shopify_set_inventory(inventory_item_id, available):
+    headers = ensure_shopify_headers()
+    url = f"{shopify_base()}/inventory_levels/set.json"
+    body = {
+        "location_id": int(SHOPIFY_LOCATION_ID),
+        "inventory_item_id": int(inventory_item_id),
+        "available": int(available)
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Shopify inventory set failed {r.status_code}: {r.text[:500]}")
+    return r.json()
 
-                update_product_payload = {
-                    "product": {
-                        "id": product_id,
-                        "body_html": description
-                    }
-                }
-                update_variant_payload = {
-                    "variant": {
-                        "id": variant_id,
-                        "price": price,
-                        "inventory_quantity": stock
-                    }
-                }
-
-                resp1 = requests.put(f"{SHOPIFY_API_URL}/products/{product_id}.json",
-                                     json=update_product_payload, headers=headers)
-                resp2 = requests.put(f"{SHOPIFY_API_URL}/variants/{variant_id}.json",
-                                     json=update_variant_payload, headers=headers)
-                print(f"Updated product {title} (SKU: {sku}): Product Resp: {resp1.status_code}, Variant Resp: {resp2.status_code}")
-
-            else:
-                product_payload = {
-                    "product": {
-                        "title": title,
-                        "body_html": description,
-                        "variants": [
-                            {
-                                "price": price,
-                                "sku": sku,
-                                "inventory_quantity": stock
-                            }
-                        ]
-                    }
-                }
-                create_url = f"{SHOPIFY_API_URL}/products.json"
-                resp = requests.post(create_url, json=product_payload, headers=headers)
-                print(f"Created new product {title} (SKU: {sku}): Status {resp.status_code}")
-
-        return Response("Products processed and synced to Shopify.", status=200)
-
-    except ET.ParseError:
-        return Response("Invalid XML format.", status=400)
-    except Exception as e:
-        traceback.print_exc()
-        return Response("Products processed and synced to Shopify.", status=200)
-
-@app.route("/twinxml/postproduct.asp", methods=["POST"])
-def handle_postproduct():
-    return product("twinxml/postproduct.asp")
+def upsert_shopify_product_from_row(row):
+    """
+    Tar en DB-row (fra products) og oppretter/oppdaterer i Shopify.
+    Returnerer (product_id, variant_id, inventory_item_id).
+    """
+    sku = row["prodid"]  # bruker Uni Varenr/prodid som SKU
+    name = row["name"]
+    price = row["price"]
+    body_html = row["body_html"]
+    barcode = row["barcode"]
+    stock = row["stock"] or 0
+    webactive
