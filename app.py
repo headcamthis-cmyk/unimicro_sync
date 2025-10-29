@@ -261,16 +261,22 @@ def status_asp():
 @app.route("/twinxml/productlist.asp", methods=["GET","POST"])
 def productlist_asp():
     """
-    Returner gyldig tom produktliste. Uni bruker ofte dette for å se hvilke varer
-    som allerede finnes i nettbutikken før opplasting. Tom liste => last opp alt.
+    Returner en gyldig tom produktliste for Uni. 
+    Dette får enkelte versjoner til å fortsette med postproduct.asp.
     """
     xml = (
         '<?xml version="1.0" encoding="ISO-8859-1"?>'
         "<Root>"
-        "<products count=\"0\"></products>"
+        "<OK>OK</OK>"
+        "<products>"
+        "<product><id>0</id><productident>dummy</productident></product>"
+        "</products>"
         "</Root>"
     )
-    return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
+    resp = Response(xml, status=200)
+    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
+    resp.headers["Connection"] = "close"
+    return resp
 
 # ---------- Uni: svar for varegrupper ----------
 def uni_groups_ok():
