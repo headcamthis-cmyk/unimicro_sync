@@ -80,7 +80,7 @@ init_db()
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
 def ok_txt(body="OK"):
-    # Klassisk ASP-aktig OK med CRLF + riktig Content-Length settes der det trengs
+    # Klassisk ASP-aktig OK med CRLF
     return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
 def require_auth():
@@ -195,6 +195,32 @@ def ensure_tracking_and_set_inventory(vid, iid, qty):
             raise
     shopify_update_variant(vid, {"inventory_management":"shopify", "inventory_policy":"deny", "requires_shipping":True})
     shopify_set_inventory(iid, qty)
+
+def shopify_upsert_product_metafields(pid: int, meta: dict):
+    """
+    Upsert en håndfull produkt-metafields under namespace 'uni'.
+    Tolkes som single_line_text_field i MVP.
+    """
+    if not meta:
+        return
+    try:
+        for key, val in meta.items():
+            if val is None or val == "":
+                continue
+            body = {"metafield": {
+                "namespace": "uni",
+                "key": key,
+                "value": str(val),
+                "type": "single_line_text_field"
+            }}
+            requests.post(
+                f"{shopify_base()}/products/{int(pid)}/metafields.json",
+                headers=sh_headers(),
+                data=json.dumps(body),
+                timeout=30
+            )
+    except Exception as e:
+        log.warning("Metafields upsert failed for product %s: %s", pid, e)
 
 def upsert_shopify_product_from_row(r):
     sku=r["prodid"]; name=r["name"]; price=r["price"]; stock=r["stock"] or 0
@@ -427,25 +453,56 @@ def post_product():
     conn = db(); c = conn.cursor()
     upserted=0; synced=0
     for p in nodes:
+        # --- Identitet / navn ---
         sku = findtext_any(p,["productident","prodid","varenr","sku","itemno"]).strip()
-        if not sku: continue
-        name = findtext_any(p,["description","name","varenavn","title","productname"]).strip()
+        if not sku:
+            continue
+        name  = findtext_any(p,["description","name","varenavn","title","productname","varenavn1"]).strip()
+        name2 = findtext_any(p,["varenavn2","alt01"]).strip()
+        name3 = findtext_any(p,["varenavn3","alt07"]).strip()
 
-        # Pris / lager / gruppering
-        price= to_float_safe(findtext_any(p,["price","pris","salesprice","price_incl_vat","newprice","webprice"]))
-        grp  = findtext_any(p,["productgroup","groupid","gruppeid","groupno"]).strip()
-        stock= to_int_safe(findtext_any(p,["quantityonhand","stock","quantity","qty","lager","onhand"]))
-
-        # Beskrivelse: longdesc/desc kan være hex i XML → dekode
-        longdesc = findtext_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml"]) or ""
+        # --- Beskrivelse (kan være hex i XML ifølge Uni) ---
+        longdesc = findtext_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or ""
         longdesc = maybe_hex_to_text(longdesc)
 
-        img  = findtext_any(p,["image_b64","image","bilde_b64"]) or None
-        web  = 1 if (findtext_any(p,["publish","webactive","active","is_web"],"1").strip().lower() in ("1","true","yes")) else 0
+        # --- Gruppering / lager ---
+        grp   = findtext_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]).strip()
+        stock = to_int_safe(findtext_any(p,["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
 
+        # --- Priser ---
+        price          = to_float_safe(findtext_any(p,["price","pris","salesprice","price_incl_vat","newprice","webprice","pris1","standard utpris"]))
+        ordinaryprice  = to_float_safe(findtext_any(p,["ordinaryprice","pris2"]))     # compare_at_price hvis > price
+        netprice       = to_float_safe(findtext_any(p,["netprice","innpris_selvkost"]))  # innpris → metafield
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
 
+        # --- EAN / barcode ---
+        ean = findtext_any(p,["ean","ean_nr","ean_nr.ean","alt02"]).strip()
+
+        # --- Dimensjoner / volum ---
+        length = to_float_safe(findtext_any(p,["dimension_y","lengde","alt03"]))
+        width  = to_float_safe(findtext_any(p,["dimension_x","bredde","alt04"]))
+        height = to_float_safe(findtext_any(p,["dimension_z","hoyde","høyde","alt05"]))
+        volume = to_float_safe(findtext_any(p,["volum","volume","alt06"]))
+        qty_in_pack = to_int_safe(findtext_any(p,["antall_pr_kolli","quantityinpack"]))
+
+        # --- Vekt / enhet ---
+        netweight = to_float_safe(findtext_any(p,["netweight","vekt"]))   # Pris3 i tabellen var "netweight"
+        grsweight = to_float_safe(findtext_any(p,["grsweight"]))
+        unit      = findtext_any(p,["unit","enhet"]).strip()
+
+        # --- Variant-relaterte felt (MVP: til metafields/tags) ---
+        color = findtext_any(p,["color","farge"]).strip()
+        size  = findtext_any(p,["dimen","størrelse","storrelse","size"]).strip()
+        parentno = findtext_any(p,["parentno","variansparent"]).strip()
+
+        # --- Sist endret ---
+        lastedit = findtext_any(p,["lastedit"]).strip()
+
+        # --- Webaktiv ---
+        web  = 1 if (findtext_any(p,["publish","webactive","active","is_web"],"1").strip().lower() in ("1","true","yes")) else 0
+
+        # --- Persist i lokal DB ---
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
@@ -454,14 +511,93 @@ def post_product():
             name=excluded.name, price=excluded.price, groupid=excluded.groupid, stock=excluded.stock,
             body_html=excluded.body_html, image_b64=excluded.image_b64, webactive=excluded.webactive,
             payload_xml=excluded.payload_xml, updated_at=excluded.updated_at
-        """,(sku,name,price,None,grp,None,stock,longdesc,img,web,raw,None,None,None,now_iso()))
+        """,(sku,name,price,None,grp,ean,stock,longdesc,None,web,raw,None,None,None,now_iso()))
         upserted += 1
 
+        # --- Sync til Shopify ---
         if SHOPIFY_TOKEN:
             try:
-                row = c.execute("SELECT * FROM products WHERE prodid=?", (sku,)).fetchone()
-                _pid = upsert_shopify_product_from_row(row)
+                # Bygg produktpayload (variant + compare_at_price, barcode, weight)
+                variant_payload = {
+                    "sku": sku,
+                    "price": f"{(price or 0):.2f}",
+                    "inventory_management": "shopify",
+                    "inventory_policy": "deny",
+                    "requires_shipping": True
+                }
+                if ordinaryprice and price and ordinaryprice > price:
+                    variant_payload["compare_at_price"] = f"{ordinaryprice:.2f}"
+                if ean:
+                    variant_payload["barcode"] = ean
+                weight_val = netweight if netweight is not None else grsweight
+                if weight_val is not None:
+                    variant_payload["weight"] = float(weight_val)
+                    variant_payload["weight_unit"] = "kg"
+
+                # Tittel + tags
+                full_title = name
+                extra = " ".join([t for t in [name2, name3] if t])
+                if extra:
+                    full_title = f"{name} {extra}"
+
+                product_payload = {
+                    "title": full_title or sku,
+                    "body_html": longdesc or "",
+                    "tags": [t for t in [
+                        f"group-{grp}" if grp else None,
+                        f"unit:{unit}" if unit else None,
+                        f"color:{color}" if color else None,
+                        f"size:{size}" if size else None
+                    ] if t],
+                    "variants": [variant_payload]
+                }
+
+                v = shopify_find_variant_by_sku(sku)
+                if v:
+                    pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
+                    up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
+                    if product_payload["tags"]:
+                        up["tags"]=",".join(product_payload["tags"])
+                    shopify_update_product(pid, up)
+                    log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
+                             sku, pid, SHOPIFY_DOMAIN, pid)
+                else:
+                    cp=dict(product_payload)
+                    if cp["tags"]:
+                        cp["tags"]=",".join(cp["tags"])
+                    cp["status"]="active" if web else "draft"
+                    created=shopify_create_product(cp)
+                    pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
+                    log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
+                             sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
+
+                # Lager
+                try:
+                    ensure_tracking_and_set_inventory(vid, iid, stock)
+                except Exception as e:
+                    log.warning("Inventory set failed for %s: %s", sku, e)
+
+                # Metafields (felter uten native plass)
+                metafields = {
+                    "ean": ean or None,
+                    "length": length,
+                    "width": width,
+                    "height": height,
+                    "volume": volume,
+                    "quantity_in_pack": qty_in_pack,
+                    "unit": unit or None,
+                    "netprice": netprice,
+                    "netweight": netweight,
+                    "grsweight": grsweight,
+                    "parentno": parentno or None,
+                    "color": color or None,
+                    "size": size or None,
+                    "lastedit": lastedit or None
+                }
+                shopify_upsert_product_metafields(pid, metafields)
+
                 synced += 1
+
             except Exception as e:
                 log.error("Shopify sync failed for %s: %s", sku, e)
 
@@ -527,7 +663,8 @@ def twinxml_fallback(rest):
     is_upload = (
         path_l.startswith("post") or
         "product" in path_l or "item" in path_l or
-        "price" in path_l or "stock" in path_l or "inventory" in path_l
+        "price" in path_l or "stock" in path_l or "inventory" in path_l or
+        "discount" in path_l
     )
     logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s  (upload=%s)", rest, qs, is_upload)
     if is_upload and request.method in ("POST","GET"):
