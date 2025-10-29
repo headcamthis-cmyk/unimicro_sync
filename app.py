@@ -227,10 +227,13 @@ def shopify_create_product(payload):
 def shopify_update_product(product_id, payload):
     headers = ensure_shopify_headers()
     url = f"{shopify_base()}/products/{product_id}.json"
-    r = requests.put(url, headers=headers, data=json.dumps({"product": payload}), timeout=60)
+    # Sørg for riktig wrapper og at vi ikke sender tomme felter
+    clean = {k: v for k, v in payload.items() if v is not None and v != ""}
+    r = requests.put(url, headers=headers, data=json.dumps({"product": clean}), timeout=60)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Shopify update product failed {r.status_code}: {r.text[:500]}")
     return r.json()["product"]
+
 
 def shopify_set_inventory(inventory_item_id, available):
     headers = ensure_shopify_headers()
