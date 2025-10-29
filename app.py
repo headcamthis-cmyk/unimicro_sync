@@ -142,15 +142,8 @@ def to_int_safe(v):
 
 # --- Uni groups OK helper ---
 def uni_groups_ok():
-    style = UNI_GROUPS_RESPONSE_STYLE
-    if style == "plain_ok":
-        return Response("OK", mimetype="text/plain; charset=windows-1252")
-    if style == "xml_ok":
-        return Response("<OK/>", mimetype="text/xml; charset=windows-1252")
-    if style == "xml_double":
-        xml = '<?xml version="1.0" encoding="ISO-8859-1"?>\r\n<OK>OK</OK>'
-        return Response(xml, mimetype="text/xml; charset=ISO-8859-1")
-    return Response(status=200, mimetype="text/plain; charset=windows-1252")
+    # Uni forventer i praksis *ren tekst* "OK" med CRLF og Windows-1252 encoding.
+    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
 
 
 # -------- Shopify client (simplified) --------
