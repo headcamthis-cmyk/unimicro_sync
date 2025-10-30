@@ -359,25 +359,30 @@ def orders_stub():
 
 @app.route("/twinxml/postproductgroup.asp", methods=["POST"])
 def post_product_group():
-    # store groups for reference; respond plain "OK" (Uni still shows 'OK' but that's fine)
     body = (request.data or b"").decode("iso-8859-1", "ignore")
     try:
         root = ET.fromstring(body)
         cnt = 0
-        conn = db()
-        cur = conn.cursor()
+        conn = db(); cur = conn.cursor()
         for g in root.findall(".//productgroup"):
             grpno = _get_text(g.find("groupno"))
             desc  = _get_text(g.find("description"))
             if grpno:
-                cur.execute("INSERT INTO product_groups(groupono, description) VALUES(?,?) ON CONFLICT(groupono) DO UPDATE SET description=excluded.description", (grpno, desc))
+                cur.execute("""
+                    INSERT INTO product_groups(groupono, description)
+                    VALUES(?,?)
+                    ON CONFLICT(groupono) DO UPDATE SET description=excluded.description
+                """, (grpno, desc))
                 cnt += 1
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
         logging.info("Stored %d groups", cnt)
     except Exception as e:
         logging.warning("Group parse failed: %s", e)
-    return ok_txt("OK")
+
+    # <<< IMPORTANT: reply as XML >>>
+    xml = '<?xml version="1.0" encoding="ISO-8859-1"?><OK>OK</OK>'
+    return Response(xml.encode("iso-8859-1"),
+                    mimetype="text/xml; charset=ISO-8859-1")
 
 @app.route("/twinxml/postproduct.asp", methods=["POST"])
 def post_product():
