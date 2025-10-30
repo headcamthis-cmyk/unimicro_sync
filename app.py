@@ -30,17 +30,9 @@ VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% VAT by default
 
 # ---------- Feature toggles ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1","true","yes")
-SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
-ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
-
-# IMPORTANT: only UPDATE, never CREATE (your requirement)
-ALLOW_CREATE = os.environ.get("ALLOW_CREATE", "false").lower() in ("1","true","yes")
-
-# Title behavior
-TITLE_APPEND_SKU = False  # your request: never append SKU
+PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")  # used on create if no image found
 
 # SEO / body defaults (optional)
-PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
 SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")
 DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")
@@ -242,8 +234,8 @@ def extract_title(p: ET.Element, sku: str) -> str:
     if not title:
         alt01 = findtext_ci_any(p, ["alt01"]) or ""
         alt07 = findtext_ci_any(p, ["alt07"]) or ""
-        title = alt01 or alt07 or sku  # fallback only if no text fields found
-    # IMPORTANT: do NOT append SKU (your request)
+        title = alt01 or alt07 or sku  # fallback only if nothing else
+    # IMPORTANT: do NOT append SKU
     return title
 
 def extract_best_price(p: ET.Element):
@@ -282,6 +274,11 @@ def shopify_find_variant_by_sku(sku):
     if r.status_code!=200: return None
     arr = r.json().get("variants", [])
     return arr[0] if arr else None
+
+def shopify_create_product(p):
+    r = requests.post(f"{shopify_base()}/products.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
+    if r.status_code not in (200,201): raise RuntimeError(f"create {r.status_code}: {r.text[:300]}")
+    return r.json()["product"]
 
 def shopify_update_product(pid, p):
     r = requests.put(f"{shopify_base()}/products/{pid}.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
@@ -571,56 +568,93 @@ def post_product():
         """,(sku,full_title,price,None,grp,ean,stock,longdesc,img_b64,1,vendor,raw,None,None,None,now_iso()))
         upserted += 1
 
-        # ---------- Shopify sync (UPDATE only, no CREATE) ----------
-        if SHOPIFY_TOKEN:
-            try:
-                v = shopify_find_variant_by_sku(sku)
-                if not v:
-                    log.info("SKU %s not found on Shopify. Skipping create (ALLOW_CREATE=%s).", sku, ALLOW_CREATE)
-                    continue  # Only update existing
+        # ---------- Shopify: UPDATE if exists, otherwise CREATE ----------
+        if not SHOPIFY_TOKEN:
+            continue
 
+        try:
+            v = shopify_find_variant_by_sku(sku)
+
+            # Build common product payload
+            variant_payload = {
+                "sku": sku,
+                "price": f"{(price or 0):.2f}",
+                "inventory_management": "shopify",
+                "inventory_policy": "deny",
+                "requires_shipping": True
+            }
+            if ordinaryprice and price and ordinaryprice > price:
+                variant_payload["compare_at_price"] = f"{ordinaryprice:.2f}"
+            if ean:
+                variant_payload["barcode"] = ean
+
+            product_payload = {
+                "title": full_title,
+                "body_html": longdesc or "",
+                "vendor": vendor or None,
+                "tags": [t for t in [f"group-{grp}" if grp else None] if t],
+                "variants": [variant_payload]
+            }
+
+            images_to_attach = []
+            if ENABLE_IMAGE_UPLOAD and img_b64:
+                images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
+            elif PLACEHOLDER_IMAGE_URL and not v:
+                images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1})
+            if images_to_attach:
+                product_payload["images"] = images_to_attach
+
+            pid = vid = iid = None
+
+            if v:
+                # UPDATE existing product
                 pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
-
-                # Update product title/body/vendor/tags
-                up={"id":pid,"title":full_title,"body_html":longdesc or ""}
-                if vendor: up["vendor"]=vendor
-                tags = []
-                if grp: tags.append(f"group-{grp}")
-                if tags:
-                    up["tags"] = ",".join(tags)
+                up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
+                if product_payload.get("vendor"): up["vendor"] = product_payload["vendor"]
+                if product_payload["tags"]:
+                    up["tags"] = ",".join(product_payload["tags"])
                 shopify_update_product(pid, up)
-
-                # Update variant price/compare_at/barcode
-                variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
-                if ordinaryprice and price and ordinaryprice > price:
-                    variant_update["compare_at_price"] = f"{ordinaryprice:.2f}"
-                if ean:
-                    variant_update["barcode"] = ean
-                try:
-                    shopify_update_variant(vid, variant_update)
-                except Exception as e:
-                    log.warning("Variant price update failed for %s: %s", sku, e)
-
-                # Inventory
-                try:
-                    ensure_tracking_and_set_inventory(vid, iid, stock)
-                except Exception as e:
-                    log.warning("Inventory set failed for %s: %s", sku, e)
-
-                shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
-                shopify_set_seo(pid, seo_title, seo_desc)
-
-                c.execute(
-                    "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, updated_at=? WHERE prodid=?",
-                    (pid, vid, iid, now_iso(), sku)
-                )
-                conn.commit()
                 log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                          sku, pid, SHOPIFY_DOMAIN, pid)
-                synced += 1
+            else:
+                # CREATE new product
+                cp=dict(product_payload)
+                if cp["tags"]:
+                    cp["tags"] = ",".join(cp["tags"])
+                cp["status"]="active"
+                created=shopify_create_product(cp)
+                pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
+                log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
+                         sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
 
+            # Always update variant and inventory
+            variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
+            if ordinaryprice and price and ordinaryprice > price:
+                variant_update["compare_at_price"] = f"{ordinaryprice:.2f}"
+            if ean:
+                variant_update["barcode"] = ean
+            try:
+                shopify_update_variant(vid, variant_update)
             except Exception as e:
-                log.error("Shopify sync failed for %s: %s", sku, e)
+                log.warning("Variant price update failed for %s: %s", sku, e)
+
+            try:
+                ensure_tracking_and_set_inventory(vid, iid, stock)
+            except Exception as e:
+                log.warning("Inventory set failed for %s: %s", sku, e)
+
+            shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
+            shopify_set_seo(pid, seo_title, seo_desc)
+
+            c.execute(
+                "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, updated_at=? WHERE prodid=?",
+                (pid, vid, iid, now_iso(), sku)
+            )
+            conn.commit()
+            synced += 1
+
+        except Exception as e:
+            log.error("Shopify sync failed for %s: %s", sku, e)
 
     conn.commit(); conn.close()
     log.info("Upserted %d products (Shopify updated %d)", upserted, synced)
@@ -634,19 +668,7 @@ def delete_product():
     sku = (request.args.get("id") or "").strip()
     if not sku: return ok_txt("OK")
     conn = db(); conn.execute("DELETE FROM products WHERE prodid=?", (sku,)); conn.commit(); conn.close()
-    try:
-        if SHOPIFY_TOKEN and ENABLE_SHOPIFY_DELETE:
-            v = shopify_find_variant_by_sku(sku)
-            if v:
-                pid=v["product_id"]
-                if SHOPIFY_DELETE_MODE=="delete":
-                    requests.delete(f"{shopify_base()}/products/{pid}.json", headers=sh_headers(), timeout=30)
-                elif SHOPIFY_DELETE_MODE=="draft":
-                    shopify_update_product(pid, {"id":pid,"status":"draft"})
-                else:
-                    shopify_update_product(pid, {"id":pid,"status":"archived"})
-    except Exception as e:
-        log.warning("Shopify delete/archive failed for %s: %s", sku, e)
+    # Intentionally not deleting on Shopify here (safer)
     return ok_txt("OK")
 
 # ---------- reset map ----------
