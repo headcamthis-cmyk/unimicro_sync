@@ -37,7 +37,7 @@ DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")
 TITLE_APPEND_SKU           = os.environ.get("TITLE_APPEND_SKU","false").lower() in ("1","true","yes")
 
 # Debug: log all discovered fields for first N products each request
-LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS","true").lower() in ("1","true","yes")
+LOG_SNIFF_FIELDS   = os.environ.get("LOG_SNIFF_FIELDS","true").lower() in ("1","true","yes")
 SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS","3"))
 
 # ---------- DB ----------
@@ -189,7 +189,6 @@ def node_text_or_attr(node: ET.Element) -> str:
     txt = (getattr(node, "text", "") or "").strip()
     if txt:
         return txt
-    # Uni can embed data in attributes (seen in some exports)
     for k in ("value","val","text","t"):
         v = node.attrib.get(k)
         if v and v.strip():
@@ -409,7 +408,8 @@ def postdiscount_asp():
 
 # ---------- varegrupper ----------
 def uni_groups_ok():
-    body = "OK\r\n"
+    # IMPORTANT: Uni V3 clients commonly expect literal "true" to confirm success
+    body = "true"
     resp = Response(body, status=200)
     resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
     resp.headers["Content-Length"] = str(len(body.encode("cp1252")))
