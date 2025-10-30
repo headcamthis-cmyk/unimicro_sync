@@ -62,6 +62,13 @@ def db():
 
 def init_db():
     conn = db(); c = conn.cursor()
+    # Gjør SQLite mer robust med flere prosesser (om du bruker >1 worker)
+    try:
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS groups(
       groupid TEXT PRIMARY KEY, groupname TEXT, parentid TEXT,
@@ -87,6 +94,29 @@ def init_db():
         pass
     conn.commit(); conn.close()
 init_db()
+
+def ensure_logs_table(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
+    )""")
+    conn.commit()
+
+def safe_log(endpoint: str, method: str, query: str, body: str):
+    try:
+        conn = db()
+        ensure_logs_table(conn)
+        conn.execute(
+            "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
+            (endpoint, method, query, body, now_iso())
+        )
+        conn.commit()
+    except Exception as e:
+        logging.warning("Skipping logs insert: %s", e)
+    finally:
+        try: conn.close()
+        except: pass
 
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
@@ -324,11 +354,12 @@ def uni_groups_ok():
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
-    conn = db()
-    conn.execute("INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
-                 ("/twinxml/postproductgroup", request.method, request.query_string.decode("utf-8","ignore"),
-                  (request.data or b"").decode("utf-8","ignore"), now_iso()))
-    conn.commit(); conn.close()
+    safe_log(
+        "/twinxml/postproductgroup",
+        request.method,
+        request.query_string.decode("utf-8","ignore"),
+        (request.data or b"").decode("utf-8","ignore")
+    )
 
     if request.method == "GET":
         return uni_groups_ok()
