@@ -29,12 +29,12 @@ ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in 
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
-# “Senere” (valgfrie) funksjoner – default AV
+# Valgfrie “senere”-funksjoner
 FORCE_NEW_PRODUCT_PER_SKU = os.environ.get("FORCE_NEW_PRODUCT_PER_SKU", "false").lower() in ("1","true","yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
-SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")  # f.eks: "{title} | AllSupermoto AS"
-SEO_DEFAULT_DESC_TEMPLATE = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")    # f.eks: "Kjøp {title} raskt & trygt hos ASM."
-DEFAULT_BODY_HTML = os.environ.get("DEFAULT_BODY_HTML")                    # f.eks: "<p>Standard beskrivelse…</p>"
+SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")  # f.eks: "{title} | {sku} | AllSupermoto AS"
+SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")   # f.eks: "Kjøp {title} ({sku}) hos ASM …"
+DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")           # f.eks: "<p>Standard beskrivelse…</p>"
 
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -75,7 +75,6 @@ def init_db():
       last_shopify_product_id TEXT, last_shopify_variant_id TEXT,
       last_inventory_item_id TEXT, updated_at TEXT
     )""")
-    # Prøv å legge til vendor-kolonnen hvis gammel DB mangler den
     try:
         c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
     except Exception:
@@ -152,6 +151,11 @@ def clean_b64(data):
     except Exception: return None
     return s
 
+def one_line(s: str | None) -> str | None:
+    if not s:
+        return None
+    return re.sub(r"[\r\n]+", " ", str(s)).strip()
+
 # ---------- Shopify ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
 def sh_headers():
@@ -209,6 +213,30 @@ def shopify_upsert_product_metafields(pid: int, meta: dict):
                           headers=sh_headers(), data=json.dumps(body), timeout=30)
     except Exception as e:
         log.warning("Metafields upsert failed for product %s: %s", pid, e)
+
+def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None):
+    """Setter SEO via metafields 'global.title_tag' og 'global.description_tag' (single_line_text_field)."""
+    try:
+        for key, val in (("title_tag", title), ("description_tag", desc)):
+            val = one_line(val)
+            if not val:
+                continue
+            body = {
+                "metafield": {
+                    "namespace": "global",
+                    "key": key,
+                    "type": "single_line_text_field",
+                    "value": val
+                }
+            }
+            requests.post(
+                f"{shopify_base()}/products/{int(pid)}/metafields.json",
+                headers=sh_headers(),
+                data=json.dumps(body),
+                timeout=30
+            )
+    except Exception as e:
+        log.warning("SEO metafields failed for product %s: %s", pid, e)
 
 # ---------- Request logging ----------
 @app.before_request
@@ -370,26 +398,27 @@ def post_product():
     upserted=0; synced=0
 
     for p in nodes:
+        # SKU
         sku = findtext_any(p,["productident","prodid","varenr","sku","itemno"]).strip()
         if not sku: continue
 
-        # Navn
+        # Navn -> title (inkl. varenavn2/3 hvis finnes)
         name  = findtext_any(p,["description","name","varenavn","title","productname","varenavn1"]).strip()
         name2 = findtext_any(p,["varenavn2","alt01"]).strip()
         name3 = findtext_any(p,["varenavn3","alt07"]).strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
 
-        # Beskrivelse (kan være hex)
+        # Beskrivelse (kan være hex fra Uni)
         longdesc = findtext_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or ""
         longdesc = maybe_hex_to_text(longdesc)
         if not longdesc and DEFAULT_BODY_HTML:
             longdesc = DEFAULT_BODY_HTML
 
-        # Grupper / lager
+        # Gruppe (kun tag i MVP) og lager
         grp   = findtext_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]).strip()
         stock = to_int_safe(findtext_any(p,["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
 
-        # Priser
+        # Pris/compare-at
         price         = to_float_safe(findtext_any(p,["price","pris","salesprice","price_incl_vat","newprice","webprice","pris1","standard utpris"]))
         ordinaryprice = to_float_safe(findtext_any(p,["ordinaryprice","pris2"]))  # compare_at_price hvis > price
         if price is not None and not PRICE_INCLUDES_VAT:
@@ -401,12 +430,12 @@ def post_product():
         # Barcode/EAN (valgfritt)
         ean = findtext_any(p,["ean","ean_nr","ean_nr.ean","alt02"]).strip()
 
-        # Bilde (vi laster ikke opp med mindre Uni faktisk sender det)
+        # Bilde – lastes kun opp hvis Uni faktisk sender b64. Ellers valgfri placeholder på CREATE.
         img_b64  = findtext_any(p,["image_b64","image","bilde_b64"]) or None
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        # SEO templates (valgfritt)
+        # SEO (valgfritt via ENV). Vi setter dette separat via metafields (single-line).
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
 
@@ -425,7 +454,6 @@ def post_product():
         # ---------- Shopify sync ----------
         if SHOPIFY_TOKEN:
             try:
-                # Finn eksisterende variant via SKU (med mulighet til å tvinge nytt produkt per SKU)
                 v = None if FORCE_NEW_PRODUCT_PER_SKU else shopify_find_variant_by_sku(sku)
 
                 variant_payload = {
@@ -447,9 +475,7 @@ def post_product():
                     "tags": [t for t in [f"group-{grp}" if grp else None] if t],
                     "variants": [variant_payload]
                 }
-                # Vi sender ikke images med mindre vi faktisk har b64 fra Uni
-                # (unngår tilfeldige/eksisterende bilder). Hvis du senere vil ha placeholder,
-                # sett PLACEHOLDER_IMAGE_URL.
+
                 images_to_attach = []
                 if ENABLE_IMAGE_UPLOAD and img_b64:
                     images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
@@ -458,23 +484,20 @@ def post_product():
                 if images_to_attach:
                     product_payload["images"] = images_to_attach
 
-                # CREATE/UPDATE
                 if v:
                     pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
                     up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
                     if product_payload.get("vendor"): up["vendor"] = product_payload["vendor"]
-                    if product_payload["tags"]: up["tags"]=",".join(product_payload["tags"])
-                    if seo_title or seo_desc:
-                        up["metafields"] = []
-                        if seo_title: up["metafields"].append({"namespace":"global","key":"title_tag","type":"single_line_text_field","value":seo_title})
-                        if seo_desc:  up["metafields"].append({"namespace":"global","key":"description_tag","type":"single_line_text_field","value":seo_desc})
+                    if product_payload["tags"]:
+                        up["tags"] = ",".join(product_payload["tags"])
                     shopify_update_product(pid, up)
                     log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                              sku, pid, SHOPIFY_DOMAIN, pid)
                 else:
                     cp=dict(product_payload)
-                    cp["tags"] = ",".join([t for t in cp.get("tags", []) if t])
-                    cp["status"]="active"  # alle varer som kommer fra Uni = web-aktive
+                    if cp["tags"]:
+                        cp["tags"] = ",".join(cp["tags"])
+                    cp["status"]="active"
                     created=shopify_create_product(cp)
                     pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
                     log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
@@ -486,8 +509,11 @@ def post_product():
                 except Exception as e:
                     log.warning("Inventory set failed for %s: %s", sku, e)
 
-                # Metafields: lagre vendor også i uni-namespace (lett å debugge)
+                # Vendor i metafields også (lett å debugge)
                 shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
+
+                # Sett SEO separat (enkeltlinje)
+                shopify_set_seo(pid, seo_title, seo_desc)
 
                 synced += 1
 
