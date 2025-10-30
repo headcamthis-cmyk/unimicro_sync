@@ -19,24 +19,33 @@ UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set i Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
-PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1","true","yes")
 
-# Feature toggles
+# ---------- Pricing behavior ----------
+# Uni sends NET price? If true, we add VAT before sending to Shopify
+UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1","true","yes")
+VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% VAT by default
+
+# ---------- Feature toggles ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1","true","yes")
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
-FORCE_NEW_PRODUCT_PER_SKU = os.environ.get("FORCE_NEW_PRODUCT_PER_SKU", "false").lower() in ("1","true","yes")
+# IMPORTANT: only UPDATE, never CREATE (your requirement)
+ALLOW_CREATE = os.environ.get("ALLOW_CREATE", "false").lower() in ("1","true","yes")
+
+# Title behavior
+TITLE_APPEND_SKU = False  # your request: never append SKU
+
+# SEO / body defaults (optional)
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
 SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")
 DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")
-TITLE_APPEND_SKU           = os.environ.get("TITLE_APPEND_SKU","false").lower() in ("1","true","yes")
 
-# Debug: log all discovered fields for first N products each request
+# Debug: log discovered XML fields for first N products each request
 LOG_SNIFF_FIELDS   = os.environ.get("LOG_SNIFF_FIELDS","true").lower() in ("1","true","yes")
 SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS","3"))
 
@@ -49,7 +58,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ---- normalize '//' i PATH (Uni kan sende dobbelt-slash)
+# ---- normalize '//' in PATH (Uni sometimes posts with double slash)
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -180,12 +189,11 @@ def one_line(s: str | None) -> str | None:
         return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
-# ---------- Case-insensitive + wildcard tag matching + attribute fallback ----------
+# ---------- Tag helpers (case-insensitive, attribute fallback) ----------
 def norm_tag(tag: str) -> str:
     return (tag.split('}', 1)[-1] if '}' in tag else tag).lower()
 
 def node_text_or_attr(node: ET.Element) -> str:
-    """Return inner text, or common attribute carriers like value/val."""
     txt = (getattr(node, "text", "") or "").strip()
     if txt:
         return txt
@@ -234,8 +242,9 @@ def extract_title(p: ET.Element, sku: str) -> str:
     if not title:
         alt01 = findtext_ci_any(p, ["alt01"]) or ""
         alt07 = findtext_ci_any(p, ["alt07"]) or ""
-        title = alt01 or alt07 or sku
-    return f"{title} ({sku})" if TITLE_APPEND_SKU and sku not in title else title
+        title = alt01 or alt07 or sku  # fallback only if no text fields found
+    # IMPORTANT: do NOT append SKU (your request)
+    return title
 
 def extract_best_price(p: ET.Element):
     """
@@ -273,11 +282,6 @@ def shopify_find_variant_by_sku(sku):
     if r.status_code!=200: return None
     arr = r.json().get("variants", [])
     return arr[0] if arr else None
-
-def shopify_create_product(p):
-    r = requests.post(f"{shopify_base()}/products.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
-    if r.status_code not in (200,201): raise RuntimeError(f"create {r.status_code}: {r.text[:300]}")
-    return r.json()["product"]
 
 def shopify_update_product(pid, p):
     r = requests.put(f"{shopify_base()}/products/{pid}.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
@@ -406,9 +410,8 @@ def deletetable_asp():
 def postdiscount_asp():
     return post_product()
 
-# ---------- varegrupper ----------
+# ---------- product groups (must return literal "true") ----------
 def uni_groups_ok():
-    # IMPORTANT: Uni V3 clients commonly expect literal "true" to confirm success
     body = "true"
     resp = Response(body, status=200)
     resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
@@ -456,7 +459,7 @@ def post_product_group():
     log.info("Stored %d groups", count)
     return uni_groups_ok()
 
-# ---------- produkter ----------
+# ---------- products ----------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
 @app.route("/twinxml/postproducts.asp", methods=["GET","POST"])
@@ -489,7 +492,6 @@ def post_product():
     nodes = (root.findall(".//product") or root.findall(".//vare") or
              root.findall(".//item") or root.findall(".//produkt"))
     if not nodes:
-        # fallback: any node that contains an id field
         cands=[]; idtags=["productident","prodid","varenr","sku","itemno"]
         for elem in root.iter():
             ident = ""
@@ -502,7 +504,6 @@ def post_product():
     conn = db(); c = conn.cursor()
     upserted=0; synced=0
 
-    # Optional deep sniff for first N products
     if LOG_SNIFF_FIELDS:
         for i, probe in enumerate(nodes[:SNIFF_MAX_PRODUCTS]):
             snap = []
@@ -517,12 +518,11 @@ def post_product():
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
 
+        # Title (no SKU appended)
         name  = extract_title(p, sku)
         name2 = (findtext_ci_any(p,["varenavn2","alt01"]) or "").strip()
         name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
-        if TITLE_APPEND_SKU and sku not in full_title:
-            full_title = f"{full_title} ({sku})"
 
         longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
@@ -535,11 +535,16 @@ def post_product():
         price_raw, price_src = extract_best_price(p)
         price = price_raw
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
-        if price is None and ordinaryprice is not None:
-            price = ordinaryprice
-            price_src = "ordinaryprice/pris2"
-        if price is not None and not PRICE_INCLUDES_VAT:
-            price = round(price * 1.25, 2)
+
+        # ---- VAT handling: send price INCLUDING VAT to Shopify
+        def brutto(val):
+            if val is None:
+                return None
+            return round(val * (1.0 + VAT_RATE), 2) if UNI_PRICE_IS_NET else round(val, 2)
+
+        price = brutto(price)
+        if ordinaryprice is not None:
+            ordinaryprice = brutto(ordinaryprice)
 
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
@@ -553,10 +558,6 @@ def post_product():
 
         log.info("PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s vendor=%r group=%r",
                  sku, full_title, price, price_src, ordinaryprice, stock, vendor, grp)
-        if full_title == sku:
-            log.warning("Title fallback to SKU for %s (no title-like fields matched)", sku)
-        if price is None:
-            log.warning("No price parsed for %s. Check SNIFF log for which tag holds it.", sku)
 
         # Persist locally
         c.execute("""
@@ -570,83 +571,26 @@ def post_product():
         """,(sku,full_title,price,None,grp,ean,stock,longdesc,img_b64,1,vendor,raw,None,None,None,now_iso()))
         upserted += 1
 
-        # ---------- Shopify sync ----------
+        # ---------- Shopify sync (UPDATE only, no CREATE) ----------
         if SHOPIFY_TOKEN:
             try:
-                row = c.execute(
-                    "SELECT last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id FROM products WHERE prodid=?",
-                    (sku,)
-                ).fetchone()
-                v = None
-                if row and row["last_shopify_product_id"]:
-                    try:
-                        v = {
-                            "product_id": int(row["last_shopify_product_id"]),
-                            "id": int(row["last_shopify_variant_id"]),
-                            "inventory_item_id": int(row["last_inventory_item_id"])
-                        }
-                    except Exception:
-                        v = None
-
-                if not v and not FORCE_NEW_PRODUCT_PER_SKU:
-                    v = shopify_find_variant_by_sku(sku)
-
-                variant_payload = {
-                    "sku": sku,
-                    "price": f"{(price or 0):.2f}",
-                    "inventory_management": "shopify",
-                    "inventory_policy": "deny",
-                    "requires_shipping": True
-                }
-                if ordinaryprice and price and ordinaryprice > price:
-                    variant_payload["compare_at_price"] = f"{ordinaryprice:.2f}"
-                if ean:
-                    variant_payload["barcode"] = ean
-
-                product_payload = {
-                    "title": full_title,
-                    "body_html": longdesc or "",
-                    "vendor": vendor or None,
-                    "tags": [t for t in [f"group-{grp}" if grp else None] if t],
-                    "variants": [variant_payload]
-                }
-
-                images_to_attach = []
-                if ENABLE_IMAGE_UPLOAD and img_b64:
-                    images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
-                elif PLACEHOLDER_IMAGE_URL and not v:
-                    images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1})
-                if images_to_attach:
-                    product_payload["images"] = images_to_attach
-
-                pid = vid = iid = None
-
-                if v:
-                    pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
-                    up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
-                    if product_payload.get("vendor"): up["vendor"] = product_payload["vendor"]
-                    if product_payload["tags"]:
-                        up["tags"] = ",".join(product_payload["tags"])
-                    try:
-                        shopify_update_product(pid, up)
-                    except Exception as e:
-                        log.warning("Update failed for %s (pid=%s). Will create new. Err=%s", sku, pid, e)
-                        v = None
-
+                v = shopify_find_variant_by_sku(sku)
                 if not v:
-                    cp=dict(product_payload)
-                    if cp["tags"]:
-                        cp["tags"] = ",".join(cp["tags"])
-                    cp["status"]="active"
-                    created=shopify_create_product(cp)
-                    pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
-                    log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
-                             sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
-                else:
-                    log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
-                             sku, pid, SHOPIFY_DOMAIN, pid)
+                    log.info("SKU %s not found on Shopify. Skipping create (ALLOW_CREATE=%s).", sku, ALLOW_CREATE)
+                    continue  # Only update existing
 
-                # Always update variant price/compare_at/barcode
+                pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
+
+                # Update product title/body/vendor/tags
+                up={"id":pid,"title":full_title,"body_html":longdesc or ""}
+                if vendor: up["vendor"]=vendor
+                tags = []
+                if grp: tags.append(f"group-{grp}")
+                if tags:
+                    up["tags"] = ",".join(tags)
+                shopify_update_product(pid, up)
+
+                # Update variant price/compare_at/barcode
                 variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
                 if ordinaryprice and price and ordinaryprice > price:
                     variant_update["compare_at_price"] = f"{ordinaryprice:.2f}"
@@ -657,6 +601,7 @@ def post_product():
                 except Exception as e:
                     log.warning("Variant price update failed for %s: %s", sku, e)
 
+                # Inventory
                 try:
                     ensure_tracking_and_set_inventory(vid, iid, stock)
                 except Exception as e:
@@ -670,6 +615,8 @@ def post_product():
                     (pid, vid, iid, now_iso(), sku)
                 )
                 conn.commit()
+                log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
+                         sku, pid, SHOPIFY_DOMAIN, pid)
                 synced += 1
 
             except Exception as e:
