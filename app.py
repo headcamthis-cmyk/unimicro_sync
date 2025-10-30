@@ -62,7 +62,7 @@ def db():
 
 def init_db():
     conn = db(); c = conn.cursor()
-    # Gjør SQLite mer robust med flere prosesser (om du bruker >1 worker)
+    # WAL for bedre samtidighet (men én worker er fortsatt best)
     try:
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
@@ -87,7 +87,7 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
     )""")
-    # Legg til vendor-kolonne hvis gammel DB mangler den
+    # Legg til vendor-kolonne hvis gammel DB mangler den (trygg)
     try:
         c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
     except Exception:
@@ -476,7 +476,7 @@ def post_product():
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
 
-        # Persist lokalt
+        # Persist lokalt (grunndata)
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,vendor,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
@@ -491,8 +491,27 @@ def post_product():
         # ---------- Shopify sync ----------
         if SHOPIFY_TOKEN:
             try:
-                v = None if FORCE_NEW_PRODUCT_PER_SKU else shopify_find_variant_by_sku(sku)
+                # --- Hent ev. tidligere pinning (mapping) ---
+                row = c.execute(
+                    "SELECT last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id FROM products WHERE prodid=?",
+                    (sku,)
+                ).fetchone()
+                v = None
+                if row and row["last_shopify_product_id"]:
+                    try:
+                        v = {
+                            "product_id": int(row["last_shopify_product_id"]),
+                            "id": int(row["last_shopify_variant_id"]),
+                            "inventory_item_id": int(row["last_inventory_item_id"])
+                        }
+                    except Exception:
+                        v = None
 
+                # Hvis ikke pinned mapping og ikke tvang-ny: prøv å finne via SKU-søk
+                if not v and not FORCE_NEW_PRODUCT_PER_SKU:
+                    v = shopify_find_variant_by_sku(sku)
+
+                # Bygg variant payload
                 variant_payload = {
                     "sku": sku,
                     "price": f"{(price or 0):.2f}",
@@ -505,6 +524,7 @@ def post_product():
                 if ean:
                     variant_payload["barcode"] = ean
 
+                # Bygg product payload
                 product_payload = {
                     "title": full_title,
                     "body_html": longdesc or "",
@@ -521,16 +541,21 @@ def post_product():
                 if images_to_attach:
                     product_payload["images"] = images_to_attach
 
+                # --- UPDATE eller CREATE ---
                 if v:
                     pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
                     up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
                     if product_payload.get("vendor"): up["vendor"] = product_payload["vendor"]
                     if product_payload["tags"]:
                         up["tags"] = ",".join(product_payload["tags"])
-                    shopify_update_product(pid, up)
-                    log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
-                             sku, pid, SHOPIFY_DOMAIN, pid)
-                else:
+                    try:
+                        shopify_update_product(pid, up)
+                    except Exception as e:
+                        # F.eks. 404 / mapping stale -> fall tilbake til CREATE
+                        log.warning("Update failed for %s (pid=%s). Will create new. Err=%s", sku, pid, e)
+                        v = None
+
+                if not v:
                     cp=dict(product_payload)
                     if cp["tags"]:
                         cp["tags"] = ",".join(cp["tags"])
@@ -539,6 +564,9 @@ def post_product():
                     pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
                     log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
                              sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
+                else:
+                    log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
+                             sku, pid, SHOPIFY_DOMAIN, pid)
 
                 # Inventory
                 try:
@@ -551,6 +579,13 @@ def post_product():
 
                 # Sett SEO separat (single-line)
                 shopify_set_seo(pid, seo_title, seo_desc)
+
+                # --- Lagre pinning (mapping) ---
+                c.execute(
+                    "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, updated_at=? WHERE prodid=?",
+                    (pid, vid, iid, now_iso(), sku)
+                )
+                conn.commit()
 
                 synced += 1
 
@@ -582,6 +617,22 @@ def delete_product():
                     shopify_update_product(pid, {"id":pid,"status":"archived"})
     except Exception as e:
         log.warning("Shopify delete/archive failed for %s: %s", sku, e)
+    return ok_txt("OK")
+
+# ---------- reset map (pinning) ----------
+@app.route("/twinxml/resetmap.asp", methods=["GET","POST"])
+def resetmap():
+    if not require_auth(): return ok_txt("OK")
+    sku = (request.args.get("id") or "").strip()
+    if not sku: return ok_txt("OK")
+    conn = db()
+    conn.execute("""
+        UPDATE products
+           SET last_shopify_product_id=NULL,
+               last_shopify_variant_id=NULL,
+               last_inventory_item_id=NULL
+         WHERE prodid=?""", (sku,))
+    conn.commit(); conn.close()
     return ok_txt("OK")
 
 # ---------- (stubs) ----------
