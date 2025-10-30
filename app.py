@@ -44,7 +44,7 @@ PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
 # ---------- Create / Update strategy ----------
 STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() in ("1", "true", "yes")
 # FIND_EXISTING_MODE: "cache_only" | "cache_then_lookup"
-FIND_EXISTING_MODE = os.environ.get("FIND_EXISTING_MODE")  # default below
+FIND_EXISTING_MODE = os.environ.get("FIND_EXISTING_MODE")
 if not FIND_EXISTING_MODE:
     FIND_EXISTING_MODE = "cache_only" if STRICT_UPDATE_ONLY else "cache_then_lookup"
 
@@ -480,6 +480,7 @@ def shopify_add_placeholder_image(pid: int):
                 alt = (img.get("alt") or "").lower()
                 if PLACEHOLDER_ALT.lower() in alt:
                     return
+            # has at least one image already; skip placeholder
             return
         body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
@@ -903,7 +904,7 @@ def post_product():
     conn = db(); c = conn.cursor()
     upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0
 
-    # Optional field sniff (kept very low for speed)
+    # Optional field sniff (light)
     if os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1","true","yes"):
         for i, probe in enumerate(nodes[:2]):
             snap = []
@@ -1135,46 +1136,102 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- Admin: seed cache (optional pre-warm) ----------
-@app.route("/admin/seed_cache", methods=["POST","GET"])
+# ---------- Admin: streaming seed cache with resume ----------
+@app.route("/admin/seed_cache", methods=["GET","POST"])
 def admin_seed_cache():
     key = request.args.get("key","")
     if ADMIN_KEY and key != ADMIN_KEY:
         return Response("Forbidden\r\n", status=403, mimetype="text/plain")
-    scanned = 0
-    since_id = 0
-    conn = db(); cur = conn.cursor()
-    try:
-        while True:
-            r = shopify_request("GET", f"/variants.json", params={"since_id": since_id, "limit": 250})
-            if r.status_code != 200:
-                return Response(f"Error {r.status_code}: {r.text[:200]}\r\n", mimetype="text/plain")
-            arr = r.json().get("variants", [])
-            if not arr:
-                break
-            for v in arr:
-                scanned += 1
-                sku = (v.get("sku") or "").strip()
-                if not sku:
-                    continue
-                pid = v.get("product_id")
-                vid = v.get("id")
-                iid = v.get("inventory_item_id")
+
+    # tunables via query params
+    limit = int(request.args.get("limit", "250"))          # variants per page (250 max)
+    flush_every = int(request.args.get("flush_every", "500"))
+    resume = (request.args.get("resume", "1").lower() in ("1","true","yes"))
+
+    def stream():
+        conn = db(); cur = conn.cursor()
+        try:
+            # read/create checkpoint
+            since_id = 0
+            if resume:
                 cur.execute("""
-                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(prodid) DO UPDATE SET
-                      last_shopify_product_id=excluded.last_shopify_product_id,
-                      last_shopify_variant_id=excluded.last_shopify_variant_id,
-                      last_inventory_item_id=excluded.last_inventory_item_id,
-                      updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                    CREATE TABLE IF NOT EXISTS seed_checkpoint(
+                        id INTEGER PRIMARY KEY CHECK (id=1),
+                        since_id INTEGER
+                    )""")
+                row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
+                if row and row["since_id"]:
+                    since_id = int(row["since_id"] or 0)
+
+            scanned = 0
+            total_scanned = 0
+            yield f"Starting seed (resume={resume}) from since_id={since_id}\n"
+
+            while True:
+                r = shopify_request("GET", f"/variants.json",
+                                    params={"since_id": since_id, "limit": min(limit, 250)})
+                if r.status_code != 200:
+                    yield f"Error {r.status_code}: {r.text[:200]}\n"
+                    break
+                arr = r.json().get("variants", [])
+                if not arr:
+                    yield "Done. No more variants.\n"
+                    break
+
+                for v in arr:
+                    sku = (v.get("sku") or "").strip()
+                    if not sku:
+                        continue
+                    pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
+                    cur.execute("""
+                        INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
+                                             last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(prodid) DO UPDATE SET
+                          last_shopify_product_id=excluded.last_shopify_product_id,
+                          last_shopify_variant_id=excluded.last_shopify_variant_id,
+                          last_inventory_item_id=excluded.last_inventory_item_id,
+                          updated_at=excluded.updated_at
+                    """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                    scanned += 1; total_scanned += 1
+                    since_id = v.get("id") or since_id
+
+                    if scanned >= flush_every:
+                        conn.commit()
+                        if resume:
+                            cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
+                                           VALUES(1, ?)
+                                           ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
+                                        (since_id,))
+                            conn.commit()
+                        yield f"Seeded +{scanned} (total={total_scanned}) — since_id={since_id}\n"
+                        scanned = 0
+
+                # flush after each page
+                conn.commit()
+                if resume:
+                    cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
+                                   VALUES(1, ?)
+                                   ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
+                                (since_id,))
+                    conn.commit()
+                yield f"Page committed — since_id={since_id}, total={total_scanned}\n"
+
+            # final commit + report last checkpoint
             conn.commit()
-            since_id = arr[-1]["id"]
-        return Response(f"Seeded {scanned} variants into local cache\r\n", mimetype="text/plain")
-    finally:
-        conn.close()
+            if resume:
+                row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
+                last = (row["since_id"] if row else None)
+                yield f"Finished. Last checkpoint since_id={last}\n"
+            else:
+                yield "Finished (no checkpoint saved).\n"
+        except Exception as e:
+            yield f"ERROR: {e}\n"
+        finally:
+            conn.close()
+
+    # streamed text/plain keeps the connection alive so you can watch progress
+    return Response(stream(), mimetype="text/plain", direct_passthrough=True)
 
 # ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
