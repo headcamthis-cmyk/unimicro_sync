@@ -17,9 +17,12 @@ PORT = int(os.environ.get("PORT", "10000"))
 UNI_USER = os.environ.get("UNI_USER", "synall")
 UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
+# ---------- Admin key (optional) ----------
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render env
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 
@@ -32,7 +35,7 @@ ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in 
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 
 # Behavior: ONLY update if SKU exists (no create) when true
-STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1","true","yes")
+STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1", "true", "yes")
 
 # SEO / body defaults (optional)
 SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
@@ -129,6 +132,11 @@ def safe_log(endpoint: str, method: str, query: str, body: str):
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def ok_txt(body="OK"): return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 def require_auth(): return request.args.get("user")==UNI_USER and request.args.get("pass")==UNI_PASS
+def require_admin():
+    key = request.args.get("key", "")
+    if ADMIN_KEY:
+        return key == ADMIN_KEY
+    return require_auth()
 
 def read_xml_body():
     raw = request.get_data() or b""
@@ -270,112 +278,35 @@ def parse_gid(gid: str, kind: str) -> int | None:
     m = re.match(rf"^gid://shopify/{re.escape(kind)}/(\d+)$", str(gid))
     return int(m.group(1)) if m else None
 
-def shopify_find_variant_by_sku(sku):
-    target = (sku or "").strip()
-    if not target:
-        return None
+def shopify_get_product(pid: int):
+    r = requests.get(f"{shopify_base()}/products/{pid}.json", headers=sh_headers(), timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"get product {r.status_code}: {r.text[:200]}")
+    return r.json()["product"]
 
-    # 0) Lokal cache i SQLite først
+def shopify_product_images(pid: int):
+    r = requests.get(f"{shopify_base()}/products/{pid}/images.json", headers=sh_headers(), timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"images {r.status_code}: {r.text[:200]}")
+    return r.json().get("images", [])
+
+def shopify_add_placeholder_image(pid: int, force: bool = False):
+    if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
+        return
     try:
-        conn = db()
-        row = conn.execute(
-            "SELECT last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
-            "FROM products WHERE prodid=?", (target,)
-        ).fetchone()
-        conn.close()
-        if row and row["last_shopify_variant_id"]:
-            return {
-                "id": int(row["last_shopify_variant_id"]),
-                "product_id": int(row["last_shopify_product_id"]) if row["last_shopify_product_id"] else None,
-                "inventory_item_id": int(row["last_inventory_item_id"]) if row["last_inventory_item_id"] else None,
-                "sku": target
-            }
-    except Exception as e:
-        logging.warning("Local SKU cache lookup failed for %r: %s", target, e)
-
-    # 1) GraphQL exact query (med korte retries)
-    for attempt in range(2):
-        try:
-            gql_url = f"{shopify_base()}/graphql.json"
-            headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
-            query = """
-            query ($q: String!) {
-              productVariants(first: 1, query: $q) {
-                edges {
-                  node {
-                    id
-                    sku
-                    product { id }
-                    inventoryItem { id }
-                  }
-                }
-              }
-            }
-            """
-            payload = {"query": query, "variables": {"q": f"sku:{target}"}}
-            r = requests.post(gql_url, headers=headers, data=json.dumps(payload), timeout=30)
-            if r.status_code == 200:
-                data = r.json()
-                edges = (((data or {}).get("data") or {}).get("productVariants") or {}).get("edges", [])
-                if edges:
-                    node = (edges[0] or {}).get("node") or {}
-                    if (node.get("sku") or "").strip() == target:
-                        vid = parse_gid(node.get("id"), "ProductVariant")
-                        pid = parse_gid(((node.get("product") or {}).get("id")), "Product")
-                        iid = parse_gid(((node.get("inventoryItem") or {}).get("id")), "InventoryItem")
-                        if vid and pid:
-                            return {"id": vid, "product_id": pid, "inventory_item_id": iid, "sku": target}
-                else:
-                    logging.warning("GraphQL lookup: 200 OK but empty for SKU %r (attempt %d)", target, attempt+1)
-            else:
-                logging.warning("GraphQL lookup failed for %r: %s %s", target, r.status_code, r.text[:200])
-                if r.status_code in (401,403):
-                    logging.warning("GraphQL auth/permissions issue: token needs read_products/read_inventory.")
-                    break
-        except Exception as e:
-            logging.warning("GraphQL error for %r (attempt %d): %s", target, attempt+1, e)
-
-    # 2) REST ?sku= (raskt, men kan ignoreres av Shopify noen ganger)
-    try:
-        r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(), params={"sku": target, "limit": 250}, timeout=30)
-        if r.status_code == 200:
-            arr = r.json().get("variants", [])
-            for v in arr:
-                if (v.get("sku") or "").strip() == target:
-                    return v
-            if arr:
-                logging.warning("Shopify ignored ?sku= for %r; full scan disabled unless FIND_SKU_MAX_VARIANTS>0", target)
+        if not force:
+            imgs = shopify_product_images(pid)
+            if imgs:
+                return
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1}}
+        r = requests.post(f"{shopify_base()}/products/{pid}/images.json",
+                          headers=sh_headers(), data=json.dumps(body), timeout=30)
+        if r.status_code not in (200, 201):
+            logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
         else:
-            logging.warning("variants.json?sku=… returned %s: %s", r.status_code, r.text[:200])
+            logging.info("Placeholder image attached to product %s", pid)
     except Exception as e:
-        logging.warning("SKU filtered lookup failed for %r: %s", target, e)
-
-    # 3) REST fullskann kun hvis eksplisitt aktivert
-    max_scan = FIND_SKU_MAX_VARIANTS
-    if max_scan and max_scan > 0:
-        scanned = 0
-        since_id = 0
-        while scanned < max_scan:
-            try:
-                r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(), params={"since_id": since_id, "limit": 250}, timeout=30)
-                if r.status_code != 200:
-                    logging.warning("variants scan stopped (status %s): %s", r.status_code, r.text[:200])
-                    break
-                arr = r.json().get("variants", [])
-                if not arr:
-                    break
-                for v in arr:
-                    scanned += 1
-                    if (v.get("sku") or "").strip() == target:
-                        return v
-                since_id = arr[-1]["id"]
-            except Exception as e:
-                logging.warning("variants scan error after %d scanned: %s", scanned, e)
-                break
-        logging.info("SKU %r not found after scanning %d variants.", target, scanned)
-
-    return None
-
+        logging.warning("Placeholder image attach error for %s: %s", pid, e)
 
 def shopify_create_product(p):
     r = requests.post(f"{shopify_base()}/products.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
@@ -433,6 +364,115 @@ def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None)
                           headers=sh_headers(), data=json.dumps(body), timeout=30)
     except Exception as e:
         log.warning("SEO metafields failed for product %s: %s", pid, e)
+
+# ---------- SKU lookup ----------
+def shopify_find_variant_by_sku(sku):
+    target = (sku or "").strip()
+    if not target:
+        return None
+
+    # 0) Local cache first
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
+            "FROM products WHERE prodid=?", (target,)
+        ).fetchone()
+        conn.close()
+        if row and row["last_shopify_variant_id"]:
+            return {
+                "id": int(row["last_shopify_variant_id"]),
+                "product_id": int(row["last_shopify_product_id"]) if row["last_shopify_product_id"] else None,
+                "inventory_item_id": int(row["last_inventory_item_id"]) if row["last_inventory_item_id"] else None,
+                "sku": target
+            }
+    except Exception as e:
+        logging.warning("Local SKU cache lookup failed for %r: %s", target, e)
+
+    # 1) GraphQL exact query (retry 2)
+    for attempt in range(2):
+        try:
+            gql_url = f"{shopify_base()}/graphql.json"
+            headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
+            query = """
+            query ($q: String!) {
+              productVariants(first: 1, query: $q) {
+                edges {
+                  node {
+                    id
+                    sku
+                    product { id }
+                    inventoryItem { id }
+                  }
+                }
+              }
+            }
+            """
+            payload = {"query": query, "variables": {"q": f"sku:{target}"}}
+            r = requests.post(gql_url, headers=headers, data=json.dumps(payload), timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                edges = (((data or {}).get("data") or {}).get("productVariants") or {}).get("edges", [])
+                if edges:
+                    node = (edges[0] or {}).get("node") or {}
+                    if (node.get("sku") or "").strip() == target:
+                        vid = parse_gid(node.get("id"), "ProductVariant")
+                        pid = parse_gid(((node.get("product") or {}).get("id")), "Product")
+                        iid = parse_gid(((node.get("inventoryItem") or {}).get("id")), "InventoryItem")
+                        if vid and pid:
+                            return {"id": vid, "product_id": pid, "inventory_item_id": iid, "sku": target}
+                else:
+                    logging.warning("GraphQL lookup: 200 OK but empty for SKU %r (attempt %d)", target, attempt+1)
+            else:
+                logging.warning("GraphQL lookup failed for %r: %s %s", target, r.status_code, r.text[:200])
+                if r.status_code in (401,403):
+                    logging.warning("GraphQL auth/permissions issue: token needs read_products/read_inventory.")
+                    break
+        except Exception as e:
+            logging.warning("GraphQL error for %r (attempt %d): %s", target, attempt+1, e)
+
+    # 2) REST ?sku= (quick; sometimes ignored)
+    try:
+        r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(),
+                         params={"sku": target, "limit": 250}, timeout=30)
+        if r.status_code == 200:
+            arr = r.json().get("variants", [])
+            for v in arr:
+                if (v.get("sku") or "").strip() == target:
+                    return v
+            if arr:
+                logging.warning("Shopify ignored ?sku= for %r; full scan disabled unless FIND_SKU_MAX_VARIANTS>0", target)
+        else:
+            logging.warning("variants.json?sku=… returned %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logging.warning("SKU filtered lookup failed for %r: %s", target, e)
+
+    # 3) Full scan if enabled
+    max_scan = FIND_SKU_MAX_VARIANTS
+    if max_scan and max_scan > 0:
+        scanned = 0
+        since_id = 0
+        while scanned < max_scan:
+            try:
+                r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(),
+                                 params={"since_id": since_id, "limit": 250}, timeout=30)
+                if r.status_code != 200:
+                    logging.warning("variants scan stopped (status %s): %s", r.status_code, r.text[:200])
+                    break
+                arr = r.json().get("variants", [])
+                if not arr:
+                    break
+                for v in arr:
+                    scanned += 1
+                    if (v.get("sku") or "").strip() == target:
+                        return v
+                since_id = arr[-1]["id"]
+            except Exception as e:
+                logging.warning("variants scan error after %d scanned: %s", scanned, e)
+                break
+        logging.info("SKU %r not found after scanning %d variants.", target, scanned)
+
+    return None
 
 # ---------- Request logging ----------
 @app.before_request
@@ -693,6 +733,7 @@ def post_product():
             if ENABLE_IMAGE_UPLOAD and img_b64:
                 images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
             elif PLACEHOLDER_IMAGE_URL and not v:
+                # For creations we can attach placeholder immediately
                 images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1})
             if images_to_attach:
                 product_payload["images"] = images_to_attach
@@ -709,6 +750,14 @@ def post_product():
                 shopify_update_product(pid, up)
                 log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                          sku, pid, SHOPIFY_DOMAIN, pid)
+
+                # Attach placeholder forcibly on update if product has no images
+                if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
+                    try:
+                        shopify_add_placeholder_image(pid, force=True)
+                    except Exception as e:
+                        logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
+
             else:
                 if STRICT_UPDATE_ONLY:
                     log.warning("STRICT_UPDATE_ONLY: Not creating missing SKU %r (skipping create).", sku)
@@ -782,7 +831,53 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- stubs ----------
+# ---------- Admin: seed cache (optional; safe to ignore) ----------
+@app.route("/admin/seed_cache", methods=["POST","GET"])
+def admin_seed_cache():
+    if not require_admin():
+        return Response("Forbidden\r\n", status=403, mimetype="text/plain")
+    headers = sh_headers()
+    scanned = 0
+    since_id = 0
+    conn = db(); cur = conn.cursor()
+    try:
+        while True:
+            r = requests.get(
+                f"{shopify_base()}/variants.json",
+                headers=headers,
+                params={"since_id": since_id, "limit": 250},
+                timeout=60
+            )
+            if r.status_code != 200:
+                return Response(f"Error {r.status_code}: {r.text[:200]}\r\n", mimetype="text/plain")
+            arr = r.json().get("variants", [])
+            if not arr:
+                break
+            for v in arr:
+                scanned += 1
+                sku = (v.get("sku") or "").strip()
+                if not sku:
+                    continue
+                pid = v.get("product_id")
+                vid = v.get("id")
+                iid = v.get("inventory_item_id")
+                cur.execute("""
+                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,vendor,payload_xml,
+                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(prodid) DO UPDATE SET
+                      last_shopify_product_id=excluded.last_shopify_product_id,
+                      last_shopify_variant_id=excluded.last_shopify_variant_id,
+                      last_inventory_item_id=excluded.last_inventory_item_id,
+                      updated_at=excluded.updated_at
+                """,(sku,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,now_iso()))
+            conn.commit()
+            since_id = arr[-1]["id"]
+        return Response(f"Seeded {scanned} variants into local cache\r\n", mimetype="text/plain")
+    finally:
+        conn.close()
+
+# ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
     return ok_txt("OK")
