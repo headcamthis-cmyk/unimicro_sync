@@ -271,97 +271,111 @@ def parse_gid(gid: str, kind: str) -> int | None:
     return int(m.group(1)) if m else None
 
 def shopify_find_variant_by_sku(sku):
-    """
-    Robust lookup preferring GraphQL exact match, then REST:
-      1) GraphQL: productVariants(query: "sku:...") -> exact match
-      2) REST: /variants.json?sku=... (verify)
-      3) REST: paginated scan up to FIND_SKU_MAX_VARIANTS
-    Returns a dict with keys: id, product_id, inventory_item_id, sku
-    """
     target = (sku or "").strip()
     if not target:
         return None
 
-    # ---- 1) GraphQL exact query ----
+    # 0) Lokal cache i SQLite først
     try:
-        gql_url = f"{shopify_base()}/graphql.json"
-        headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
-        query = """
-        query ($q: String!) {
-          productVariants(first: 1, query: $q) {
-            edges {
-              node {
-                id
-                sku
-                product { id }
-                inventoryItem { id }
+        conn = db()
+        row = conn.execute(
+            "SELECT last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
+            "FROM products WHERE prodid=?", (target,)
+        ).fetchone()
+        conn.close()
+        if row and row["last_shopify_variant_id"]:
+            return {
+                "id": int(row["last_shopify_variant_id"]),
+                "product_id": int(row["last_shopify_product_id"]) if row["last_shopify_product_id"] else None,
+                "inventory_item_id": int(row["last_inventory_item_id"]) if row["last_inventory_item_id"] else None,
+                "sku": target
+            }
+    except Exception as e:
+        logging.warning("Local SKU cache lookup failed for %r: %s", target, e)
+
+    # 1) GraphQL exact query (med korte retries)
+    for attempt in range(2):
+        try:
+            gql_url = f"{shopify_base()}/graphql.json"
+            headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
+            query = """
+            query ($q: String!) {
+              productVariants(first: 1, query: $q) {
+                edges {
+                  node {
+                    id
+                    sku
+                    product { id }
+                    inventoryItem { id }
+                  }
+                }
               }
             }
-          }
-        }
-        """
-        payload = {"query": query, "variables": {"q": f"sku:{target}"}}
-        r = requests.post(gql_url, headers=headers, data=json.dumps(payload), timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            edges = (((data or {}).get("data") or {}).get("productVariants") or {}).get("edges", [])
-            if not edges:
-                logging.warning("GraphQL lookup: 200 OK but empty for SKU %r", target)
-            for e in edges:
-                node = (e or {}).get("node") or {}
-                if (node.get("sku") or "").strip() == target:
-                    vid = parse_gid(node.get("id"), "ProductVariant")
-                    pid = parse_gid(((node.get("product") or {}).get("id")), "Product")
-                    iid = parse_gid(((node.get("inventoryItem") or {}).get("id")), "InventoryItem")
-                    if vid and pid:
-                        return {"id": vid, "product_id": pid, "inventory_item_id": iid, "sku": target}
-        else:
-            logging.warning("GraphQL lookup failed for SKU %r: %s %s", target, r.status_code, r.text[:200])
-            if r.status_code in (401, 403):
-                logging.warning("GraphQL auth/permissions issue. Ensure token has read_products/read_inventory.")
-    except Exception as e:
-        logging.warning("GraphQL lookup error for SKU %r: %s", target, e)
+            """
+            payload = {"query": query, "variables": {"q": f"sku:{target}"}}
+            r = requests.post(gql_url, headers=headers, data=json.dumps(payload), timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                edges = (((data or {}).get("data") or {}).get("productVariants") or {}).get("edges", [])
+                if edges:
+                    node = (edges[0] or {}).get("node") or {}
+                    if (node.get("sku") or "").strip() == target:
+                        vid = parse_gid(node.get("id"), "ProductVariant")
+                        pid = parse_gid(((node.get("product") or {}).get("id")), "Product")
+                        iid = parse_gid(((node.get("inventoryItem") or {}).get("id")), "InventoryItem")
+                        if vid and pid:
+                            return {"id": vid, "product_id": pid, "inventory_item_id": iid, "sku": target}
+                else:
+                    logging.warning("GraphQL lookup: 200 OK but empty for SKU %r (attempt %d)", target, attempt+1)
+            else:
+                logging.warning("GraphQL lookup failed for %r: %s %s", target, r.status_code, r.text[:200])
+                if r.status_code in (401,403):
+                    logging.warning("GraphQL auth/permissions issue: token needs read_products/read_inventory.")
+                    break
+        except Exception as e:
+            logging.warning("GraphQL error for %r (attempt %d): %s", target, attempt+1, e)
 
-    # ---- 2) REST filtered (verify) ----
-    base = shopify_base()
-    headers = sh_headers()
+    # 2) REST ?sku= (raskt, men kan ignoreres av Shopify noen ganger)
     try:
-        r = requests.get(f"{base}/variants.json", headers=headers, params={"sku": target, "limit": 250}, timeout=30)
+        r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(), params={"sku": target, "limit": 250}, timeout=30)
         if r.status_code == 200:
             arr = r.json().get("variants", [])
             for v in arr:
                 if (v.get("sku") or "").strip() == target:
                     return v
             if arr:
-                logging.warning("Shopify ignored ?sku= filter for %r; falling back to full scan.", target)
+                logging.warning("Shopify ignored ?sku= for %r; full scan disabled unless FIND_SKU_MAX_VARIANTS>0", target)
         else:
             logging.warning("variants.json?sku=… returned %s: %s", r.status_code, r.text[:200])
     except Exception as e:
         logging.warning("SKU filtered lookup failed for %r: %s", target, e)
 
-    # ---- 3) REST paginated scan ----
-    scanned = 0
-    since_id = 0
-    while scanned < FIND_SKU_MAX_VARIANTS:
-        try:
-            r = requests.get(f"{base}/variants.json", headers=headers, params={"since_id": since_id, "limit": 250}, timeout=30)
-            if r.status_code != 200:
-                logging.warning("variants scan stopped (status %s): %s", r.status_code, r.text[:200])
+    # 3) REST fullskann kun hvis eksplisitt aktivert
+    max_scan = FIND_SKU_MAX_VARIANTS
+    if max_scan and max_scan > 0:
+        scanned = 0
+        since_id = 0
+        while scanned < max_scan:
+            try:
+                r = requests.get(f"{shopify_base()}/variants.json", headers=sh_headers(), params={"since_id": since_id, "limit": 250}, timeout=30)
+                if r.status_code != 200:
+                    logging.warning("variants scan stopped (status %s): %s", r.status_code, r.text[:200])
+                    break
+                arr = r.json().get("variants", [])
+                if not arr:
+                    break
+                for v in arr:
+                    scanned += 1
+                    if (v.get("sku") or "").strip() == target:
+                        return v
+                since_id = arr[-1]["id"]
+            except Exception as e:
+                logging.warning("variants scan error after %d scanned: %s", scanned, e)
                 break
-            arr = r.json().get("variants", [])
-            if not arr:
-                break
-            for v in arr:
-                scanned += 1
-                if (v.get("sku") or "").strip() == target:
-                    return v
-            since_id = arr[-1]["id"]
-        except Exception as e:
-            logging.warning("variants scan error after %d scanned: %s", scanned, e)
-            break
+        logging.info("SKU %r not found after scanning %d variants.", target, scanned)
 
-    logging.info("SKU %r not found after scanning %d variants.", target, scanned)
     return None
+
 
 def shopify_create_product(p):
     r = requests.post(f"{shopify_base()}/products.json", headers=sh_headers(), data=json.dumps({"product":p}), timeout=60)
