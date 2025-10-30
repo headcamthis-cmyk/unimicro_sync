@@ -192,6 +192,23 @@ def one_line(s: str | None) -> str | None:
         return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
+def extract_title(p, sku: str) -> str:
+    # Kandidater for tittel (mange varianter fra Uni)
+    name_tags = [
+        "description", "descrip", "desc", "name", "title", "productname",
+        "varenavn", "varenavn1", "varenavn2", "varenavn3", "name1"
+    ]
+    for t in name_tags:
+        v = p.findtext(t)
+        if v and v.strip():
+            return v.strip()
+    # fallbacks fra alt-felt
+    alt01 = (p.findtext("alt01") or "").strip()
+    alt07 = (p.findtext("alt07") or "").strip()
+    if alt01: return alt01
+    if alt07: return alt07
+    return sku
+
 # ---------- Shopify ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
 def sh_headers():
@@ -440,7 +457,7 @@ def post_product():
         if not sku: continue
 
         # Navn -> title (inkl. varenavn2/3 hvis finnes)
-        name  = findtext_any(p,["description","name","varenavn","title","productname","varenavn1"]).strip()
+        name  = extract_title(p, sku)
         name2 = findtext_any(p,["varenavn2","alt01"]).strip()
         name3 = findtext_any(p,["varenavn3","alt07"]).strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
@@ -541,6 +558,8 @@ def post_product():
                 if images_to_attach:
                     product_payload["images"] = images_to_attach
 
+                pid = vid = iid = None
+
                 # --- UPDATE eller CREATE ---
                 if v:
                     pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
@@ -567,6 +586,17 @@ def post_product():
                 else:
                     log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                              sku, pid, SHOPIFY_DOMAIN, pid)
+
+                # --- Variant price/compare_at/barcode oppdatering ALLTID ---
+                variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
+                if ordinaryprice and price and ordinaryprice > price:
+                    variant_update["compare_at_price"] = f"{ordinaryprice:.2f}"
+                if ean:
+                    variant_update["barcode"] = ean
+                try:
+                    shopify_update_variant(vid, variant_update)
+                except Exception as e:
+                    log.warning("Variant price update failed for %s: %s", sku, e)
 
                 # Inventory
                 try:
