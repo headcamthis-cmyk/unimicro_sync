@@ -25,11 +25,14 @@ SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 
 # ---------- Pricing behavior ----------
 UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1", "true", "yes")
-VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))
+VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% VAT default
 
 # ---------- Feature toggles ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
+
+# Behavior: ONLY update if SKU exists (no create) when true
+STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1", "true", "yes")
 
 # SEO / body defaults (optional)
 SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
@@ -40,7 +43,7 @@ DEFAULT_BODY_HTML = os.environ.get("DEFAULT_BODY_HTML")
 LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1", "true", "yes")
 SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS", "3"))
 
-# Robust variant scan cap (fallback after GraphQL)
+# REST scan cap (only used if GraphQL fails)
 FIND_SKU_MAX_VARIANTS = int(os.environ.get("FIND_SKU_MAX_VARIANTS", "3000"))
 
 # ---------- DB ----------
@@ -54,12 +57,10 @@ app.url_map.strict_slashes = False
 
 # ---- normalize '//' in PATH (Uni sometimes posts with double slash)
 class DoubleSlashFix:
-    def __init__(self, app):
-        self.app = app
+    def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
         p = environ.get("PATH_INFO", "/")
-        if "//" in p:
-            environ["PATH_INFO"] = p.replace("//", "/")
+        if "//" in p: environ["PATH_INFO"] = p.replace("//", "/")
         return self.app(environ, start_response)
 app.wsgi_app = DoubleSlashFix(app.wsgi_app)
 
@@ -126,12 +127,8 @@ def safe_log(endpoint: str, method: str, query: str, body: str):
 
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
-
-def ok_txt(body="OK"):
-    return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
-
-def require_auth():
-    return request.args.get("user")==UNI_USER and request.args.get("pass")==UNI_PASS
+def ok_txt(body="OK"): return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
+def require_auth(): return request.args.get("user")==UNI_USER and request.args.get("pass")==UNI_PASS
 
 def read_xml_body():
     raw = request.get_data() or b""
@@ -181,8 +178,7 @@ def clean_b64(data):
     return s
 
 def one_line(s: str | None) -> str | None:
-    if not s:
-        return None
+    if not s: return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
 # ---------- Tag helpers ----------
@@ -270,9 +266,6 @@ def sh_headers():
     return {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type":"application/json", "Accept":"application/json"}
 
 def parse_gid(gid: str, kind: str) -> int | None:
-    """
-    Convert a Shopify GID to numeric id. kind: 'ProductVariant', 'Product', 'InventoryItem'
-    """
     if not gid: return None
     m = re.match(rf"^gid://shopify/{re.escape(kind)}/(\d+)$", str(gid))
     return int(m.group(1)) if m else None
@@ -312,6 +305,8 @@ def shopify_find_variant_by_sku(sku):
         if r.status_code == 200:
             data = r.json()
             edges = (((data or {}).get("data") or {}).get("productVariants") or {}).get("edges", [])
+            if not edges:
+                logging.warning("GraphQL lookup: 200 OK but empty for SKU %r", target)
             for e in edges:
                 node = (e or {}).get("node") or {}
                 if (node.get("sku") or "").strip() == target:
@@ -321,7 +316,9 @@ def shopify_find_variant_by_sku(sku):
                     if vid and pid:
                         return {"id": vid, "product_id": pid, "inventory_item_id": iid, "sku": target}
         else:
-            logging.warning("GraphQL variant lookup failed %s: %s", r.status_code, r.text[:200])
+            logging.warning("GraphQL lookup failed for SKU %r: %s %s", target, r.status_code, r.text[:200])
+            if r.status_code in (401, 403):
+                logging.warning("GraphQL auth/permissions issue. Ensure token has read_products/read_inventory.")
     except Exception as e:
         logging.warning("GraphQL lookup error for SKU %r: %s", target, e)
 
@@ -409,10 +406,6 @@ def shopify_upsert_product_metafields(pid: int, meta: dict):
                           headers=sh_headers(), data=json.dumps(body), timeout=30)
     except Exception as e:
         log.warning("Metafields upsert failed for product %s: %s", pid, e)
-
-def one_line(s):  # override annotation for brevity in SEO helper
-    if not s: return None
-    return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
 def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None):
     try:
@@ -655,7 +648,7 @@ def post_product():
         """,(sku,full_title,price,None,grp,ean,stock,longdesc,img_b64,1,vendor,raw,None,None,None,now_iso()))
         upserted += 1
 
-        # ---------- Shopify: UPDATE if exists, otherwise CREATE ----------
+        # ---------- Shopify: UPDATE if exists, otherwise (maybe) CREATE ----------
         if not SHOPIFY_TOKEN:
             continue
 
@@ -703,6 +696,9 @@ def post_product():
                 log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                          sku, pid, SHOPIFY_DOMAIN, pid)
             else:
+                if STRICT_UPDATE_ONLY:
+                    log.warning("STRICT_UPDATE_ONLY: Not creating missing SKU %r (skipping create).", sku)
+                    continue
                 # CREATE new product
                 cp=dict(product_payload)
                 if cp["tags"]:
