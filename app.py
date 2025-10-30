@@ -576,7 +576,7 @@ def status_asp():
            "<supportsdeletes>1</supportsdeletes>"
            f"<echo_lastupdate>{lastupdate}</echo_lastupdate></Root>")
     resp = Response(xml, status=200)
-    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"]
+    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
     resp.headers["Connection"] = "close"
     return resp
 
