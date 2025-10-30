@@ -32,9 +32,9 @@ ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() 
 # Valgfrie “senere”-funksjoner
 FORCE_NEW_PRODUCT_PER_SKU = os.environ.get("FORCE_NEW_PRODUCT_PER_SKU", "false").lower() in ("1","true","yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
-SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")  # f.eks: "{title} | {sku} | AllSupermoto AS"
-SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")   # f.eks: "Kjøp {title} ({sku}) hos ASM …"
-DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")           # f.eks: "<p>Standard beskrivelse…</p>"
+SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")  # "{title} | {sku} | AllSupermoto AS"
+SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")   # "Kjøp {title} ({sku}) hos ASM …"
+DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")           # "<p>Standard beskrivelse…</p>"
 
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -75,6 +75,12 @@ def init_db():
       last_shopify_product_id TEXT, last_shopify_variant_id TEXT,
       last_inventory_item_id TEXT, updated_at TEXT
     )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
+    )""")
+    # Legg til vendor-kolonne hvis gammel DB mangler den
     try:
         c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
     except Exception:
@@ -424,7 +430,7 @@ def post_product():
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
 
-        # Vendor (produsent/leverandør)
+        # Vendor
         vendor = findtext_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]).strip()
 
         # Barcode/EAN (valgfritt)
@@ -435,7 +441,7 @@ def post_product():
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        # SEO (valgfritt via ENV). Vi setter dette separat via metafields (single-line).
+        # SEO (valgfritt via ENV) – settes separat via metafields (single-line).
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
 
@@ -509,10 +515,10 @@ def post_product():
                 except Exception as e:
                     log.warning("Inventory set failed for %s: %s", sku, e)
 
-                # Vendor i metafields også (lett å debugge)
+                # Vendor i metafields (lett å verifisere)
                 shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
 
-                # Sett SEO separat (enkeltlinje)
+                # Sett SEO separat (single-line)
                 shopify_set_seo(pid, seo_title, seo_desc)
 
                 synced += 1
