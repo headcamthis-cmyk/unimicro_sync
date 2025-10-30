@@ -1,3 +1,4 @@
+# app.py
 import os
 import logging
 import sqlite3
@@ -24,26 +25,28 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render env
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 
 # ---------- Pricing behavior ----------
 UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1", "true", "yes")
-VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% VAT default
+VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% default
 
 # ---------- COST behavior ----------
-# If Uni cost is NET (ex. VAT), leave as-is (default).
-# If Uni sends cost incl. VAT, set UNI_COST_IS_NET=false to convert -> net.
 UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "true", "yes")
 
-# ---------- Feature toggles ----------
+# ---------- Images ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
 
-# Behavior: ONLY update if SKU exists (no create) when true
-STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1", "true", "yes")
+# ---------- Create / Update strategy ----------
+STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() in ("1", "true", "yes")
+# FIND_EXISTING_MODE: "cache_only" | "cache_then_lookup"
+FIND_EXISTING_MODE = os.environ.get("FIND_EXISTING_MODE")  # default below
+if not FIND_EXISTING_MODE:
+    FIND_EXISTING_MODE = "cache_only" if STRICT_UPDATE_ONLY else "cache_then_lookup"
 
 # ---------- Canary / batch controls ----------
 STOP_AFTER_N = int(os.environ.get("STOP_AFTER_N", "0"))  # 0 = no limit
@@ -63,7 +66,7 @@ SEO_DEFAULT_DESC_TEMPLATE = os.environ.get(
 # DEFAULT_BODY_MODE: one of: "missing" (default), "append", "replace"
 DEFAULT_BODY_MODE = os.environ.get("DEFAULT_BODY_MODE", "missing").strip().lower()
 DEFAULT_BODY_HTML = os.environ.get("DEFAULT_BODY_HTML", """
-<p>Original del / tilbehør. Rask levering fra AllSupermoto AS (Stavanger). Kontakt oss om du er usikker på kompatibilitet.</p>
+<p>Original del / tilbehør. Rask levering fra AllSupermoto AS (Stavanger).</p>
 """.strip())
 
 # ---------- Tag generation ----------
@@ -73,8 +76,8 @@ DEFAULT_STOPWORDS = "for,med,til,og,eller,den,det,et,en,av,på,i,mm,inkl,inch,sw
 EXTRA_STOPWORDS = os.environ.get("TAG_STOPWORDS", "")
 STOPWORDS = {w.strip().lower() for w in (DEFAULT_STOPWORDS + "," + EXTRA_STOPWORDS).split(",") if w.strip()}
 
-# REST scan cap (only used if GraphQL fails)
-FIND_SKU_MAX_VARIANTS = int(os.environ.get("FIND_SKU_MAX_VARIANTS", "3000"))
+# REST scan cap (only used if we allow scanning)
+FIND_SKU_MAX_VARIANTS = int(os.environ.get("FIND_SKU_MAX_VARIANTS", "0"))  # default 0 (off) for speed
 
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -85,7 +88,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ---- normalize '//' in PATH (Uni sometimes posts with double slash)
+# ---- normalize '//' in PATH
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -122,7 +125,7 @@ def init_db():
       last_inventory_item_id TEXT,
       last_compare_at_price REAL,
       last_tags TEXT,
-      last_cost REAL,                  -- <--- NEW: cached cost for no-op detection
+      last_cost REAL,
       updated_at TEXT
     )""")
     c.execute("""
@@ -130,17 +133,15 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
     )""")
-    # Safe migrations
-    try: c.execute("ALTER TABLE products ADD COLUMN last_compare_at_price REAL")
-    except Exception: pass
-    try: c.execute("ALTER TABLE products ADD COLUMN last_tags TEXT")
-    except Exception: pass
-    try: c.execute("ALTER TABLE products ADD COLUMN reserved INTEGER")
-    except Exception: pass
-    try: c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
-    except Exception: pass
-    try: c.execute("ALTER TABLE products ADD COLUMN last_cost REAL")
-    except Exception: pass
+    for alter in [
+        "ALTER TABLE products ADD COLUMN last_compare_at_price REAL",
+        "ALTER TABLE products ADD COLUMN last_tags TEXT",
+        "ALTER TABLE products ADD COLUMN reserved INTEGER",
+        "ALTER TABLE products ADD COLUMN vendor TEXT",
+        "ALTER TABLE products ADD COLUMN last_cost REAL",
+    ]:
+        try: c.execute(alter)
+        except Exception: pass
     conn.commit(); conn.close()
 init_db()
 
@@ -305,14 +306,7 @@ def extract_best_price(p: ET.Element):
                 return v, t
     return (any_first if any_first else (None, None))
 
-# ---- COST extraction
 def extract_cost(p: ET.Element):
-    """
-    Try common field names for cost price from Uni:
-    cost, costprice, purchaseprice, purchase_price, innkjøpspris, innkjopspris, innpris,
-    innkjøp, innkjop, dealerprice, purchase, kostpris, kost, inn_kost.
-    Returns (cost_value_net, source_tag) where value is NET of VAT depending on UNI_COST_IS_NET.
-    """
     candidates = [
         "cost", "costprice", "purchaseprice", "purchase_price",
         "innkjøpspris", "innkjopspris", "innpris", "innkjøp", "innkjop",
@@ -322,7 +316,6 @@ def extract_cost(p: ET.Element):
     incl_vat_candidates = [
         "cost_incl_vat", "kost_inkl_mva", "costinclvat", "purchaseprice_incl_vat"
     ]
-    # First scan any node; prefer exact matches in candidates list
     found = {}
     for node in p.iter():
         t = norm_tag(getattr(node, "tag", ""))
@@ -330,15 +323,11 @@ def extract_cost(p: ET.Element):
         if v is None: continue
         if t in candidates and t not in found:
             found[t] = v
-    # If any candidate found, use the first discovered
     if found:
         for t in candidates:
             if t in found:
                 val = found[t]
-                # Treat according to UNI_COST_IS_NET
                 return (val if UNI_COST_IS_NET else round(val / (1.0 + VAT_RATE), 4), t)
-
-    # Otherwise try incl-vat candidates and convert to net
     for node in p.iter():
         t = norm_tag(getattr(node, "tag", ""))
         v = to_float_safe(node_text_or_attr(node))
@@ -346,8 +335,6 @@ def extract_cost(p: ET.Element):
         if t in incl_vat_candidates:
             net = round(v / (1.0 + VAT_RATE), 4)
             return (net, t)
-
-    # As a last resort: none
     return (None, None)
 
 def slugify_simple(s: str) -> str:
@@ -367,7 +354,6 @@ def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: 
             tags.append(gn)
     if sku: tags.append(sku.strip())
     if ean: tags.append(ean.strip())
-
     raw_tokens = re.split(r"[\s\-/_,.;:()\[\]]+", title or "")
     for tok in raw_tokens:
         t = tok.strip()
@@ -379,7 +365,6 @@ def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: 
             tags.append(low); continue
         if len(low) >= TAG_MIN_LEN or re.fullmatch(r"[A-Z0-9]{2,6}", t):
             tags.append(low)
-
     seen=set(); final=[]
     for t in tags:
         k=t.lower()
@@ -391,7 +376,7 @@ def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: 
 # ---------- Shopify rate limit + retry wrapper ----------
 SESSION = requests.Session()
 LAST_CALL_TS = 0.0
-QPS = float(os.environ.get("QPS", "1.6"))  # your env is set to 1.6
+QPS = float(os.environ.get("QPS", "1.6"))
 MIN_INTERVAL = 1.0 / max(QPS, 0.1)
 MAX_RETRIES = int(os.environ.get("RETRY_MAX", "6"))
 
@@ -434,7 +419,7 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
             try:
                 used, cap = map(int, cl.split("/"))
                 if used >= cap - 5:
-                    time.sleep(1.2)
+                    time.sleep(1.2 + random.uniform(0, 0.3))
             except Exception:
                 pass
 
@@ -447,12 +432,12 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
                 try: sleep_s = float(ra)
                 except ValueError: sleep_s = 1.0
             else:
-                sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
-            logging.warning("Rate limited (429). Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
+                sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
+            logging.warning("429 rate limit. Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
             time.sleep(sleep_s); continue
 
         if 500 <= resp.status_code < 600:
-            sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+            sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
             logging.warning("Shopify %s. Sleeping %.2fs (attempt %d/%d)", resp.status_code, sleep_s, attempt, MAX_RETRIES)
             time.sleep(sleep_s); continue
 
@@ -515,7 +500,7 @@ def shopify_create_product(p):
 
 def shopify_update_product(pid, p):
     if DRY_RUN:
-        logging.info("[DRY_RUN] Would UPDATE product_id=%s title=%r", pid, p.get("title"))
+        logging.info("[DRY_RUN] Would UPDATE product_id=%s", pid)
         return {"id": pid}
     r = shopify_request("PUT", f"/products/{pid}.json", data=json.dumps({"product":p}))
     if r.status_code not in (200,201): raise RuntimeError(f"update {r.status_code}: {r.text[:300]}")
@@ -548,20 +533,69 @@ def ensure_tracking_and_set_inventory(vid, iid, qty):
     shopify_update_variant(vid, {"inventory_management":"shopify", "inventory_policy":"deny", "requires_shipping":True})
     shopify_set_inventory(iid, qty)
 
-# ---- Inventory Item cost
+# ---- Inventory Item cost (robust)
 def shopify_update_inventory_cost(iid: int, cost: float):
     """
-    PUT /inventory_items/{id}.json with {"inventory_item":{"id":..., "cost": <net cost>}}
+    Update InventoryItem cost ("Cost per item") and verify it.
+    Tries REST first; if the value doesn't persist, falls back to GraphQL.
+    Requires token scopes: write_inventory (+ read_inventory to verify).
     """
-    if cost is None:
+    if iid is None or cost is None:
         return
+
+    body = {"inventory_item": {"id": int(iid), "cost": f"{float(cost):.2f}"}}
     if DRY_RUN:
-        logging.info("[DRY_RUN] Would UPDATE inventory_item cost iid=%s cost=%.4f", iid, float(cost))
+        logging.info("[DRY_RUN] Would UPDATE inventory_item cost iid=%s cost=%s", iid, body["inventory_item"]["cost"])
         return
-    body = {"inventory_item": {"id": int(iid), "cost": float(cost)}}
+
     r = shopify_request("PUT", f"/inventory_items/{int(iid)}.json", data=json.dumps(body))
-    if r.status_code not in (200,201):
-        raise RuntimeError(f"inventory_item cost {r.status_code}: {r.text[:300]}")
+    if r.status_code in (200, 201):
+        try:
+            g = shopify_request("GET", f"/inventory_items/{int(iid)}.json")
+            if g.status_code == 200:
+                got = ((g.json() or {}).get("inventory_item") or {}).get("cost")
+                if got is not None and str(got) == f"{float(cost):.2f}":
+                    logging.info("InventoryItem %s cost verified at %s", iid, got)
+                    return
+                else:
+                    logging.warning("InventoryItem %s cost not verified (got=%r, want=%s). Trying GraphQL.",
+                                    iid, got, f"{float(cost):.2f}")
+        except Exception as e:
+            logging.warning("InventoryItem %s cost verify failed: %s. Trying GraphQL.", iid, e)
+    else:
+        if r.status_code in (401, 403):
+            logging.error("InventoryItem cost update forbidden (HTTP %s). Check token has write_inventory.", r.status_code)
+        else:
+            logging.warning("InventoryItem cost update via REST failed %s: %s", r.status_code, r.text[:200])
+
+    # GraphQL fallback
+    try:
+        gid = f"gid://shopify/InventoryItem/{int(iid)}"
+        gql = {
+            "query": """
+              mutation InvItemCost($id: ID!, $cost: Float!) {
+                inventoryItemUpdate(id: $id, input: { cost: $cost }) {
+                  inventoryItem { id unitCost { amount } }
+                  userErrors { field message }
+                }
+              }
+            """,
+            "variables": {"id": gid, "cost": float(cost)}
+        }
+        resp = shopify_graphql(gql)
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            errs = (((data.get("data") or {}).get("inventoryItemUpdate") or {}).get("userErrors") or [])
+            if errs:
+                logging.warning("GraphQL inventoryItemUpdate userErrors for iid=%s: %s", iid, errs)
+            else:
+                amt = (((data.get("data") or {}).get("inventoryItemUpdate") or {})
+                       .get("inventoryItem") or {}).get("unitCost", {}).get("amount")
+                logging.info("InventoryItem %s cost set via GraphQL to %s", iid, amt)
+        else:
+            logging.warning("GraphQL inventoryItemUpdate HTTP %s: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logging.error("GraphQL inventoryItemUpdate failed for iid=%s: %s", iid, e)
 
 def shopify_upsert_product_metafields(pid: int, meta: dict):
     if not meta: return
@@ -595,6 +629,12 @@ def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None)
 
 # ---------- SKU lookup ----------
 def shopify_find_variant_by_sku(sku):
+    """
+    Optimized lookup:
+    - Always try local cache first (O(1)).
+    - If FIND_EXISTING_MODE == 'cache_only': return None if not cached (fast path).
+    - If FIND_EXISTING_MODE == 'cache_then_lookup': try GraphQL, then variants?sku=, (optional) scan.
+    """
     target = (sku or "").strip()
     if not target:
         return None
@@ -617,7 +657,11 @@ def shopify_find_variant_by_sku(sku):
     except Exception as e:
         logging.warning("Local SKU cache lookup failed for %r: %s", target, e)
 
-    # 1) GraphQL exact query (retry 2)
+    # Fast exit for speed if STRICT_UPDATE_ONLY / cache_only
+    if FIND_EXISTING_MODE == "cache_only":
+        return None
+
+    # 1) GraphQL exact query (2 tries)
     for attempt in range(2):
         try:
             query = """
@@ -652,12 +696,11 @@ def shopify_find_variant_by_sku(sku):
             else:
                 logging.warning("GraphQL lookup failed for %r: %s %s", target, r.status_code, r.text[:200])
                 if r.status_code in (401,403):
-                    logging.warning("GraphQL auth/permissions issue: token needs read_products/read_inventory.")
                     break
         except Exception as e:
             logging.warning("GraphQL error for %r (attempt %d): %s", target, attempt+1, e)
 
-    # 2) REST ?sku=
+    # 2) REST ?sku= (can be flaky, but cheap)
     try:
         r = shopify_request("GET", f"/variants.json", params={"sku": target, "limit": 250})
         if r.status_code == 200:
@@ -666,13 +709,13 @@ def shopify_find_variant_by_sku(sku):
                 if (v.get("sku") or "").strip() == target:
                     return v
             if arr:
-                logging.warning("Shopify ignored ?sku= for %r; full scan disabled unless FIND_SKU_MAX_VARIANTS>0", target)
+                logging.warning("Shopify ignored ?sku= for %r; scan disabled unless FIND_SKU_MAX_VARIANTS>0", target)
         else:
             logging.warning("variants.json?sku=… returned %s: %s", r.status_code, r.text[:200])
     except Exception as e:
         logging.warning("SKU filtered lookup failed for %r: %s", target, e)
 
-    # 3) Full scan if enabled
+    # 3) Full scan (usually off for speed)
     max_scan = FIND_SKU_MAX_VARIANTS
     if max_scan and max_scan > 0:
         scanned = 0
@@ -858,19 +901,17 @@ def post_product():
         nodes=cands
 
     conn = db(); c = conn.cursor()
-    upserted=0; synced=0; processed=0; skipped_noops=0
+    upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0
 
-    # Optional field sniff
+    # Optional field sniff (kept very low for speed)
     if os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1","true","yes"):
-        SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS", "3"))
-        for i, probe in enumerate(nodes[:SNIFF_MAX_PRODUCTS]):
+        for i, probe in enumerate(nodes[:2]):
             snap = []
             for n in probe.iter():
                 tag = norm_tag(getattr(n,"tag",""))
                 val = node_text_or_attr(n)
-                if val:
-                    snap.append(f"{tag}={val[:80]}")
-            log.info("SNIFF[%d]: %s", i+1, "; ".join(snap[:40]))
+                if val: snap.append(f"{tag}={val[:80]}")
+            log.info("SNIFF[%d]: %s", i+1, "; ".join(snap[:25]))
 
     # Load groups map (for tag generation)
     group_map = {}
@@ -906,7 +947,6 @@ def post_product():
             body_html = longdesc or DEFAULT_BODY_HTML
 
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
-
         stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"])) or 0
         reserved = to_int_safe(findtext_ci_any(p, ["reservert","reserved","committed","backorder"])) or 0
         available = max(0, int(stock) - int(reserved))
@@ -927,8 +967,7 @@ def post_product():
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
 
-        # --- COST from Uni ---
-        cost_net, cost_src = extract_cost(p)  # cost already net if UNI_COST_IS_NET=true
+        cost_net, cost_src = extract_cost(p)
 
         img_b64  = findtext_ci_any(p,["image_b64","image","bilde_b64"]) or None
         if img_b64: img_b64 = clean_b64(img_b64)
@@ -942,7 +981,7 @@ def post_product():
             sku, full_title, price, price_src, compare_at, stock, reserved, available, vendor, grp, cost_net, cost_src
         )
 
-        # ---- NO-OP detection: compare with previous row BEFORE overwriting it ----
+        # ---- NO-OP detection (compare before overwrite) ----
         prev = c.execute(
             "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, last_cost, "
             "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
@@ -950,8 +989,7 @@ def post_product():
             (sku,)
         ).fetchone()
 
-        def f2(x):
-            return None if x is None else round(float(x), 2)
+        def f2(x): return None if x is None else round(float(x), 2)
 
         is_new = prev is None
         changed_title = is_new or (prev["name"] or "") != (full_title or "")
@@ -960,7 +998,6 @@ def post_product():
         changed_price = is_new or f2(prev["price"]) != f2(price)
         changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
         changed_cost  = is_new or f2(prev["last_cost"]) != f2(cost_net)
-        # inventory change measured by available (stock - reserved)
         prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
         changed_av  = is_new or int(prev_avail or -1) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
@@ -972,12 +1009,10 @@ def post_product():
             skipped_noops += 1
             c.execute("UPDATE products SET updated_at=? WHERE prodid=?", (now_iso(), sku))
             conn.commit()
-            log.info("NO-OP: sku=%s unchanged (incl. cost). Skipping Shopify calls.", sku)
+            log.info("NO-OP: sku=%s unchanged (incl. cost).", sku)
             continue
 
-        # ---- From here on, we'll call Shopify (create/update/inventory etc.) ----
-
-        # Persist (upsert) the current intended state locally now
+        # ---- Persist intended state (do not change last_* IDs yet) ----
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
@@ -994,134 +1029,84 @@ def post_product():
              compare_at, tags_csv, cost_net, now_iso()))
         upserted += 1
 
-        # ---------- Shopify: UPDATE if exists, otherwise (maybe) CREATE ----------
+        # ---------- Shopify: find existing (fast path) ----------
         if not SHOPIFY_TOKEN:
             continue
 
-        try:
-            v = shopify_find_variant_by_sku(sku)
+        v = shopify_find_variant_by_sku(sku)
+        if not v:
+            # We do NOT create when STRICT_UPDATE_ONLY=true
+            if STRICT_UPDATE_ONLY:
+                skipped_cache_miss += 1
+                log.warning("STRICT_UPDATE_ONLY: SKU %r not found%s. Skipping.",
+                            sku, " (cache-only mode)" if FIND_EXISTING_MODE=="cache_only" else "")
+                continue
+            # (Create path would go here if allowed)
+            log.warning("Create disabled; skipping SKU %r (not found).", sku)
+            continue
 
-            variant_payload = {
-                "sku": sku,
-                "price": f"{(price or 0):.2f}",
-                "inventory_management": "shopify",
-                "inventory_policy": "deny",
-                "requires_shipping": True
-            }
-            if compare_at:
-                variant_payload["compare_at_price"] = f"{compare_at:.2f}"
-            if ean:
-                variant_payload["barcode"] = ean
+        pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
 
-            product_payload = {
-                "title": full_title,
-                "body_html": body_html or "",
-                "vendor": vendor or None,
-                "tags": tags_list[:],
-                "variants": [variant_payload]
-            }
+        # Flags so we only call endpoints that need changes
+        do_product_update = (changed_title or changed_body or changed_vendor or changed_tags)
+        do_variant_update = (changed_price or changed_cmp or (ean and ean != (prev and prev.get("barcode") if hasattr(prev,'get') else None)))
+        do_inventory_set  = changed_av
+        do_cost_update    = changed_cost and (cost_net is not None)
 
-            images_to_attach = []
-            if ENABLE_IMAGE_UPLOAD and img_b64 and not v:
-                images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
-            elif ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL and not v:
-                images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT})
-            if images_to_attach:
-                product_payload["images"] = images_to_attach
+        # Product update (title/body/vendor/tags)
+        if do_product_update:
+            up={"id":pid,"title":full_title,"body_html":body_html or ""}
+            if vendor: up["vendor"] = vendor
+            if tags_list: up["tags"] = ",".join(tags_list)
+            shopify_update_product(pid, up)
+            log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
+                     sku, pid, SHOPIFY_DOMAIN, pid)
 
-            pid = vid = iid = None
+            # SEO only if title/vendor changed (reduces calls)
+            if changed_title or changed_vendor:
+                final_vendor = (vendor or "Ukjent leverandør").strip() or "Ukjent leverandør"
+                seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
+                seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
+                shopify_set_seo(pid, seo_title, seo_desc)
 
-            if v:
-                # UPDATE existing product (we already know at least one field changed)
-                pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
-                up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
-                # Preserve vendor if Uni gave one, otherwise keep Shopify's existing vendor
-                if product_payload.get("vendor"):
-                    up["vendor"] = product_payload["vendor"]
-                if product_payload["tags"]:
-                    up["tags"] = ",".join(product_payload["tags"])
-                shopify_update_product(pid, up)
-                log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
-                         sku, pid, SHOPIFY_DOMAIN, pid)
+            # attach placeholder only because we're already updating product
+            if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
+                try: shopify_add_placeholder_image(pid)
+                except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
-                # Attach placeholder image ONLY because we're already updating
-                if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                    try:
-                        shopify_add_placeholder_image(pid)
-                    except Exception as e:
-                        logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
+        # Variant fields (price/compare_at/barcode)
+        if do_variant_update and vid:
+            vp = {"price": f"{(price or 0):.2f}", "sku": sku}
+            if compare_at: vp["compare_at_price"] = f"{compare_at:.2f}"
+            if ean: vp["barcode"] = ean
+            shopify_update_variant(vid, vp)
 
-            else:
-                if STRICT_UPDATE_ONLY:
-                    log.warning("STRICT_UPDATE_ONLY: Not creating missing SKU %r (skipping create).", sku)
-                    continue
-                # CREATE new product
-                cp=dict(product_payload)
-                if cp.get("tags"):
-                    cp["tags"] = ",".join(cp["tags"])
-                cp["status"]="active"
-                created=shopify_create_product(cp)
-                pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
-                log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
-                         sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
-
-            # Variant pricing / barcode
-            try:
-                shopify_update_variant(vid, {k:v for k,v in variant_payload.items() if k in ("price","compare_at_price","sku","barcode")})
-            except Exception as e:
-                log.warning("Variant update failed for %s: %s", sku, e)
-
-            # Inventory qty
+        # Inventory qty (available = stock - reserved)
+        if do_inventory_set and iid:
             try:
                 ensure_tracking_and_set_inventory(vid, iid, available)
             except Exception as e:
                 log.warning("Inventory set failed for %s: %s", sku, e)
 
-            # Cost price on Inventory Item
+        # Cost per item
+        if do_cost_update and iid:
             try:
-                if iid and cost_net is not None:
-                    shopify_update_inventory_cost(iid, float(cost_net))
+                shopify_update_inventory_cost(iid, float(cost_net))
             except Exception as e:
                 log.warning("Cost update failed for %s (iid=%s): %s", sku, iid, e)
 
-            # Metafields (non-critical)
-            shopify_upsert_product_metafields(pid, {
-                "vendor": vendor or "",
-                "group_id": grp or "",
-                "group_name": group_name or "",
-                "reserved": reserved
-            })
-
-            # ---- SEO ----
-            try:
-                if product_payload.get("vendor"):
-                    final_vendor = (product_payload["vendor"] or "").strip()
-                else:
-                    prod_obj = shopify_get_product(pid)
-                    final_vendor = (prod_obj.get("vendor") or "").strip()
-            except Exception:
-                final_vendor = (vendor or "").strip()
-            if not final_vendor:
-                final_vendor = "Ukjent leverandør"
-
-            seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
-            seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
-            shopify_set_seo(pid, seo_title, seo_desc)
-
-            # Update IDs + cache
-            c.execute(
-                "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
-                "last_compare_at_price=?, last_tags=?, last_cost=?, updated_at=? WHERE prodid=?",
-                (pid, vid, iid, compare_at, tags_csv, cost_net, now_iso(), sku)
-            )
-            conn.commit()
-            synced += 1
-
-        except Exception as e:
-            log.error("Shopify sync failed for %s: %s", sku, e)
+        # Update IDs cache (if we got them)
+        c.execute(
+            "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
+            "last_compare_at_price=?, last_tags=?, last_cost=?, updated_at=? WHERE prodid=?",
+            (pid, vid, iid, compare_at, tags_csv, cost_net, now_iso(), sku)
+        )
+        conn.commit()
+        synced += 1
 
     conn.commit(); conn.close()
-    log.info("Upserted %d products (Shopify updated %d, skipped no-ops %d)", upserted, synced, skipped_noops)
+    log.info("Upserted %d products (Shopify updated %d, skipped no-ops %d, skipped cache-miss %d)",
+             upserted, synced, skipped_noops, skipped_cache_miss)
     return ok_txt("OK")
 
 # ---------- delete ----------
@@ -1150,7 +1135,7 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- Admin: seed cache ----------
+# ---------- Admin: seed cache (optional pre-warm) ----------
 @app.route("/admin/seed_cache", methods=["POST","GET"])
 def admin_seed_cache():
     key = request.args.get("key","")
