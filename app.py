@@ -32,6 +32,11 @@ SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1", "true", "yes")
 VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% VAT default
 
+# ---------- COST behavior ----------
+# If Uni cost is NET (ex. VAT), leave as-is (default).
+# If Uni sends cost incl. VAT, set UNI_COST_IS_NET=false to convert -> net.
+UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "true", "yes")
+
 # ---------- Feature toggles ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
@@ -115,8 +120,9 @@ def init_db():
       payload_xml TEXT,
       last_shopify_product_id TEXT, last_shopify_variant_id TEXT,
       last_inventory_item_id TEXT,
-      last_compare_at_price REAL,         -- for no-op detection
-      last_tags TEXT,                     -- comma-separated
+      last_compare_at_price REAL,
+      last_tags TEXT,
+      last_cost REAL,                  -- <--- NEW: cached cost for no-op detection
       updated_at TEXT
     )""")
     c.execute("""
@@ -132,6 +138,8 @@ def init_db():
     try: c.execute("ALTER TABLE products ADD COLUMN reserved INTEGER")
     except Exception: pass
     try: c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
+    except Exception: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN last_cost REAL")
     except Exception: pass
     conn.commit(); conn.close()
 init_db()
@@ -297,6 +305,51 @@ def extract_best_price(p: ET.Element):
                 return v, t
     return (any_first if any_first else (None, None))
 
+# ---- COST extraction
+def extract_cost(p: ET.Element):
+    """
+    Try common field names for cost price from Uni:
+    cost, costprice, purchaseprice, purchase_price, innkjøpspris, innkjopspris, innpris,
+    innkjøp, innkjop, dealerprice, purchase, kostpris, kost, inn_kost.
+    Returns (cost_value_net, source_tag) where value is NET of VAT depending on UNI_COST_IS_NET.
+    """
+    candidates = [
+        "cost", "costprice", "purchaseprice", "purchase_price",
+        "innkjøpspris", "innkjopspris", "innpris", "innkjøp", "innkjop",
+        "dealerprice", "purchase", "kostpris", "kost", "inn_kost",
+        "cost_net", "costnett", "kost_netto", "net_cost"
+    ]
+    incl_vat_candidates = [
+        "cost_incl_vat", "kost_inkl_mva", "costinclvat", "purchaseprice_incl_vat"
+    ]
+    # First scan any node; prefer exact matches in candidates list
+    found = {}
+    for node in p.iter():
+        t = norm_tag(getattr(node, "tag", ""))
+        v = to_float_safe(node_text_or_attr(node))
+        if v is None: continue
+        if t in candidates and t not in found:
+            found[t] = v
+    # If any candidate found, use the first discovered
+    if found:
+        for t in candidates:
+            if t in found:
+                val = found[t]
+                # Treat according to UNI_COST_IS_NET
+                return (val if UNI_COST_IS_NET else round(val / (1.0 + VAT_RATE), 4), t)
+
+    # Otherwise try incl-vat candidates and convert to net
+    for node in p.iter():
+        t = norm_tag(getattr(node, "tag", ""))
+        v = to_float_safe(node_text_or_attr(node))
+        if v is None: continue
+        if t in incl_vat_candidates:
+            net = round(v / (1.0 + VAT_RATE), 4)
+            return (net, t)
+
+    # As a last resort: none
+    return (None, None)
+
 def slugify_simple(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9\s\-_/]", "", s)
@@ -433,10 +486,6 @@ def shopify_product_images(pid: int):
     return r.json().get("images", [])
 
 def shopify_add_placeholder_image(pid: int):
-    """
-    Idempotent: only uploads if there are no images already.
-    NOTE: Called only when we're already doing a create/update (never on pure no-op).
-    """
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
         return
     try:
@@ -498,6 +547,21 @@ def ensure_tracking_and_set_inventory(vid, iid, qty):
             raise
     shopify_update_variant(vid, {"inventory_management":"shopify", "inventory_policy":"deny", "requires_shipping":True})
     shopify_set_inventory(iid, qty)
+
+# ---- Inventory Item cost
+def shopify_update_inventory_cost(iid: int, cost: float):
+    """
+    PUT /inventory_items/{id}.json with {"inventory_item":{"id":..., "cost": <net cost>}}
+    """
+    if cost is None:
+        return
+    if DRY_RUN:
+        logging.info("[DRY_RUN] Would UPDATE inventory_item cost iid=%s cost=%.4f", iid, float(cost))
+        return
+    body = {"inventory_item": {"id": int(iid), "cost": float(cost)}}
+    r = shopify_request("PUT", f"/inventory_items/{int(iid)}.json", data=json.dumps(body))
+    if r.status_code not in (200,201):
+        raise RuntimeError(f"inventory_item cost {r.status_code}: {r.text[:300]}")
 
 def shopify_upsert_product_metafields(pid: int, meta: dict):
     if not meta: return
@@ -863,6 +927,9 @@ def post_product():
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
 
+        # --- COST from Uni ---
+        cost_net, cost_src = extract_cost(p)  # cost already net if UNI_COST_IS_NET=true
+
         img_b64  = findtext_ci_any(p,["image_b64","image","bilde_b64"]) or None
         if img_b64: img_b64 = clean_b64(img_b64)
 
@@ -871,13 +938,13 @@ def post_product():
         tags_csv = ",".join(tags_list) if tags_list else ""
 
         log.info(
-            "PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s reserved=%s -> available=%s vendor=%r group=%r",
-            sku, full_title, price, price_src, ordinaryprice, stock, reserved, available, vendor, grp
+            "PARSED sku=%s title=%r price=%s (src=%s) compare_at=%s stock=%s reserved=%s -> available=%s vendor=%r group=%r cost=%s (src=%s)",
+            sku, full_title, price, price_src, compare_at, stock, reserved, available, vendor, grp, cost_net, cost_src
         )
 
         # ---- NO-OP detection: compare with previous row BEFORE overwriting it ----
         prev = c.execute(
-            "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, "
+            "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, last_cost, "
             "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
             "  FROM products WHERE prodid=?",
             (sku,)
@@ -892,21 +959,20 @@ def post_product():
         changed_vendor= is_new or (prev["vendor"] or "") != (vendor or "")
         changed_price = is_new or f2(prev["price"]) != f2(price)
         changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
+        changed_cost  = is_new or f2(prev["last_cost"]) != f2(cost_net)
         # inventory change measured by available (stock - reserved)
         prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
         changed_av  = is_new or int(prev_avail or -1) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
 
         needs_shopify = (changed_title or changed_body or changed_vendor or
-                         changed_price or changed_cmp or changed_av or changed_tags)
+                         changed_price or changed_cmp or changed_av or changed_tags or changed_cost)
 
         if not needs_shopify:
-            # Nothing to do anywhere, including placeholder image.
             skipped_noops += 1
-            # Still update updated_at to show we processed this SKU this session.
             c.execute("UPDATE products SET updated_at=? WHERE prodid=?", (now_iso(), sku))
             conn.commit()
-            log.info("NO-OP: sku=%s unchanged (title/body/vendor/price/compare_at/available/tags). Skipping Shopify calls.", sku)
+            log.info("NO-OP: sku=%s unchanged (incl. cost). Skipping Shopify calls.", sku)
             continue
 
         # ---- From here on, we'll call Shopify (create/update/inventory etc.) ----
@@ -914,18 +980,18 @@ def post_product():
         # Persist (upsert) the current intended state locally now
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                               last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(prodid) DO UPDATE SET
             name=excluded.name, price=excluded.price, groupid=excluded.groupid, stock=excluded.stock,
             reserved=excluded.reserved, body_html=excluded.body_html, image_b64=excluded.image_b64, vendor=excluded.vendor,
             payload_xml=excluded.payload_xml, last_compare_at_price=excluded.last_compare_at_price, last_tags=excluded.last_tags,
-            updated_at=excluded.updated_at
+            last_cost=excluded.last_cost, updated_at=excluded.updated_at
         """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,raw,
              prev["last_shopify_product_id"] if prev else None,
              prev["last_shopify_variant_id"] if prev else None,
              prev["last_inventory_item_id"] if prev else None,
-             compare_at, tags_csv, now_iso()))
+             compare_at, tags_csv, cost_net, now_iso()))
         upserted += 1
 
         # ---------- Shopify: UPDATE if exists, otherwise (maybe) CREATE ----------
@@ -957,7 +1023,6 @@ def post_product():
 
             images_to_attach = []
             if ENABLE_IMAGE_UPLOAD and img_b64 and not v:
-                # only attach base64 image automatically on create
                 images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
             elif ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL and not v:
                 images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT})
@@ -967,7 +1032,7 @@ def post_product():
             pid = vid = iid = None
 
             if v:
-                # UPDATE existing product (we already know something changed)
+                # UPDATE existing product (we already know at least one field changed)
                 pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
                 up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
                 # Preserve vendor if Uni gave one, otherwise keep Shopify's existing vendor
@@ -1004,13 +1069,20 @@ def post_product():
             try:
                 shopify_update_variant(vid, {k:v for k,v in variant_payload.items() if k in ("price","compare_at_price","sku","barcode")})
             except Exception as e:
-                log.warning("Variant price update failed for %s: %s", sku, e)
+                log.warning("Variant update failed for %s: %s", sku, e)
 
-            # Inventory: available = stock - reserved
+            # Inventory qty
             try:
                 ensure_tracking_and_set_inventory(vid, iid, available)
             except Exception as e:
                 log.warning("Inventory set failed for %s: %s", sku, e)
+
+            # Cost price on Inventory Item
+            try:
+                if iid and cost_net is not None:
+                    shopify_update_inventory_cost(iid, float(cost_net))
+            except Exception as e:
+                log.warning("Cost update failed for %s (iid=%s): %s", sku, iid, e)
 
             # Metafields (non-critical)
             shopify_upsert_product_metafields(pid, {
@@ -1039,8 +1111,8 @@ def post_product():
             # Update IDs + cache
             c.execute(
                 "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
-                "last_compare_at_price=?, last_tags=?, updated_at=? WHERE prodid=?",
-                (pid, vid, iid, compare_at, tags_csv, now_iso(), sku)
+                "last_compare_at_price=?, last_tags=?, last_cost=?, updated_at=? WHERE prodid=?",
+                (pid, vid, iid, compare_at, tags_csv, cost_net, now_iso(), sku)
             )
             conn.commit()
             synced += 1
@@ -1105,14 +1177,14 @@ def admin_seed_cache():
                 iid = v.get("inventory_item_id")
                 cur.execute("""
                     INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(prodid) DO UPDATE SET
                       last_shopify_product_id=excluded.last_shopify_product_id,
                       last_shopify_variant_id=excluded.last_shopify_variant_id,
                       last_inventory_item_id=excluded.last_inventory_item_id,
                       updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,now_iso()))
+                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
             conn.commit()
             since_id = arr[-1]["id"]
         return Response(f"Seeded {scanned} variants into local cache\r\n", mimetype="text/plain")
