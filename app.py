@@ -862,7 +862,7 @@ def post_product():
                 # Attach placeholder forcibly on update if product has no images
                 if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
                     try:
-                        shopify_add_placeholder_image(pid, force=True)
+                        shopify_add_placeholder_image(pid)  # default force=False
                     except Exception as e:
                         logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
