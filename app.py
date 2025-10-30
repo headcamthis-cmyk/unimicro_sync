@@ -114,28 +114,25 @@ def init_db():
       body_html TEXT, image_b64 TEXT, webactive INTEGER, vendor TEXT,
       payload_xml TEXT,
       last_shopify_product_id TEXT, last_shopify_variant_id TEXT,
-      last_inventory_item_id TEXT, updated_at TEXT,
-      -- last synced snapshot to skip no-op updates
-      last_title TEXT, last_vendor TEXT, last_tags TEXT,
-      last_price REAL, last_compare_at REAL, last_available INTEGER,
-      last_barcode TEXT
+      last_inventory_item_id TEXT,
+      last_compare_at_price REAL,         -- for no-op detection
+      last_tags TEXT,                     -- comma-separated
+      updated_at TEXT
     )""")
-    # Safe migrations for older DBs
-    for col_def in [
-        ("vendor", "TEXT"),
-        ("reserved", "INTEGER"),
-        ("last_title", "TEXT"),
-        ("last_vendor", "TEXT"),
-        ("last_tags", "TEXT"),
-        ("last_price", "REAL"),
-        ("last_compare_at", "REAL"),
-        ("last_available", "INTEGER"),
-        ("last_barcode", "TEXT"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE products ADD COLUMN {col_def[0]} {col_def[1]}")
-        except Exception:
-            pass
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
+    )""")
+    # Safe migrations
+    try: c.execute("ALTER TABLE products ADD COLUMN last_compare_at_price REAL")
+    except Exception: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN last_tags TEXT")
+    except Exception: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN reserved INTEGER")
+    except Exception: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
+    except Exception: pass
     conn.commit(); conn.close()
 init_db()
 
@@ -277,7 +274,7 @@ def extract_title(p: ET.Element, sku: str) -> str:
         alt01 = findtext_ci_any(p, ["alt01"]) or ""
         alt07 = findtext_ci_any(p, ["alt07"]) or ""
         title = alt01 or alt07 or sku
-    return title  # never append SKU
+    return title
 
 def extract_best_price(p: ET.Element):
     priority = [
@@ -309,32 +306,24 @@ def slugify_simple(s: str) -> str:
 
 def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: str, ean: str) -> list[str]:
     tags = []
-    if vendor:
-        tags.append(vendor.strip())
-    if group_id:
-        tags.append(f"group-{group_id.strip()}")
+    if vendor: tags.append(vendor.strip())
+    if group_id: tags.append(f"group-{group_id.strip()}")
     if group_name:
         gn = slugify_simple(group_name)
         if gn and len(gn) >= TAG_MIN_LEN:
             tags.append(gn)
-    if sku:
-        tags.append(sku.strip())
-    if ean:
-        tags.append(ean.strip())
+    if sku: tags.append(sku.strip())
+    if ean: tags.append(ean.strip())
 
     raw_tokens = re.split(r"[\s\-/_,.;:()\[\]]+", title or "")
     for tok in raw_tokens:
         t = tok.strip()
-        if not t:
-            continue
+        if not t: continue
         low = t.lower()
-        if low in STOPWORDS:
-            continue
-        if len(low) < TAG_MIN_LEN and not re.fullmatch(r"[A-Z0-9]{2,6}", t):
-            continue
+        if low in STOPWORDS: continue
+        if len(low) < TAG_MIN_LEN and not re.fullmatch(r"[A-Z0-9]{2,6}", t): continue
         if re.fullmatch(r"\d{1,2}(mm|cm|inch|in)$", low):
-            tags.append(low)
-            continue
+            tags.append(low); continue
         if len(low) >= TAG_MIN_LEN or re.fullmatch(r"[A-Z0-9]{2,6}", t):
             tags.append(low)
 
@@ -402,10 +391,8 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
             if ra:
-                try:
-                    sleep_s = float(ra)
-                except ValueError:
-                    sleep_s = 1.0
+                try: sleep_s = float(ra)
+                except ValueError: sleep_s = 1.0
             else:
                 sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
             logging.warning("Rate limited (429). Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
@@ -417,6 +404,7 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
             time.sleep(sleep_s); continue
 
         return resp
+
     return resp
 
 def shopify_graphql(payload: dict) -> requests.Response:
@@ -445,28 +433,28 @@ def shopify_product_images(pid: int):
     return r.json().get("images", [])
 
 def shopify_add_placeholder_image(pid: int):
+    """
+    Idempotent: only uploads if there are no images already.
+    NOTE: Called only when we're already doing a create/update (never on pure no-op).
+    """
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
-        return False
+        return
     try:
         imgs = shopify_product_images(pid)
         if imgs:
             for img in imgs:
                 alt = (img.get("alt") or "").lower()
                 if PLACEHOLDER_ALT.lower() in alt:
-                    return False
-            return False
+                    return
+            return
         body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
-        if DRY_RUN:
-            logging.info("[DRY_RUN] Would add placeholder to %s", pid)
-            return True
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
-        if r.status_code in (200, 201):
+        if r.status_code not in (200, 201):
+            logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
+        else:
             logging.info("Placeholder image attached to product %s", pid)
-            return True
-        logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
     except Exception as e:
         logging.warning("Placeholder image attach error for %s: %s", pid, e)
-    return False
 
 def shopify_create_product(p):
     if DRY_RUN:
@@ -547,6 +535,7 @@ def shopify_find_variant_by_sku(sku):
     if not target:
         return None
 
+    # 0) Local cache first
     try:
         conn = db()
         row = conn.execute(
@@ -564,6 +553,7 @@ def shopify_find_variant_by_sku(sku):
     except Exception as e:
         logging.warning("Local SKU cache lookup failed for %r: %s", target, e)
 
+    # 1) GraphQL exact query (retry 2)
     for attempt in range(2):
         try:
             query = """
@@ -603,6 +593,7 @@ def shopify_find_variant_by_sku(sku):
         except Exception as e:
             logging.warning("GraphQL error for %r (attempt %d): %s", target, attempt+1, e)
 
+    # 2) REST ?sku=
     try:
         r = shopify_request("GET", f"/variants.json", params={"sku": target, "limit": 250})
         if r.status_code == 200:
@@ -617,6 +608,7 @@ def shopify_find_variant_by_sku(sku):
     except Exception as e:
         logging.warning("SKU filtered lookup failed for %r: %s", target, e)
 
+    # 3) Full scan if enabled
     max_scan = FIND_SKU_MAX_VARIANTS
     if max_scan and max_scan > 0:
         scanned = 0
@@ -710,7 +702,7 @@ def deletetable_asp():
 def postdiscount_asp():
     return post_product()
 
-# ---------- product groups ----------
+# ---------- product groups (return literal "true") ----------
 def uni_groups_ok():
     body = "true"
     resp = Response(body, status=200)
@@ -759,30 +751,6 @@ def post_product_group():
     log.info("Stored %d groups", count)
     return uni_groups_ok()
 
-# ---------- diff helpers ----------
-def normalize_tags_list(tags_list):
-    # Shopify stores comma-separated tags; order-insensitive compare
-    return sorted([t.strip().lower() for t in (tags_list or []) if t and t.strip()])
-
-def noop_if_unchanged(prev, desired) -> bool:
-    """Return True (no-op) if all comparable fields are equal."""
-    if prev is None:
-        return False
-    eq = (
-        (prev["last_title"] or "") == (desired["title"] or "") and
-        (prev["last_vendor"] or "") == (desired["vendor"] or "") and
-        normalize_tags_list((prev["last_tags"] or "").split(",")) ==
-        normalize_tags_list(desired.get("tags") or []) and
-        (prev["last_price"] if prev["last_price"] is not None else None) ==
-        (desired.get("price")) and
-        (prev["last_compare_at"] if prev["last_compare_at"] is not None else None) ==
-        (desired.get("compare_at")) and
-        (prev["last_available"] if prev["last_available"] is not None else None) ==
-        (desired.get("available")) and
-        (prev["last_barcode"] or "") == (desired.get("barcode") or "")
-    )
-    return eq
-
 # ---------- products ----------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
@@ -826,8 +794,9 @@ def post_product():
         nodes=cands
 
     conn = db(); c = conn.cursor()
-    upserted=0; synced=0; processed=0
+    upserted=0; synced=0; processed=0; skipped_noops=0
 
+    # Optional field sniff
     if os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1","true","yes"):
         SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS", "3"))
         for i, probe in enumerate(nodes[:SNIFF_MAX_PRODUCTS]):
@@ -839,6 +808,7 @@ def post_product():
                     snap.append(f"{tag}={val[:80]}")
             log.info("SNIFF[%d]: %s", i+1, "; ".join(snap[:40]))
 
+    # Load groups map (for tag generation)
     group_map = {}
     try:
         cur = conn.cursor()
@@ -856,13 +826,7 @@ def post_product():
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
 
-        # fetch previous snapshot for diffing BEFORE we overwrite the row
-        prev_row = c.execute(
-            "SELECT last_title,last_vendor,last_tags,last_price,last_compare_at,last_available,last_barcode,"
-            "last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id "
-            "FROM products WHERE prodid=?", (sku,)
-        ).fetchone()
-
+        # ---- Build intended state ----
         name  = extract_title(p, sku)
         name2 = (findtext_ci_any(p,["varenavn2","alt01"]) or "").strip()
         name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
@@ -874,15 +838,13 @@ def post_product():
             body_html = DEFAULT_BODY_HTML
         elif DEFAULT_BODY_MODE == "append":
             body_html = f"{longdesc}\n\n{DEFAULT_BODY_HTML}" if longdesc else DEFAULT_BODY_HTML
-        else:  # "missing"
+        else:
             body_html = longdesc or DEFAULT_BODY_HTML
 
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
 
-        stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
-        reserved = to_int_safe(findtext_ci_any(p, ["reservert","reserved","committed","backorder"]))
-        if stock is None: stock = 0
-        if reserved is None: reserved = 0
+        stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"])) or 0
+        reserved = to_int_safe(findtext_ci_any(p, ["reservert","reserved","committed","backorder"])) or 0
         available = max(0, int(stock) - int(reserved))
 
         price_raw, price_src = extract_best_price(p)
@@ -890,78 +852,137 @@ def post_product():
             if val is None: return None
             return round(val * (1.0 + VAT_RATE), 2) if UNI_PRICE_IS_NET else round(val, 2)
         price = brutto(price_raw)
-        ordinaryprice = brutto(to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"])))
+
+        ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
+        compare_at = None
+        if ordinaryprice is not None:
+            ordinaryprice = brutto(ordinaryprice)
+            if price and ordinaryprice and ordinaryprice > price:
+                compare_at = round(ordinaryprice, 2)
 
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
 
         img_b64  = findtext_ci_any(p,["image_b64","image","bilde_b64"]) or None
-        if img_b64:
-            img_b64 = clean_b64(img_b64)
+        if img_b64: img_b64 = clean_b64(img_b64)
 
         group_name = group_map.get(grp, "") if grp else ""
         tags_list = generate_tags(full_title, vendor, grp, group_name, sku, ean)
+        tags_csv = ",".join(tags_list) if tags_list else ""
 
         log.info(
             "PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s reserved=%s -> available=%s vendor=%r group=%r",
             sku, full_title, price, price_src, ordinaryprice, stock, reserved, available, vendor, grp
         )
 
-        # Persist minimal current parse (not last_* snapshot yet)
+        # ---- NO-OP detection: compare with previous row BEFORE overwriting it ----
+        prev = c.execute(
+            "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, "
+            "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
+            "  FROM products WHERE prodid=?",
+            (sku,)
+        ).fetchone()
+
+        def f2(x):
+            return None if x is None else round(float(x), 2)
+
+        is_new = prev is None
+        changed_title = is_new or (prev["name"] or "") != (full_title or "")
+        changed_body  = is_new or (prev["body_html"] or "") != (body_html or "")
+        changed_vendor= is_new or (prev["vendor"] or "") != (vendor or "")
+        changed_price = is_new or f2(prev["price"]) != f2(price)
+        changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
+        # inventory change measured by available (stock - reserved)
+        prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
+        changed_av  = is_new or int(prev_avail or -1) != int(available)
+        changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
+
+        needs_shopify = (changed_title or changed_body or changed_vendor or
+                         changed_price or changed_cmp or changed_av or changed_tags)
+
+        if not needs_shopify:
+            # Nothing to do anywhere, including placeholder image.
+            skipped_noops += 1
+            # Still update updated_at to show we processed this SKU this session.
+            c.execute("UPDATE products SET updated_at=? WHERE prodid=?", (now_iso(), sku))
+            conn.commit()
+            log.info("NO-OP: sku=%s unchanged (title/body/vendor/price/compare_at/available/tags). Skipping Shopify calls.", sku)
+            continue
+
+        # ---- From here on, we'll call Shopify (create/update/inventory etc.) ----
+
+        # Persist (upsert) the current intended state locally now
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                               last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(prodid) DO UPDATE SET
             name=excluded.name, price=excluded.price, groupid=excluded.groupid, stock=excluded.stock,
             reserved=excluded.reserved, body_html=excluded.body_html, image_b64=excluded.image_b64, vendor=excluded.vendor,
-            payload_xml=excluded.payload_xml, updated_at=excluded.updated_at
-        """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,raw,None,None,None,now_iso()))
+            payload_xml=excluded.payload_xml, last_compare_at_price=excluded.last_compare_at_price, last_tags=excluded.last_tags,
+            updated_at=excluded.updated_at
+        """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,raw,
+             prev["last_shopify_product_id"] if prev else None,
+             prev["last_shopify_variant_id"] if prev else None,
+             prev["last_inventory_item_id"] if prev else None,
+             compare_at, tags_csv, now_iso()))
         upserted += 1
 
+        # ---------- Shopify: UPDATE if exists, otherwise (maybe) CREATE ----------
         if not SHOPIFY_TOKEN:
             continue
 
-        # Build desired snapshot for no-op comparison
-        desired = {
-            "title": full_title,
-            "vendor": vendor or (prev_row["last_vendor"] if prev_row else ""),  # fallback to last vendor for comparison
-            "tags": tags_list[:],
-            "price": price,
-            "compare_at": (ordinaryprice if (ordinaryprice and price and ordinaryprice > price) else None),
-            "available": available,
-            "barcode": ean or ""
-        }
-
         try:
             v = shopify_find_variant_by_sku(sku)
+
+            variant_payload = {
+                "sku": sku,
+                "price": f"{(price or 0):.2f}",
+                "inventory_management": "shopify",
+                "inventory_policy": "deny",
+                "requires_shipping": True
+            }
+            if compare_at:
+                variant_payload["compare_at_price"] = f"{compare_at:.2f}"
+            if ean:
+                variant_payload["barcode"] = ean
+
+            product_payload = {
+                "title": full_title,
+                "body_html": body_html or "",
+                "vendor": vendor or None,
+                "tags": tags_list[:],
+                "variants": [variant_payload]
+            }
+
+            images_to_attach = []
+            if ENABLE_IMAGE_UPLOAD and img_b64 and not v:
+                # only attach base64 image automatically on create
+                images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
+            elif ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL and not v:
+                images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT})
+            if images_to_attach:
+                product_payload["images"] = images_to_attach
+
             pid = vid = iid = None
 
             if v:
+                # UPDATE existing product (we already know something changed)
                 pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
-
-                # If Uni vendor is blank, preserve previously synced vendor for SEO/tagging diffing
-                if not vendor and prev_row and (prev_row["last_vendor"] or ""):
-                    desired["vendor"] = prev_row["last_vendor"]
-
-                # NO-OP short-circuit (skip everything, incl. placeholder)
-                if noop_if_unchanged(prev_row, desired):
-                    log.info("No changes for SKU=%s (skipping).", sku)
-                    continue
-
-                # Product update only when any of title/vendor/tags/body changed (we already know something changed)
-                up={"id":pid,"title":desired["title"],"body_html":body_html or ""}
-                if desired["vendor"]:
-                    up["vendor"] = desired["vendor"]
-                if desired["tags"]:
-                    up["tags"] = ",".join(desired["tags"])
+                up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
+                # Preserve vendor if Uni gave one, otherwise keep Shopify's existing vendor
+                if product_payload.get("vendor"):
+                    up["vendor"] = product_payload["vendor"]
+                if product_payload["tags"]:
+                    up["tags"] = ",".join(product_payload["tags"])
                 shopify_update_product(pid, up)
                 log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                          sku, pid, SHOPIFY_DOMAIN, pid)
 
-                # Placeholder only when no images exist (function already idempotent)
+                # Attach placeholder image ONLY because we're already updating
                 if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                    try: shopify_add_placeholder_image(pid)
+                    try:
+                        shopify_add_placeholder_image(pid)
                     except Exception as e:
                         logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
@@ -969,95 +990,57 @@ def post_product():
                 if STRICT_UPDATE_ONLY:
                     log.warning("STRICT_UPDATE_ONLY: Not creating missing SKU %r (skipping create).", sku)
                     continue
-
-                # Create payload
-                variant_payload = {
-                    "sku": sku,
-                    "price": f"{(price or 0):.2f}",
-                    "inventory_management": "shopify",
-                    "inventory_policy": "deny",
-                    "requires_shipping": True
-                }
-                if desired["compare_at"]:
-                    variant_payload["compare_at_price"] = f"{desired['compare_at']:.2f}"
-                if ean:
-                    variant_payload["barcode"] = ean
-
-                cp = {
-                    "title": desired["title"],
-                    "body_html": body_html or "",
-                    "vendor": desired["vendor"] or None,
-                    "tags": ",".join(desired["tags"]) if desired["tags"] else "",
-                    "variants": [variant_payload],
-                    "status": "active"
-                }
-                images_to_attach = []
-                if ENABLE_IMAGE_UPLOAD and img_b64:
-                    images_to_attach.append({"attachment": img_b64, "filename": f"{sku}.jpg", "position": 1})
-                elif PLACEHOLDER_IMAGE_URL:
-                    images_to_attach.append({"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT})
-                if images_to_attach:
-                    cp["images"] = images_to_attach
-
+                # CREATE new product
+                cp=dict(product_payload)
+                if cp.get("tags"):
+                    cp["tags"] = ",".join(cp["tags"])
+                cp["status"]="active"
                 created=shopify_create_product(cp)
                 pid=created["id"]; vid=created["variants"][0]["id"]; iid=created["variants"][0]["inventory_item_id"]
                 log.info("Shopify CREATE OK sku=%s product_id=%s status=%s admin=https://%s/admin/products/%s",
                          sku, pid, cp["status"], SHOPIFY_DOMAIN, pid)
 
-            # Variant (only when price/compare/barcode changed)
-            need_variant_update = True
-            if prev_row:
-                prev_price = prev_row["last_price"]
-                prev_cmp   = prev_row["last_compare_at"]
-                prev_bar   = prev_row["last_barcode"] or ""
-                need_variant_update = (
-                    prev_price != desired["price"] or
-                    (prev_cmp if prev_cmp is not None else None) != desired["compare_at"] or
-                    prev_bar != (ean or "")
-                )
-            if need_variant_update:
-                variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
-                if desired["compare_at"]:
-                    variant_update["compare_at_price"] = f"{desired['compare_at']:.2f}"
-                if ean:
-                    variant_update["barcode"] = ean
-                try:
-                    shopify_update_variant(vid, variant_update)
-                except Exception as e:
-                    log.warning("Variant price update failed for %s: %s", sku, e)
+            # Variant pricing / barcode
+            try:
+                shopify_update_variant(vid, {k:v for k,v in variant_payload.items() if k in ("price","compare_at_price","sku","barcode")})
+            except Exception as e:
+                log.warning("Variant price update failed for %s: %s", sku, e)
 
-            # Inventory (only when available changed)
-            need_inventory = True
-            if prev_row:
-                prev_avail = prev_row["last_available"]
-                need_inventory = (prev_avail != desired["available"])
-            if need_inventory:
-                try:
-                    ensure_tracking_and_set_inventory(vid, iid, desired["available"])
-                except Exception as e:
-                    log.warning("Inventory set failed for %s: %s", sku, e)
+            # Inventory: available = stock - reserved
+            try:
+                ensure_tracking_and_set_inventory(vid, iid, available)
+            except Exception as e:
+                log.warning("Inventory set failed for %s: %s", sku, e)
 
-            # Metafields & SEO (we let them be fire-and-forget; optional to diff further)
+            # Metafields (non-critical)
             shopify_upsert_product_metafields(pid, {
-                "vendor": desired["vendor"] or "",
+                "vendor": vendor or "",
                 "group_id": grp or "",
                 "group_name": group_name or "",
                 "reserved": reserved
             })
-            final_vendor = desired["vendor"] or "Ukjent leverandør"
+
+            # ---- SEO ----
+            try:
+                if product_payload.get("vendor"):
+                    final_vendor = (product_payload["vendor"] or "").strip()
+                else:
+                    prod_obj = shopify_get_product(pid)
+                    final_vendor = (prod_obj.get("vendor") or "").strip()
+            except Exception:
+                final_vendor = (vendor or "").strip()
+            if not final_vendor:
+                final_vendor = "Ukjent leverandør"
+
             seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
             seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
             shopify_set_seo(pid, seo_title, seo_desc)
 
-            # Persist last_* snapshot to enable future no-op skips
+            # Update IDs + cache
             c.execute(
                 "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
-                "last_title=?, last_vendor=?, last_tags=?, last_price=?, last_compare_at=?, last_available=?, last_barcode=?, updated_at=? "
-                "WHERE prodid=?",
-                (pid, vid, iid,
-                 desired["title"], desired["vendor"], ",".join(desired["tags"]),
-                 desired["price"], desired["compare_at"], desired["available"], desired["barcode"], now_iso(),
-                 sku)
+                "last_compare_at_price=?, last_tags=?, updated_at=? WHERE prodid=?",
+                (pid, vid, iid, compare_at, tags_csv, now_iso(), sku)
             )
             conn.commit()
             synced += 1
@@ -1066,7 +1049,7 @@ def post_product():
             log.error("Shopify sync failed for %s: %s", sku, e)
 
     conn.commit(); conn.close()
-    log.info("Upserted %d products (Shopify updated %d)", upserted, synced)
+    log.info("Upserted %d products (Shopify updated %d, skipped no-ops %d)", upserted, synced, skipped_noops)
     return ok_txt("OK")
 
 # ---------- delete ----------
@@ -1122,14 +1105,14 @@ def admin_seed_cache():
                 iid = v.get("inventory_item_id")
                 cur.execute("""
                     INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(prodid) DO UPDATE SET
                       last_shopify_product_id=excluded.last_shopify_product_id,
                       last_shopify_variant_id=excluded.last_shopify_variant_id,
                       last_inventory_item_id=excluded.last_inventory_item_id,
                       updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,now_iso()))
+                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,now_iso()))
             conn.commit()
             since_id = arr[-1]["id"]
         return Response(f"Seeded {scanned} variants into local cache\r\n", mimetype="text/plain")
