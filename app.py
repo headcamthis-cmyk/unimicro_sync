@@ -192,22 +192,66 @@ def one_line(s: str | None) -> str | None:
         return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
-def extract_title(p, sku: str) -> str:
-    # Kandidater for tittel (mange varianter fra Uni)
-    name_tags = [
-        "description", "descrip", "desc", "name", "title", "productname",
+# ---------- NEW: Case-insensitive + wildcard tag matching ----------
+def norm_tag(tag: str) -> str:
+    return (tag.split('}', 1)[-1] if '}' in tag else tag).lower()
+
+def findtext_ci_direct(elem: ET.Element, names):
+    """
+    Case-insensitive, direct-child finder with optional prefix matching.
+    Use 'descrip*' to match descrip, description, descrip1, etc.
+    """
+    wanted = []
+    for n in names:
+        n = n.strip().lower()
+        if n.endswith('*'):
+            wanted.append((n[:-1], True))
+        else:
+            wanted.append((n, False))
+    for child in list(elem):
+        t = norm_tag(child.tag)
+        for base, is_prefix in wanted:
+            if (t.startswith(base) if is_prefix else t == base):
+                v = (child.text or "").strip()
+                if v:
+                    return v
+    return ""
+
+def findtext_ci_any(elem: ET.Element, names):
+    """
+    Like findtext_ci_direct, but matches the element itself or any descendant.
+    """
+    wanted = []
+    for n in names:
+        n = n.strip().lower()
+        if n.endswith('*'):
+            wanted.append((n[:-1], True))
+        else:
+            wanted.append((n, False))
+    for node in elem.iter():
+        t = norm_tag(getattr(node, "tag", ""))
+        for base, is_prefix in wanted:
+            if (t.startswith(base) if is_prefix else t == base):
+                v = (getattr(node, "text", "") or "").strip()
+                if v:
+                    return v
+    return ""
+
+def extract_title(p: ET.Element, sku: str) -> str:
+    # Try direct children first (fast), then any descendant (safer)
+    title = findtext_ci_direct(p, [
+        "description", "descrip*", "name", "title", "productname",
         "varenavn", "varenavn1", "varenavn2", "varenavn3", "name1"
-    ]
-    for t in name_tags:
-        v = p.findtext(t)
-        if v and v.strip():
-            return v.strip()
-    # fallbacks fra alt-felt
-    alt01 = (p.findtext("alt01") or "").strip()
-    alt07 = (p.findtext("alt07") or "").strip()
-    if alt01: return alt01
-    if alt07: return alt07
-    return sku
+    ]) or findtext_ci_any(p, [
+        "description", "descrip*", "name", "title", "productname",
+        "varenavn", "varenavn1", "varenavn2", "varenavn3", "name1"
+    ])
+    if title:
+        return title
+    # fallbacks
+    alt01 = findtext_ci_any(p, ["alt01"]) or ""
+    alt07 = findtext_ci_any(p, ["alt07"]) or ""
+    return (alt01 or alt07 or sku)
 
 # ---------- Shopify ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
@@ -444,6 +488,7 @@ def post_product():
     if not nodes:
         cands=[]; idtags=["productident","prodid","varenr","sku","itemno"]
         for elem in root.iter():
+            # keep original helper for broad fallback
             ident = findtext_any(elem, idtags).strip()
             if ident: cands.append(elem)
         nodes=cands
@@ -453,45 +498,55 @@ def post_product():
 
     for p in nodes:
         # SKU
-        sku = findtext_any(p,["productident","prodid","varenr","sku","itemno"]).strip()
+        sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
 
         # Navn -> title (inkl. varenavn2/3 hvis finnes)
         name  = extract_title(p, sku)
-        name2 = findtext_any(p,["varenavn2","alt01"]).strip()
-        name3 = findtext_any(p,["varenavn3","alt07"]).strip()
+        name2 = (findtext_ci_any(p,["varenavn2","alt01"]) or "").strip()
+        name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
 
         # Beskrivelse (kan være hex fra Uni)
-        longdesc = findtext_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or ""
+        longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
         if not longdesc and DEFAULT_BODY_HTML:
             longdesc = DEFAULT_BODY_HTML
 
         # Gruppe (kun tag i MVP) og lager
-        grp   = findtext_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]).strip()
-        stock = to_int_safe(findtext_any(p,["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
+        grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
+        stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
 
         # Pris/compare-at
-        price         = to_float_safe(findtext_any(p,["price","pris","salesprice","price_incl_vat","newprice","webprice","pris1","standard utpris"]))
-        ordinaryprice = to_float_safe(findtext_any(p,["ordinaryprice","pris2"]))  # compare_at_price hvis > price
+        price = to_float_safe(findtext_ci_any(p, [
+            "price", "pris", "salesprice", "price_incl_vat", "newprice", "webprice", "pris1", "standard utpris"
+        ]))
+        ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
 
         # Vendor
-        vendor = findtext_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]).strip()
+        vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
 
         # Barcode/EAN (valgfritt)
-        ean = findtext_any(p,["ean","ean_nr","ean_nr.ean","alt02"]).strip()
+        ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
 
         # Bilde – lastes kun opp hvis Uni faktisk sender b64. Ellers valgfri placeholder på CREATE.
-        img_b64  = findtext_any(p,["image_b64","image","bilde_b64"]) or None
+        img_b64  = findtext_ci_any(p,["image_b64","image","bilde_b64"]) or None
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
         # SEO (valgfritt via ENV) – settes separat via metafields (single-line).
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
+
+        # Parse debug
+        log.info("PARSED sku=%s title=%r price=%s ordinary=%s stock=%s vendor=%r group=%r",
+                 sku, full_title, price, ordinaryprice, stock, vendor, grp)
+        if full_title == sku:
+            log.warning("Title fallback to SKU for %s (no title-like fields found)", sku)
+        if price is None:
+            log.warning("No price parsed for %s (check XML fields/commas).", sku)
 
         # Persist lokalt (grunndata)
         c.execute("""
