@@ -32,7 +32,7 @@ ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in 
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 
 # Behavior: ONLY update if SKU exists (no create) when true
-STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1", "true", "yes")
+STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1","true","yes")
 
 # SEO / body defaults (optional)
 SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
