@@ -82,6 +82,11 @@ FIND_SKU_MAX_VARIANTS = int(os.environ.get("FIND_SKU_MAX_VARIANTS", "0"))  # def
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
 
+# ---------- New runtime throttles / light mode ----------
+LIGHT_MODE = os.environ.get("LIGHT_MODE", "false").lower() in ("1", "true", "yes")
+STORE_RAW_XML = os.environ.get("STORE_RAW_XML", "true").lower() in ("1", "true", "yes")
+LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "false").lower() in ("1", "true", "yes")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
 
@@ -476,11 +481,11 @@ def shopify_add_placeholder_image(pid: int):
     try:
         imgs = shopify_product_images(pid)
         if imgs:
+            # any image exists -> skip placeholder
             for img in imgs:
                 alt = (img.get("alt") or "").lower()
                 if PLACEHOLDER_ALT.lower() in alt:
                     return
-            # has at least one image already; skip placeholder
             return
         body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
@@ -599,7 +604,8 @@ def shopify_update_inventory_cost(iid: int, cost: float):
         logging.error("GraphQL inventoryItemUpdate failed for iid=%s: %s", iid, e)
 
 def shopify_upsert_product_metafields(pid: int, meta: dict):
-    if not meta: return
+    if not meta or LIGHT_MODE:  # gated in light mode
+        return
     try:
         for key, val in meta.items():
             if val is None or val == "": continue
@@ -614,6 +620,8 @@ def shopify_upsert_product_metafields(pid: int, meta: dict):
         log.warning("Metafields upsert failed for product %s: %s", pid, e)
 
 def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None):
+    if LIGHT_MODE:  # gated in light mode
+        return
     try:
         for key, val in (("title_tag", title), ("description_tag", desc)):
             val = one_line(val)
@@ -853,7 +861,7 @@ def post_product_group():
               parentid=excluded.parentid,
               payload_xml=excluded.payload_xml,
               updated_at=excluded.updated_at
-        """, (gid, gname, parent, raw, now_iso()))
+        """, (gid, gname, parent, (raw if STORE_RAW_XML else None), now_iso()))
         count += 1
     conn.commit(); conn.close()
     log.info("Stored %d groups", count)
@@ -905,7 +913,7 @@ def post_product():
     upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0
 
     # Optional field sniff (light)
-    if os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1","true","yes"):
+    if LOG_SNIFF_FIELDS:
         for i, probe in enumerate(nodes[:2]):
             snap = []
             for n in probe.iter():
@@ -940,12 +948,16 @@ def post_product():
 
         longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
-        if DEFAULT_BODY_MODE == "replace":
-            body_html = DEFAULT_BODY_HTML
-        elif DEFAULT_BODY_MODE == "append":
-            body_html = f"{longdesc}\n\n{DEFAULT_BODY_HTML}" if longdesc else DEFAULT_BODY_HTML
+
+        if LIGHT_MODE:
+            body_html = longdesc or ""  # keep light for speed/memory
         else:
-            body_html = longdesc or DEFAULT_BODY_HTML
+            if DEFAULT_BODY_MODE == "replace":
+                body_html = DEFAULT_BODY_HTML
+            elif DEFAULT_BODY_MODE == "append":
+                body_html = f"{longdesc}\n\n{DEFAULT_BODY_HTML}" if longdesc else DEFAULT_BODY_HTML
+            else:
+                body_html = longdesc or DEFAULT_BODY_HTML
 
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
         stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"])) or 0
@@ -974,8 +986,13 @@ def post_product():
         if img_b64: img_b64 = clean_b64(img_b64)
 
         group_name = group_map.get(grp, "") if grp else ""
-        tags_list = generate_tags(full_title, vendor, grp, group_name, sku, ean)
-        tags_csv = ",".join(tags_list) if tags_list else ""
+
+        if LIGHT_MODE:
+            tags_list = []
+            tags_csv = ""
+        else:
+            tags_list = generate_tags(full_title, vendor, grp, group_name, sku, ean)
+            tags_csv = ",".join(tags_list) if tags_list else ""
 
         log.info(
             "PARSED sku=%s title=%r price=%s (src=%s) compare_at=%s stock=%s reserved=%s -> available=%s vendor=%r group=%r cost=%s (src=%s)",
@@ -1024,7 +1041,7 @@ def post_product():
             reserved=excluded.reserved, body_html=excluded.body_html, image_b64=excluded.image_b64, vendor=excluded.vendor,
             payload_xml=excluded.payload_xml, last_compare_at_price=excluded.last_compare_at_price, last_tags=excluded.last_tags,
             last_cost=excluded.last_cost, updated_at=excluded.updated_at
-        """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,raw,
+        """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,(raw if STORE_RAW_XML else None),
              prev["last_shopify_product_id"] if prev else None,
              prev["last_shopify_variant_id"] if prev else None,
              prev["last_inventory_item_id"] if prev else None,
@@ -1050,7 +1067,7 @@ def post_product():
         pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
 
         # Flags so we only call endpoints that need changes
-        do_product_update = (changed_title or changed_body or changed_vendor or changed_tags)
+        do_product_update = (changed_title or changed_body or changed_vendor or ((not LIGHT_MODE) and changed_tags))
         do_variant_update = (changed_price or changed_cmp or changed_bar)
         do_inventory_set  = changed_av
         do_cost_update    = changed_cost and (cost_net is not None)
@@ -1059,20 +1076,20 @@ def post_product():
         if do_product_update:
             up={"id":pid,"title":full_title,"body_html":body_html or ""}
             if vendor: up["vendor"] = vendor
-            if tags_list: up["tags"] = ",".join(tags_list)
+            if (not LIGHT_MODE) and tags_list: up["tags"] = ",".join(tags_list)
             shopify_update_product(pid, up)
             log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                      sku, pid, SHOPIFY_DOMAIN, pid)
 
-            # SEO only if title/vendor changed (reduces calls)
-            if changed_title or changed_vendor:
+            # SEO only if not light mode and title/vendor changed (saves calls)
+            if not LIGHT_MODE and (changed_title or changed_vendor):
                 final_vendor = (vendor or "Ukjent leverandør").strip() or "Ukjent leverandør"
                 seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 shopify_set_seo(pid, seo_title, seo_desc)
 
-            # attach placeholder only because we're already updating product
-            if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
+            # attach placeholder only when not light mode
+            if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
                 try: shopify_add_placeholder_image(pid)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
