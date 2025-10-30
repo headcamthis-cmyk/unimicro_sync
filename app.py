@@ -784,11 +784,6 @@ def post_product():
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        # SEO (always include vendor+sku via templates)
-        safe_vendor = vendor if vendor else "Ukjent leverandør"
-        seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=safe_vendor)
-        seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=safe_vendor)
-
         # Tags
         group_name = group_map.get(grp, "") if grp else ""
         tags_list = generate_tags(full_title, vendor, grp, group_name, sku, ean)
@@ -859,10 +854,10 @@ def post_product():
                 log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                          sku, pid, SHOPIFY_DOMAIN, pid)
 
-                # Attach placeholder forcibly on update if product has no images
+                # Attach placeholder only if no images
                 if ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
                     try:
-                        shopify_add_placeholder_image(pid)  # default force=False
+                        shopify_add_placeholder_image(pid)  # force=False: checks existing images first
                     except Exception as e:
                         logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
@@ -897,13 +892,32 @@ def post_product():
             except Exception as e:
                 log.warning("Inventory set failed for %s: %s", sku, e)
 
-            # Metafields + SEO
+            # Metafields
             shopify_upsert_product_metafields(pid, {
                 "vendor": vendor or "",
                 "group_id": grp or "",
                 "group_name": group_name or "",
                 "reserved": reserved
             })
+
+            # ---- SEO (NOW uses Shopify's vendor as canonical) ----
+            try:
+                if product_payload.get("vendor"):
+                    final_vendor = (product_payload["vendor"] or "").strip()
+                else:
+                    prod_obj = shopify_get_product(pid)  # read existing Shopify vendor if we didn't set it
+                    final_vendor = (prod_obj.get("vendor") or "").strip()
+            except Exception:
+                final_vendor = (vendor or "").strip()
+            if not final_vendor:
+                final_vendor = "Ukjent leverandør"
+
+            seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(
+                title=full_title, sku=sku, vendor=final_vendor
+            )
+            seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(
+                title=full_title, sku=sku, vendor=final_vendor
+            )
             shopify_set_seo(pid, seo_title, seo_desc)
 
             c.execute(
