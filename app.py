@@ -19,7 +19,7 @@ UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set i Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1","true","yes")
@@ -36,6 +36,10 @@ SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")
 DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")
 TITLE_APPEND_SKU           = os.environ.get("TITLE_APPEND_SKU","false").lower() in ("1","true","yes")
 
+# Debug: log all discovered fields for first N products each request
+LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS","true").lower() in ("1","true","yes")
+SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS","3"))
+
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
 
@@ -45,7 +49,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ---- normalize '//' in PATH (Uni sometimes sends double slash)
+# ---- normalize '//' i PATH (Uni kan sende dobbelt-slash)
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -176,9 +180,21 @@ def one_line(s: str | None) -> str | None:
         return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
-# ---------- Case-insensitive + wildcard tag matching ----------
+# ---------- Case-insensitive + wildcard tag matching + attribute fallback ----------
 def norm_tag(tag: str) -> str:
     return (tag.split('}', 1)[-1] if '}' in tag else tag).lower()
+
+def node_text_or_attr(node: ET.Element) -> str:
+    """Return inner text, or common attribute carriers like value/val."""
+    txt = (getattr(node, "text", "") or "").strip()
+    if txt:
+        return txt
+    # Uni can embed data in attributes (seen in some exports)
+    for k in ("value","val","text","t"):
+        v = node.attrib.get(k)
+        if v and v.strip():
+            return v.strip()
+    return ""
 
 def findtext_ci_direct(elem: ET.Element, names):
     wanted=[]
@@ -189,7 +205,7 @@ def findtext_ci_direct(elem: ET.Element, names):
         t = norm_tag(child.tag)
         for base, pref in wanted:
             if (t.startswith(base) if pref else t == base):
-                v = (child.text or "").strip()
+                v = node_text_or_attr(child)
                 if v:
                     return v
     return ""
@@ -203,7 +219,7 @@ def findtext_ci_any(elem: ET.Element, names):
         t = norm_tag(getattr(node, "tag", ""))
         for base, pref in wanted:
             if (t.startswith(base) if pref else t == base):
-                v = (getattr(node, "text", "") or "").strip()
+                v = node_text_or_attr(node)
                 if v:
                     return v
     return ""
@@ -224,8 +240,8 @@ def extract_title(p: ET.Element, sku: str) -> str:
 
 def extract_best_price(p: ET.Element):
     """
-    Scan all nodes whose tag contains 'price' or 'pris' (case-insensitive).
-    Choose by priority order; fallback to first numeric; return (value, source_tag).
+    Scan all nodes whose tag contains 'price' or 'pris' (case-insensitive),
+    reading node text OR 'value' attribute. Return (value, source_tag).
     """
     priority = [
         "webprice","price_incl_vat","salesprice","pris1","price","pris",
@@ -236,18 +252,15 @@ def extract_best_price(p: ET.Element):
     for node in p.iter():
         t = norm_tag(getattr(node,"tag",""))
         if ("price" in t) or ("pris" in t):
-            val = to_float_safe((getattr(node,"text","") or "").strip())
+            val = to_float_safe(node_text_or_attr(node))
             if val is not None:
                 if not any_first:
                     any_first = (val, t)
-                # keep highest val seen for same tag
                 found[t] = val if t not in found else found[t]
-    # by priority
     for key in priority:
         for t,v in found.items():
             if t == key:
                 return v, t
-    # fallback: any first
     return (any_first if any_first else (None, None))
 
 # ---------- Shopify ----------
@@ -489,6 +502,17 @@ def post_product():
     conn = db(); c = conn.cursor()
     upserted=0; synced=0
 
+    # Optional deep sniff for first N products
+    if LOG_SNIFF_FIELDS:
+        for i, probe in enumerate(nodes[:SNIFF_MAX_PRODUCTS]):
+            snap = []
+            for n in probe.iter():
+                tag = norm_tag(getattr(n,"tag",""))
+                val = node_text_or_attr(n)
+                if val:
+                    snap.append(f"{tag}={val[:80]}")
+            log.info("SNIFF[%d]: %s", i+1, "; ".join(snap[:40]))
+
     for p in nodes:
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
@@ -497,6 +521,8 @@ def post_product():
         name2 = (findtext_ci_any(p,["varenavn2","alt01"]) or "").strip()
         name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
+        if TITLE_APPEND_SKU and sku not in full_title:
+            full_title = f"{full_title} ({sku})"
 
         longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
@@ -506,12 +532,10 @@ def post_product():
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
         stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
 
-        # ---- NEW: price extraction across all price/pris fields ----
         price_raw, price_src = extract_best_price(p)
         price = price_raw
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
         if price is None and ordinaryprice is not None:
-            # fall back to ordinaryprice if that's all we have
             price = ordinaryprice
             price_src = "ordinaryprice/pris2"
         if price is not None and not PRICE_INCLUDES_VAT:
@@ -524,19 +548,15 @@ def post_product():
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        if TITLE_APPEND_SKU and sku not in full_title:
-            full_title = f"{full_title} ({sku})"
-
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
 
-        # Parse debug
         log.info("PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s vendor=%r group=%r",
                  sku, full_title, price, price_src, ordinaryprice, stock, vendor, grp)
         if full_title == sku:
             log.warning("Title fallback to SKU for %s (no title-like fields matched)", sku)
         if price is None:
-            log.warning("No price parsed for %s. Check XML tags (any '*price*'/'*pris*') and decimals.", sku)
+            log.warning("No price parsed for %s. Check SNIFF log for which tag holds it.", sku)
 
         # Persist locally
         c.execute("""
@@ -713,7 +733,7 @@ def delete_all():
         pass
     return ok_txt("OK")
 
-# ---------- fallback for broken filenames ----------
+# ---------- fallback for blank filenames ----------
 @app.route("/twinxml/asp", methods=["GET","POST","HEAD"])
 @app.route("/twinxml/.asp", methods=["GET","POST","HEAD"])
 def bare_asp_placeholder():
