@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import json
 from datetime import datetime, timezone
-from flask import Flask, request, Response
+from flask import Flask, request, Response, stream_with_context
 import xml.etree.ElementTree as ET
 import requests
 import re
@@ -985,7 +985,7 @@ def post_product():
         # ---- NO-OP detection (compare before overwrite) ----
         prev = c.execute(
             "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, last_cost, "
-            "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id "
+            "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id, barcode "
             "  FROM products WHERE prodid=?",
             (sku,)
         ).fetchone()
@@ -1002,9 +1002,10 @@ def post_product():
         prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
         changed_av  = is_new or int(prev_avail or -1) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
+        changed_bar = is_new or (prev["barcode"] or "") != (ean or "")
 
         needs_shopify = (changed_title or changed_body or changed_vendor or
-                         changed_price or changed_cmp or changed_av or changed_tags or changed_cost)
+                         changed_price or changed_cmp or changed_av or changed_tags or changed_cost or changed_bar)
 
         if not needs_shopify:
             skipped_noops += 1
@@ -1050,7 +1051,7 @@ def post_product():
 
         # Flags so we only call endpoints that need changes
         do_product_update = (changed_title or changed_body or changed_vendor or changed_tags)
-        do_variant_update = (changed_price or changed_cmp or (ean and ean != (prev and prev.get("barcode") if hasattr(prev,'get') else None)))
+        do_variant_update = (changed_price or changed_cmp or changed_bar)
         do_inventory_set  = changed_av
         do_cost_update    = changed_cost and (cost_net is not None)
 
@@ -1136,12 +1137,12 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- Admin: streaming seed cache with resume ----------
+# ---------- Admin: streaming seed cache with resume (yields BYTES) ----------
 @app.route("/admin/seed_cache", methods=["GET","POST"])
 def admin_seed_cache():
     key = request.args.get("key","")
     if ADMIN_KEY and key != ADMIN_KEY:
-        return Response("Forbidden\r\n", status=403, mimetype="text/plain")
+        return Response(b"Forbidden\r\n", status=403, mimetype="text/plain")
 
     # tunables via query params
     limit = int(request.args.get("limit", "250"))          # variants per page (250 max)
@@ -1165,17 +1166,17 @@ def admin_seed_cache():
 
             scanned = 0
             total_scanned = 0
-            yield f"Starting seed (resume={resume}) from since_id={since_id}\n"
+            yield f"Starting seed (resume={resume}) from since_id={since_id}\n".encode("utf-8")
 
             while True:
                 r = shopify_request("GET", f"/variants.json",
                                     params={"since_id": since_id, "limit": min(limit, 250)})
                 if r.status_code != 200:
-                    yield f"Error {r.status_code}: {r.text[:200]}\n"
+                    yield f"Error {r.status_code}: {r.text[:200]}\n".encode("utf-8")
                     break
                 arr = r.json().get("variants", [])
                 if not arr:
-                    yield "Done. No more variants.\n"
+                    yield b"Done. No more variants.\n"
                     break
 
                 for v in arr:
@@ -1204,7 +1205,7 @@ def admin_seed_cache():
                                            ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
                                         (since_id,))
                             conn.commit()
-                        yield f"Seeded +{scanned} (total={total_scanned}) — since_id={since_id}\n"
+                        yield f"Seeded +{scanned} (total={total_scanned}) — since_id={since_id}\n".encode("utf-8")
                         scanned = 0
 
                 # flush after each page
@@ -1215,23 +1216,24 @@ def admin_seed_cache():
                                    ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
                                 (since_id,))
                     conn.commit()
-                yield f"Page committed — since_id={since_id}, total={total_scanned}\n"
+                yield f"Page committed — since_id={since_id}, total={total_scanned}\n".encode("utf-8")
 
             # final commit + report last checkpoint
             conn.commit()
             if resume:
                 row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
                 last = (row["since_id"] if row else None)
-                yield f"Finished. Last checkpoint since_id={last}\n"
+                yield f"Finished. Last checkpoint since_id={last}\n".encode("utf-8")
             else:
-                yield "Finished (no checkpoint saved).\n"
+                yield b"Finished (no checkpoint saved).\n"
         except Exception as e:
-            yield f"ERROR: {e}\n"
+            yield f"ERROR: {e}\n".encode("utf-8")
         finally:
             conn.close()
 
-    # streamed text/plain keeps the connection alive so you can watch progress
-    return Response(stream(), mimetype="text/plain", direct_passthrough=True)
+    resp = Response(stream_with_context(stream()), mimetype="text/plain; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 # ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
