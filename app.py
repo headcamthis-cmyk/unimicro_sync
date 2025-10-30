@@ -19,22 +19,22 @@ UNI_PASS = os.environ.get("UNI_PASS", "synall")
 
 # ---------- Shopify ----------
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # settes i Render
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
-PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1", "true", "yes")
+PRICE_INCLUDES_VAT = os.environ.get("PRICE_INCLUDES_VAT", "true").lower() in ("1","true","yes")
 
 # Feature toggles
-ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1","true","yes")  # default AV
+ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1","true","yes")
 SHOPIFY_DELETE_MODE = os.environ.get("SHOPIFY_DELETE_MODE", "archive").lower()  # archive|delete|draft
 ENABLE_SHOPIFY_DELETE = os.environ.get("ENABLE_SHOPIFY_DELETE", "true").lower() in ("1","true","yes")
 
-# Valgfrie “senere”-funksjoner
 FORCE_NEW_PRODUCT_PER_SKU = os.environ.get("FORCE_NEW_PRODUCT_PER_SKU", "false").lower() in ("1","true","yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
-SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")  # "{title} | {sku} | AllSupermoto AS"
-SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")   # "Kjøp {title} ({sku}) hos ASM …"
-DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")           # "<p>Standard beskrivelse…</p>"
+SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
+SEO_DEFAULT_DESC_TEMPLATE  = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")
+DEFAULT_BODY_HTML          = os.environ.get("DEFAULT_BODY_HTML")
+TITLE_APPEND_SKU           = os.environ.get("TITLE_APPEND_SKU","false").lower() in ("1","true","yes")
 
 # ---------- DB ----------
 DB_URL = os.environ.get("DB_URL", "sync.db")
@@ -45,7 +45,7 @@ log = logging.getLogger(APP_NAME)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ---- normalize '//' i PATH (Uni kan sende dobbelt-slash)
+# ---- normalize '//' in PATH (Uni sometimes sends double slash)
 class DoubleSlashFix:
     def __init__(self, app): self.app = app
     def __call__(self, environ, start_response):
@@ -62,13 +62,11 @@ def db():
 
 def init_db():
     conn = db(); c = conn.cursor()
-    # WAL for bedre samtidighet (men én worker er fortsatt best)
     try:
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
     except Exception:
         pass
-
     c.execute("""
     CREATE TABLE IF NOT EXISTS groups(
       groupid TEXT PRIMARY KEY, groupname TEXT, parentid TEXT,
@@ -87,7 +85,6 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
     )""")
-    # Legg til vendor-kolonne hvis gammel DB mangler den (trygg)
     try:
         c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
     except Exception:
@@ -154,19 +151,6 @@ def maybe_hex_to_text(s: str) -> str:
             return s
     return s
 
-def findtext_any(e, tags, default=""):
-    for t in tags:
-        v = e.findtext(t)
-        if v is not None:
-            return v
-    return default
-
-def findall_any(root, xps):
-    for xp in xps:
-        n = root.findall(xp)
-        if n: return n
-    return []
-
 def to_float_safe(v):
     try: return float(str(v).replace(",", "."))
     except: return None
@@ -192,66 +176,79 @@ def one_line(s: str | None) -> str | None:
         return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
 
-# ---------- NEW: Case-insensitive + wildcard tag matching ----------
+# ---------- Case-insensitive + wildcard tag matching ----------
 def norm_tag(tag: str) -> str:
     return (tag.split('}', 1)[-1] if '}' in tag else tag).lower()
 
 def findtext_ci_direct(elem: ET.Element, names):
-    """
-    Case-insensitive, direct-child finder with optional prefix matching.
-    Use 'descrip*' to match descrip, description, descrip1, etc.
-    """
-    wanted = []
+    wanted=[]
     for n in names:
-        n = n.strip().lower()
-        if n.endswith('*'):
-            wanted.append((n[:-1], True))
-        else:
-            wanted.append((n, False))
+        n=n.strip().lower()
+        wanted.append((n[:-1], True) if n.endswith('*') else (n, False))
     for child in list(elem):
         t = norm_tag(child.tag)
-        for base, is_prefix in wanted:
-            if (t.startswith(base) if is_prefix else t == base):
+        for base, pref in wanted:
+            if (t.startswith(base) if pref else t == base):
                 v = (child.text or "").strip()
                 if v:
                     return v
     return ""
 
 def findtext_ci_any(elem: ET.Element, names):
-    """
-    Like findtext_ci_direct, but matches the element itself or any descendant.
-    """
-    wanted = []
+    wanted=[]
     for n in names:
-        n = n.strip().lower()
-        if n.endswith('*'):
-            wanted.append((n[:-1], True))
-        else:
-            wanted.append((n, False))
+        n=n.strip().lower()
+        wanted.append((n[:-1], True) if n.endswith('*') else (n, False))
     for node in elem.iter():
         t = norm_tag(getattr(node, "tag", ""))
-        for base, is_prefix in wanted:
-            if (t.startswith(base) if is_prefix else t == base):
+        for base, pref in wanted:
+            if (t.startswith(base) if pref else t == base):
                 v = (getattr(node, "text", "") or "").strip()
                 if v:
                     return v
     return ""
 
 def extract_title(p: ET.Element, sku: str) -> str:
-    # Try direct children first (fast), then any descendant (safer)
     title = findtext_ci_direct(p, [
-        "description", "descrip*", "name", "title", "productname",
-        "varenavn", "varenavn1", "varenavn2", "varenavn3", "name1"
+        "description","descrip*","name","title","productname",
+        "varenavn","varenavn1","varenavn2","varenavn3","name1"
     ]) or findtext_ci_any(p, [
-        "description", "descrip*", "name", "title", "productname",
-        "varenavn", "varenavn1", "varenavn2", "varenavn3", "name1"
+        "description","descrip*","name","title","productname",
+        "varenavn","varenavn1","varenavn2","varenavn3","name1"
     ])
-    if title:
-        return title
-    # fallbacks
-    alt01 = findtext_ci_any(p, ["alt01"]) or ""
-    alt07 = findtext_ci_any(p, ["alt07"]) or ""
-    return (alt01 or alt07 or sku)
+    if not title:
+        alt01 = findtext_ci_any(p, ["alt01"]) or ""
+        alt07 = findtext_ci_any(p, ["alt07"]) or ""
+        title = alt01 or alt07 or sku
+    return f"{title} ({sku})" if TITLE_APPEND_SKU and sku not in title else title
+
+def extract_best_price(p: ET.Element):
+    """
+    Scan all nodes whose tag contains 'price' or 'pris' (case-insensitive).
+    Choose by priority order; fallback to first numeric; return (value, source_tag).
+    """
+    priority = [
+        "webprice","price_incl_vat","salesprice","pris1","price","pris",
+        "ordinaryprice","pris2","newprice","netprice"
+    ]
+    found = {}
+    any_first = None
+    for node in p.iter():
+        t = norm_tag(getattr(node,"tag",""))
+        if ("price" in t) or ("pris" in t):
+            val = to_float_safe((getattr(node,"text","") or "").strip())
+            if val is not None:
+                if not any_first:
+                    any_first = (val, t)
+                # keep highest val seen for same tag
+                found[t] = val if t not in found else found[t]
+    # by priority
+    for key in priority:
+        for t,v in found.items():
+            if t == key:
+                return v, t
+    # fallback: any first
+    return (any_first if any_first else (None, None))
 
 # ---------- Shopify ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
@@ -312,20 +309,14 @@ def shopify_upsert_product_metafields(pid: int, meta: dict):
         log.warning("Metafields upsert failed for product %s: %s", pid, e)
 
 def shopify_set_seo(pid: int, title: str | None = None, desc: str | None = None):
-    """Setter SEO via metafields 'global.title_tag' og 'global.description_tag' (single_line_text_field)."""
     try:
         for key, val in (("title_tag", title), ("description_tag", desc)):
             val = one_line(val)
             if not val:
                 continue
-            body = {
-                "metafield": {
-                    "namespace": "global",
-                    "key": key,
-                    "type": "single_line_text_field",
-                    "value": val
-                }
-            }
+            body = {"metafield": {
+                "namespace": "global", "key": key, "type": "single_line_text_field", "value": val
+            }}
             requests.post(
                 f"{shopify_base()}/products/{int(pid)}/metafields.json",
                 headers=sh_headers(),
@@ -415,12 +406,10 @@ def uni_groups_ok():
 @app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
 def post_product_group():
-    safe_log(
-        "/twinxml/postproductgroup",
-        request.method,
-        request.query_string.decode("utf-8","ignore"),
-        (request.data or b"").decode("utf-8","ignore")
-    )
+    safe_log("/twinxml/postproductgroup",
+             request.method,
+             request.query_string.decode("utf-8","ignore"),
+             (request.data or b"").decode("utf-8","ignore"))
 
     if request.method == "GET":
         return uni_groups_ok()
@@ -434,11 +423,11 @@ def post_product_group():
 
     count = 0
     conn = db()
-    groups = findall_any(root, [".//productgroup",".//group",".//gruppe",".//varegruppe"])
+    groups = root.findall(".//productgroup") or root.findall(".//group") or root.findall(".//gruppe") or root.findall(".//varegruppe")
     for g in groups:
-        gid   = findtext_any(g, ["groupno","groupid","id","gruppeid","grpid"]).strip()
-        gname = findtext_any(g, ["description","groupname","name","gruppenavn"]).strip()
-        parent= findtext_any(g, ["parentgroup","parentid","parent","overgruppeid"]).strip()
+        gid   = (g.findtext("groupno") or g.findtext("groupid") or g.findtext("id") or g.findtext("gruppeid") or g.findtext("grpid") or "").strip()
+        gname = (g.findtext("description") or g.findtext("groupname") or g.findtext("name") or g.findtext("gruppenavn") or "").strip()
+        parent= (g.findtext("parentgroup") or g.findtext("parentid") or g.findtext("parent") or g.findtext("overgruppeid") or "").strip()
         if not gid: continue
         conn.execute("""
             INSERT INTO groups(groupid, groupname, parentid, payload_xml, updated_at)
@@ -454,7 +443,7 @@ def post_product_group():
     log.info("Stored %d groups", count)
     return uni_groups_ok()
 
-# ---------- produkter (alias) ----------
+# ---------- produkter ----------
 @app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
 @app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
 @app.route("/twinxml/postproducts.asp", methods=["GET","POST"])
@@ -484,12 +473,16 @@ def post_product():
         log.warning("Bad XML products: %s ... first200=%r", e, raw[:200])
         return ok_txt("OK")
 
-    nodes = findall_any(root, [".//product",".//vare",".//item",".//produkt"])
+    nodes = (root.findall(".//product") or root.findall(".//vare") or
+             root.findall(".//item") or root.findall(".//produkt"))
     if not nodes:
+        # fallback: any node that contains an id field
         cands=[]; idtags=["productident","prodid","varenr","sku","itemno"]
         for elem in root.iter():
-            # keep original helper for broad fallback
-            ident = findtext_any(elem, idtags).strip()
+            ident = ""
+            for t in idtags:
+                v = elem.findtext(t)
+                if v: ident = v.strip(); break
             if ident: cands.append(elem)
         nodes=cands
 
@@ -497,58 +490,55 @@ def post_product():
     upserted=0; synced=0
 
     for p in nodes:
-        # SKU
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
 
-        # Navn -> title (inkl. varenavn2/3 hvis finnes)
         name  = extract_title(p, sku)
         name2 = (findtext_ci_any(p,["varenavn2","alt01"]) or "").strip()
         name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
 
-        # Beskrivelse (kan være hex fra Uni)
         longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
         if not longdesc and DEFAULT_BODY_HTML:
             longdesc = DEFAULT_BODY_HTML
 
-        # Gruppe (kun tag i MVP) og lager
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
         stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
 
-        # Pris/compare-at
-        price = to_float_safe(findtext_ci_any(p, [
-            "price", "pris", "salesprice", "price_incl_vat", "newprice", "webprice", "pris1", "standard utpris"
-        ]))
+        # ---- NEW: price extraction across all price/pris fields ----
+        price_raw, price_src = extract_best_price(p)
+        price = price_raw
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
+        if price is None and ordinaryprice is not None:
+            # fall back to ordinaryprice if that's all we have
+            price = ordinaryprice
+            price_src = "ordinaryprice/pris2"
         if price is not None and not PRICE_INCLUDES_VAT:
             price = round(price * 1.25, 2)
 
-        # Vendor
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
-
-        # Barcode/EAN (valgfritt)
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
 
-        # Bilde – lastes kun opp hvis Uni faktisk sender b64. Ellers valgfri placeholder på CREATE.
         img_b64  = findtext_ci_any(p,["image_b64","image","bilde_b64"]) or None
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        # SEO (valgfritt via ENV) – settes separat via metafields (single-line).
+        if TITLE_APPEND_SKU and sku not in full_title:
+            full_title = f"{full_title} ({sku})"
+
         seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
         seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
 
         # Parse debug
-        log.info("PARSED sku=%s title=%r price=%s ordinary=%s stock=%s vendor=%r group=%r",
-                 sku, full_title, price, ordinaryprice, stock, vendor, grp)
+        log.info("PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s vendor=%r group=%r",
+                 sku, full_title, price, price_src, ordinaryprice, stock, vendor, grp)
         if full_title == sku:
-            log.warning("Title fallback to SKU for %s (no title-like fields found)", sku)
+            log.warning("Title fallback to SKU for %s (no title-like fields matched)", sku)
         if price is None:
-            log.warning("No price parsed for %s (check XML fields/commas).", sku)
+            log.warning("No price parsed for %s. Check XML tags (any '*price*'/'*pris*') and decimals.", sku)
 
-        # Persist lokalt (grunndata)
+        # Persist locally
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,vendor,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
@@ -563,7 +553,6 @@ def post_product():
         # ---------- Shopify sync ----------
         if SHOPIFY_TOKEN:
             try:
-                # --- Hent ev. tidligere pinning (mapping) ---
                 row = c.execute(
                     "SELECT last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id FROM products WHERE prodid=?",
                     (sku,)
@@ -579,11 +568,9 @@ def post_product():
                     except Exception:
                         v = None
 
-                # Hvis ikke pinned mapping og ikke tvang-ny: prøv å finne via SKU-søk
                 if not v and not FORCE_NEW_PRODUCT_PER_SKU:
                     v = shopify_find_variant_by_sku(sku)
 
-                # Bygg variant payload
                 variant_payload = {
                     "sku": sku,
                     "price": f"{(price or 0):.2f}",
@@ -596,7 +583,6 @@ def post_product():
                 if ean:
                     variant_payload["barcode"] = ean
 
-                # Bygg product payload
                 product_payload = {
                     "title": full_title,
                     "body_html": longdesc or "",
@@ -615,7 +601,6 @@ def post_product():
 
                 pid = vid = iid = None
 
-                # --- UPDATE eller CREATE ---
                 if v:
                     pid=v["product_id"]; vid=v["id"]; iid=v["inventory_item_id"]
                     up={"id":pid,"title":product_payload["title"],"body_html":product_payload["body_html"]}
@@ -625,7 +610,6 @@ def post_product():
                     try:
                         shopify_update_product(pid, up)
                     except Exception as e:
-                        # F.eks. 404 / mapping stale -> fall tilbake til CREATE
                         log.warning("Update failed for %s (pid=%s). Will create new. Err=%s", sku, pid, e)
                         v = None
 
@@ -642,7 +626,7 @@ def post_product():
                     log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                              sku, pid, SHOPIFY_DOMAIN, pid)
 
-                # --- Variant price/compare_at/barcode oppdatering ALLTID ---
+                # Always update variant price/compare_at/barcode
                 variant_update = {"price": f"{(price or 0):.2f}", "sku": sku}
                 if ordinaryprice and price and ordinaryprice > price:
                     variant_update["compare_at_price"] = f"{ordinaryprice:.2f}"
@@ -653,25 +637,19 @@ def post_product():
                 except Exception as e:
                     log.warning("Variant price update failed for %s: %s", sku, e)
 
-                # Inventory
                 try:
                     ensure_tracking_and_set_inventory(vid, iid, stock)
                 except Exception as e:
                     log.warning("Inventory set failed for %s: %s", sku, e)
 
-                # Vendor i metafields (lett å verifisere)
                 shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
-
-                # Sett SEO separat (single-line)
                 shopify_set_seo(pid, seo_title, seo_desc)
 
-                # --- Lagre pinning (mapping) ---
                 c.execute(
                     "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, updated_at=? WHERE prodid=?",
                     (pid, vid, iid, now_iso(), sku)
                 )
                 conn.commit()
-
                 synced += 1
 
             except Exception as e:
@@ -704,7 +682,7 @@ def delete_product():
         log.warning("Shopify delete/archive failed for %s: %s", sku, e)
     return ok_txt("OK")
 
-# ---------- reset map (pinning) ----------
+# ---------- reset map ----------
 @app.route("/twinxml/resetmap.asp", methods=["GET","POST"])
 def resetmap():
     if not require_auth(): return ok_txt("OK")
@@ -720,7 +698,7 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- (stubs) ----------
+# ---------- stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
     return ok_txt("OK")
@@ -735,7 +713,7 @@ def delete_all():
         pass
     return ok_txt("OK")
 
-# ---------- fallback for feilkonfigurert "asp"/".asp" ----------
+# ---------- fallback for broken filenames ----------
 @app.route("/twinxml/asp", methods=["GET","POST","HEAD"])
 @app.route("/twinxml/.asp", methods=["GET","POST","HEAD"])
 def bare_asp_placeholder():
