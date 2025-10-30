@@ -37,14 +37,30 @@ PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
 # Behavior: ONLY update if SKU exists (no create) when true
 STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "false").lower() in ("1", "true", "yes")
 
-# SEO / body defaults (optional)
-SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get("SEO_DEFAULT_TITLE_TEMPLATE")
-SEO_DEFAULT_DESC_TEMPLATE = os.environ.get("SEO_DEFAULT_DESC_TEMPLATE")
-DEFAULT_BODY_HTML = os.environ.get("DEFAULT_BODY_HTML")
+# ---------- Product description defaults ----------
+# DEFAULT_BODY_MODE: one of: "missing" (default), "append", "replace"
+DEFAULT_BODY_MODE = os.environ.get("DEFAULT_BODY_MODE", "missing").strip().lower()
+DEFAULT_BODY_HTML = os.environ.get("DEFAULT_BODY_HTML", """
+<p>Original del / tilbehør. Rask levering fra AllSupermoto AS (Stavanger). Kontakt oss om du er usikker på kompatibilitet.</p>
+""".strip())
 
-# Debug: log discovered XML fields for first N products each request
-LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1", "true", "yes")
-SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS", "3"))
+# ---------- SEO defaults (include vendor & sku by default) ----------
+SEO_DEFAULT_TITLE_TEMPLATE = os.environ.get(
+    "SEO_DEFAULT_TITLE_TEMPLATE",
+    "{title} | {vendor} | {sku} – AllSupermoto AS"
+)
+SEO_DEFAULT_DESC_TEMPLATE = os.environ.get(
+    "SEO_DEFAULT_DESC_TEMPLATE",
+    "Kjøp {title} fra {vendor} hos AllSupermoto AS. Varenummer {sku}. Rask levering og god pris."
+)
+
+# ---------- Tag generation ----------
+TAG_MAX = int(os.environ.get("TAG_MAX", "10"))
+TAG_MIN_LEN = int(os.environ.get("TAG_MIN_LEN", "3"))
+# Comma-separated Norwegian/English stopwords (extend via env)
+DEFAULT_STOPWORDS = "for,med,til,og,eller,den,det,et,en,av,på,i,mm,inkl,inch,sw,os,tdc,sae"
+EXTRA_STOPWORDS = os.environ.get("TAG_STOPWORDS", "")
+STOPWORDS = {w.strip().lower() for w in (DEFAULT_STOPWORDS + "," + EXTRA_STOPWORDS).split(",") if w.strip()}
 
 # REST scan cap (only used if GraphQL fails)
 FIND_SKU_MAX_VARIANTS = int(os.environ.get("FIND_SKU_MAX_VARIANTS", "3000"))
@@ -88,8 +104,9 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS products(
       prodid TEXT PRIMARY KEY, name TEXT, price REAL, vatcode TEXT,
-      groupid TEXT, barcode TEXT, stock INTEGER, body_html TEXT,
-      image_b64 TEXT, webactive INTEGER, vendor TEXT, payload_xml TEXT,
+      groupid TEXT, barcode TEXT, stock INTEGER, reserved INTEGER,
+      body_html TEXT, image_b64 TEXT, webactive INTEGER, vendor TEXT,
+      payload_xml TEXT,
       last_shopify_product_id TEXT, last_shopify_variant_id TEXT,
       last_inventory_item_id TEXT, updated_at TEXT
     )""")
@@ -98,10 +115,11 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       endpoint TEXT, method TEXT, query TEXT, body TEXT, created_at TEXT
     )""")
-    try:
-        c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
-    except Exception:
-        pass
+    # Safe migration adds
+    try: c.execute("ALTER TABLE products ADD COLUMN vendor TEXT")
+    except Exception: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN reserved INTEGER")
+    except Exception: pass
     conn.commit(); conn.close()
 init_db()
 
@@ -172,7 +190,7 @@ def to_float_safe(v):
 def to_int_safe(v):
     try: return int(v)
     except:
-        try: return int(float(v))
+        try: return int(float(str(v).replace(",", ".")))
         except: return None
 
 def clean_b64(data):
@@ -265,6 +283,61 @@ def extract_best_price(p: ET.Element):
             if t == key:
                 return v, t
     return (any_first if any_first else (None, None))
+
+def slugify_simple(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s\-_/]", "", s)
+    s = re.sub(r"[\s/]+", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-_")
+
+def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: str, ean: str) -> list[str]:
+    tags = []
+
+    # Vendor/brand
+    if vendor:
+        tags.append(vendor.strip())
+
+    # Group identifiers
+    if group_id:
+        tags.append(f"group-{group_id.strip()}")
+    if group_name:
+        gn = slugify_simple(group_name)
+        if gn and len(gn) >= TAG_MIN_LEN:
+            tags.append(gn)
+
+    # SKU/EAN
+    if sku:
+        tags.append(sku.strip())
+    if ean:
+        tags.append(ean.strip())
+
+    # Title tokens
+    raw_tokens = re.split(r"[\s\-/_,.;:()\[\]]+", title or "")
+    for tok in raw_tokens:
+        t = tok.strip()
+        if not t:
+            continue
+        low = t.lower()
+        if low in STOPWORDS:
+            continue
+        if len(low) < TAG_MIN_LEN and not re.fullmatch(r"[A-Z0-9]{2,6}", t):
+            continue
+        if re.fullmatch(r"\d{1,2}(mm|cm|inch|in)$", low):
+            tags.append(low)
+            continue
+        # general word
+        if len(low) >= TAG_MIN_LEN or re.fullmatch(r"[A-Z0-9]{2,6}", t):
+            tags.append(low)
+
+    # Deduplicate while preserving order
+    seen=set(); final=[]
+    for t in tags:
+        k=t.lower()
+        if k in seen: continue
+        seen.add(k); final.append(t)
+        if len(final) >= TAG_MAX: break
+    return final
 
 # ---------- Shopify ----------
 def shopify_base(): return f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
@@ -503,7 +576,7 @@ def status_asp():
            "<supportsdeletes>1</supportsdeletes>"
            f"<echo_lastupdate>{lastupdate}</echo_lastupdate></Root>")
     resp = Response(xml, status=200)
-    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"
+    resp.headers["Content-Type"] = "text/xml; charset=ISO-8859-1"]
     resp.headers["Connection"] = "close"
     return resp
 
@@ -636,7 +709,9 @@ def post_product():
     conn = db(); c = conn.cursor()
     upserted=0; synced=0
 
-    if LOG_SNIFF_FIELDS:
+    # Optional field sniff (first few products per request)
+    if os.environ.get("LOG_SNIFF_FIELDS", "true").lower() in ("1","true","yes"):
+        SNIFF_MAX_PRODUCTS = int(os.environ.get("SNIFF_MAX_PRODUCTS", "3"))
         for i, probe in enumerate(nodes[:SNIFF_MAX_PRODUCTS]):
             snap = []
             for n in probe.iter():
@@ -645,6 +720,15 @@ def post_product():
                 if val:
                     snap.append(f"{tag}={val[:80]}")
             log.info("SNIFF[%d]: %s", i+1, "; ".join(snap[:40]))
+
+    # Load groups map (for tag generation)
+    group_map = {}
+    try:
+        cur = conn.cursor()
+        for row in cur.execute("SELECT groupid, groupname FROM groups"):
+            group_map[row["groupid"]] = row["groupname"]
+    except Exception:
+        pass
 
     for p in nodes:
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
@@ -656,13 +740,29 @@ def post_product():
         name3 = (findtext_ci_any(p,["varenavn3","alt07"]) or "").strip()
         full_title = (name + (" " + " ".join([t for t in [name2, name3] if t]) if (name2 or name3) else "")) or sku
 
+        # Body/description
         longdesc = (findtext_ci_any(p,["longdesc","longtext","description_long","desc","body_html","infohtml","produktbeskrivelse"]) or "")
         longdesc = maybe_hex_to_text(longdesc)
-        if not longdesc and DEFAULT_BODY_HTML:
-            longdesc = DEFAULT_BODY_HTML
+
+        # Default body logic
+        if DEFAULT_BODY_MODE == "replace":
+            body_html = DEFAULT_BODY_HTML
+        elif DEFAULT_BODY_MODE == "append":
+            if longdesc:
+                body_html = f"{longdesc}\n\n{DEFAULT_BODY_HTML}"
+            else:
+                body_html = DEFAULT_BODY_HTML
+        else:  # "missing" (only if empty)
+            body_html = longdesc or DEFAULT_BODY_HTML
 
         grp   = (findtext_ci_any(p,["productgroup","groupid","gruppeid","groupno","varegruppe"]) or "").strip()
+
+        # Stock & reserved
         stock = to_int_safe(findtext_ci_any(p, ["quantityonhand","stock","quantity","qty","lager","onhand","antall"]))
+        reserved = to_int_safe(findtext_ci_any(p, ["reservert","reserved","committed","backorder"]))
+        if stock is None: stock = 0
+        if reserved is None: reserved = 0
+        available = max(0, int(stock) - int(reserved))
 
         price_raw, price_src = extract_best_price(p)
         price = price_raw
@@ -684,22 +784,30 @@ def post_product():
         if img_b64:
             img_b64 = clean_b64(img_b64)
 
-        seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_TITLE_TEMPLATE else None
-        seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=vendor) if SEO_DEFAULT_DESC_TEMPLATE else None
+        # SEO (always include vendor+sku via templates)
+        safe_vendor = vendor if vendor else "Ukjent leverandør"
+        seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=safe_vendor)
+        seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=safe_vendor)
 
-        log.info("PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s vendor=%r group=%r",
-                 sku, full_title, price, price_src, ordinaryprice, stock, vendor, grp)
+        # Tags
+        group_name = group_map.get(grp, "") if grp else ""
+        tags_list = generate_tags(full_title, vendor, grp, group_name, sku, ean)
+
+        log.info(
+            "PARSED sku=%s title=%r price=%s (src=%s) ordinary=%s stock=%s reserved=%s -> available=%s vendor=%r group=%r",
+            sku, full_title, price, price_src, ordinaryprice, stock, reserved, available, vendor, grp
+        )
 
         # Persist locally
         c.execute("""
-          INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,vendor,payload_xml,
+          INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(prodid) DO UPDATE SET
             name=excluded.name, price=excluded.price, groupid=excluded.groupid, stock=excluded.stock,
-            body_html=excluded.body_html, image_b64=excluded.image_b64, vendor=excluded.vendor,
+            reserved=excluded.reserved, body_html=excluded.body_html, image_b64=excluded.image_b64, vendor=excluded.vendor,
             payload_xml=excluded.payload_xml, updated_at=excluded.updated_at
-        """,(sku,full_title,price,None,grp,ean,stock,longdesc,img_b64,1,vendor,raw,None,None,None,now_iso()))
+        """,(sku,full_title,price,None,grp,ean,stock,reserved,body_html,img_b64,1,vendor,raw,None,None,None,now_iso()))
         upserted += 1
 
         # ---------- Shopify: UPDATE if exists, otherwise (maybe) CREATE ----------
@@ -723,9 +831,9 @@ def post_product():
 
             product_payload = {
                 "title": full_title,
-                "body_html": longdesc or "",
+                "body_html": body_html or "",
                 "vendor": vendor or None,
-                "tags": [t for t in [f"group-{grp}" if grp else None] if t],
+                "tags": tags_list[:],  # list of strings
                 "variants": [variant_payload]
             }
 
@@ -764,7 +872,7 @@ def post_product():
                     continue
                 # CREATE new product
                 cp=dict(product_payload)
-                if cp["tags"]:
+                if cp.get("tags"):
                     cp["tags"] = ",".join(cp["tags"])
                 cp["status"]="active"
                 created=shopify_create_product(cp)
@@ -783,12 +891,19 @@ def post_product():
             except Exception as e:
                 log.warning("Variant price update failed for %s: %s", sku, e)
 
+            # Inventory: available = stock - reserved
             try:
-                ensure_tracking_and_set_inventory(vid, iid, stock)
+                ensure_tracking_and_set_inventory(vid, iid, available)
             except Exception as e:
                 log.warning("Inventory set failed for %s: %s", sku, e)
 
-            shopify_upsert_product_metafields(pid, {"vendor": vendor or ""})
+            # Metafields + SEO
+            shopify_upsert_product_metafields(pid, {
+                "vendor": vendor or "",
+                "group_id": grp or "",
+                "group_name": group_name or "",
+                "reserved": reserved
+            })
             shopify_set_seo(pid, seo_title, seo_desc)
 
             c.execute(
@@ -834,7 +949,8 @@ def resetmap():
 # ---------- Admin: seed cache (optional; safe to ignore) ----------
 @app.route("/admin/seed_cache", methods=["POST","GET"])
 def admin_seed_cache():
-    if not require_admin():
+    key = request.args.get("key","")
+    if ADMIN_KEY and key != ADMIN_KEY:
         return Response("Forbidden\r\n", status=403, mimetype="text/plain")
     headers = sh_headers()
     scanned = 0
@@ -862,15 +978,15 @@ def admin_seed_cache():
                 vid = v.get("id")
                 iid = v.get("inventory_item_id")
                 cur.execute("""
-                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,body_html,image_b64,webactive,vendor,payload_xml,
+                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                          last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(prodid) DO UPDATE SET
                       last_shopify_product_id=excluded.last_shopify_product_id,
                       last_shopify_variant_id=excluded.last_shopify_variant_id,
                       last_inventory_item_id=excluded.last_inventory_item_id,
                       updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,now_iso()))
+                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,now_iso()))
             conn.commit()
             since_id = arr[-1]["id"]
         return Response(f"Seeded {scanned} variants into local cache\r\n", mimetype="text/plain")
