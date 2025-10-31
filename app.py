@@ -14,9 +14,19 @@ import time
 import random
 import threading
 import socket
+import errno
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
+
+# ---------- Data dir (writable) ----------
+DATA_DIR = os.environ.get("DATA_DIR", "/mnt/data")
+def _ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as e:
+        logging.warning("Could not create DATA_DIR %s: %s", DATA_DIR, e)
+_ensure_data_dir()
 
 # ---------- Uni auth ----------
 UNI_USER = os.environ.get("UNI_USER", "synall")
@@ -41,7 +51,7 @@ UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "tr
 # ---------- Images ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
-PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
+PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")  # used if SKU not provided
 
 # ---------- Create / Update strategy ----------
 STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() in ("1", "true", "yes")
@@ -89,9 +99,9 @@ LIGHT_MODE = os.environ.get("LIGHT_MODE", "false").lower() in ("1", "true", "yes
 STORE_RAW_XML = os.environ.get("STORE_RAW_XML", "true").lower() in ("1", "true", "yes")
 LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "false").lower() in ("1", "true", "yes")
 
-# ---------- Hardcoded Kill Switch (no env) ----------
-KILL_KEY = "asmstop2025"                 # change if you want
-KILL_FILE = "/mnt/data/SYNC_KILLED"      # create this file to kill; delete to resume
+# ---------- Hardcoded Kill Switch (no env needed) ----------
+KILL_KEY = "asmstop2025"                                # change if you want
+KILL_FILE = os.path.join(DATA_DIR, "SYNC_KILLED")       # create this file to kill; delete to resume
 
 def is_killed() -> bool:
     return os.path.exists(KILL_FILE)
@@ -104,8 +114,8 @@ PRELOAD_RESUME        = os.environ.get("PRELOAD_RESUME", "true").lower() in ("1"
 PRELOAD_LOG_EVERY     = int(os.environ.get("PRELOAD_LOG_EVERY", "500"))
 PRELOAD_MAX_PAGES     = int(os.environ.get("PRELOAD_MAX_PAGES", "0"))          # 0 = no page cap
 
-PRELOAD_LOCK_PATH     = "/mnt/data/PRELOAD_LOCK"
-PRELOAD_DONE_PATH     = "/mnt/data/PRELOAD_DONE"
+PRELOAD_LOCK_PATH     = os.path.join(DATA_DIR, "PRELOAD_LOCK")
+PRELOAD_DONE_PATH     = os.path.join(DATA_DIR, "PRELOAD_DONE")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
@@ -178,21 +188,6 @@ def ensure_logs_table(conn):
     )""")
     conn.commit()
 
-def safe_log(endpoint: str, method: str, query: str, body: str):
-    try:
-        conn = db()
-        ensure_logs_table(conn)
-        conn.execute(
-            "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
-            (endpoint, method, query, body, now_iso())
-        )
-        conn.commit()
-    except Exception as e:
-        logging.warning("Skipping logs insert: %s", e)
-    finally:
-        try: conn.close()
-        except: pass
-
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
@@ -261,6 +256,21 @@ def clean_b64(data):
 def one_line(s: str | None) -> str | None:
     if not s: return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
+
+def safe_log(endpoint: str, method: str, query: str, body: str):
+    try:
+        conn = db()
+        ensure_logs_table(conn)
+        conn.execute(
+            "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
+            (endpoint, method, query, body, now_iso())
+        )
+        conn.commit()
+    except Exception as e:
+        logging.warning("Skipping logs insert: %s", e)
+    finally:
+        try: conn.close()
+        except: pass
 
 # ---------- Tag helpers ----------
 def norm_tag(tag: str) -> str:
@@ -503,7 +513,11 @@ def shopify_product_images(pid: int):
         raise RuntimeError(f"images {r.status_code}: {r.text[:200]}")
     return r.json().get("images", [])
 
-def shopify_add_placeholder_image(pid: int):
+def shopify_add_placeholder_image(pid: int, sku_for_alt: str | None = None):
+    """
+    Attach placeholder image only if product has no images.
+    Alt text defaults to SKU when provided; otherwise PLACEHOLDER_ALT.
+    """
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
         return
     try:
@@ -512,15 +526,16 @@ def shopify_add_placeholder_image(pid: int):
             # any image exists -> skip placeholder
             for img in imgs:
                 alt = (img.get("alt") or "").lower()
-                if PLACEHOLDER_ALT.lower() in alt:
+                if (PLACEHOLDER_ALT or "").lower() in alt:
                     return
             return
-        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
+        alt_text = (sku_for_alt or "").strip() or PLACEHOLDER_ALT
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": alt_text}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
         if r.status_code not in (200, 201):
             logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
         else:
-            logging.info("Placeholder image attached to product %s", pid)
+            logging.info("Placeholder image attached to product %s (alt=%r)", pid, alt_text)
     except Exception as e:
         logging.warning("Placeholder image attach error for %s: %s", pid, e)
 
@@ -1140,7 +1155,7 @@ def post_product():
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid)
+                try: shopify_add_placeholder_image(pid, sku_for_alt=sku)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
@@ -1320,16 +1335,30 @@ def _write_file(path: str, content: str):
         logging.warning("Failed writing %s: %s", path, e)
 
 def _atomic_create(path: str) -> bool:
+    # Ensure parent dir exists
     try:
-        # Exclusive create fails if file exists
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except Exception as e:
+        logging.warning("Lock dir create failed for %s: %s", path, e)
+        return False
+
+    try:
+        # Exclusive create; succeeds only if file does not exist
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w") as f:
             f.write(now_iso())
         return True
     except FileExistsError:
+        # Another worker already holds the lock
+        return False
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            logging.warning("Lock create error (missing path) for %s: %s", path, e)
+        else:
+            logging.warning("Lock create unexpected OSError for %s: %s", path, e)
         return False
     except Exception as e:
-        logging.warning("Lock create error %s: %s", path, e)
+        logging.warning("Lock create unexpected error for %s: %s", path, e)
         return False
 
 def _remove_if_exists(path: str):
@@ -1347,7 +1376,7 @@ def _preload_worker():
         logging.info("Preload skipped: PRELOAD_DONE exists.")
         return
     if not _atomic_create(PRELOAD_LOCK_PATH):
-        logging.info("Preload skipped: another worker holds PRELOAD_LOCK.")
+        logging.info("Preload skipped: could not acquire PRELOAD_LOCK (dir/permissions/another worker).")
         return
 
     hostname = socket.gethostname()
@@ -1476,19 +1505,20 @@ def admin_health():
     data = {
         "cache_size": _count_cached_variants(),
         "default_body_mode": DEFAULT_BODY_MODE,
+        "dropped": 0,
+        "max_queue_size": 8000,
+        "ok": True,
         "placehldr": bool(ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL),
         "preload_done": os.path.exists(PRELOAD_DONE_PATH),
         "qps": QPS,
-        "max_queue_size": 8000,          # cosmetic / static
         "queue_size": 0,
         "queued": 0,
-        "ok": True,
         "skipped_cache_miss": 0,
         "skipped_noop": 0,
-        "dropped": 0,
         "stop_after_n": STOP_AFTER_N,
         "strict_update_only": STRICT_UPDATE_ONLY,
         "tag_max": TAG_MAX,
+        "updated": 0,
         "workers": int(os.environ.get("WEB_CONCURRENCY", "1")),
     }
     return Response(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
