@@ -38,7 +38,7 @@ UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "tr
 
 # ---------- Images ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
-PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL") or os.environ.get("PLACEHOLDER_URL")
+PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL") or os.environ.get("PLACEHOLDER_URL") or os.environ.get("PLACEHOLDER_URL")
 PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
 
 # ---------- Create / Update strategy ----------
@@ -1025,8 +1025,10 @@ def post_product():
 
     for p in nodes:
         if STOP_AFTER_N > 0 and (processed + current_total) >= STOP_AFTER_N:
-            log.info("STOP_AFTER_N reached (%d). Stopping early.", STOP_AFTER_N)
+            log.info("STOP_AFTER_N reached (%d). Stopping early (session %s total=%d).", STOP_AFTER_N, sessionid, processed + current_total)
             hit_limit = True
+            break
+hit_limit = True
             break
         processed += 1
             if STOP_AFTER_N > 0 and sessionid:
