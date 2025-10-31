@@ -781,7 +781,7 @@ def shopify_find_variant_by_sku(sku):
                     scanned += 1
                     if (v.get("sku") or "").strip() == target:
                         return v
-                since_id = arr[-1]["id"]
+                    since_id = arr[-1]["id"]
             except Exception as e:
                 logging.warning("variants scan error after %d scanned: %s", scanned, e)
                 break
@@ -1113,7 +1113,13 @@ def post_product():
         changed_price = is_new or f2(prev["price"]) != f2(price)
         changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
         changed_cost  = is_new or f2(prev["last_cost"]) != f2(cost_net)
-        prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
+        # SAFER: handle NULL stock/reserved from preloaded rows
+        if prev:
+            prev_stock = to_int_safe(prev["stock"]) or 0
+            prev_reserved = to_int_safe(prev["reserved"]) or 0
+            prev_avail = max(0, prev_stock - prev_reserved)
+        else:
+            prev_avail = None
         changed_av  = is_new or int(prev_avail or -1) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
         changed_bar = is_new or (prev["barcode"] or "") != (ean or "")
@@ -1298,6 +1304,7 @@ def admin_seed_cache():
                     if not sku:
                         continue
                     pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
+                    # STOCK + RESERVED set to 0 (avoid NULLs)
                     cur.execute("""
                         INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                              last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
@@ -1307,7 +1314,7 @@ def admin_seed_cache():
                           last_shopify_variant_id=excluded.last_shopify_variant_id,
                           last_inventory_item_id=excluded.last_inventory_item_id,
                           updated_at=excluded.updated_at
-                    """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                    """,(sku,None,None,None,None,None,0,0,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
                     scanned += 1; total_scanned += 1
                     since_id = v.get("id") or since_id
 
@@ -1375,6 +1382,7 @@ def seed_cache_once(resume: bool, limit: int, flush_every: int) -> None:
                     continue
                 pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
                 since_id = v.get("id") or since_id
+                # STOCK + RESERVED set to 0 (avoid NULLs)
                 cur.execute("""
                     INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                          last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
@@ -1384,7 +1392,7 @@ def seed_cache_once(resume: bool, limit: int, flush_every: int) -> None:
                       last_shopify_variant_id=excluded.last_shopify_variant_id,
                       last_inventory_item_id=excluded.last_inventory_item_id,
                       updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                """,(sku,None,None,None,None,None,0,0,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
                 scanned += 1; total_scanned += 1
 
                 if (scanned % flush_every) == 0:
