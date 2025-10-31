@@ -175,12 +175,15 @@ def safe_log(endpoint: str, method: str, query: str, body: str):
 
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
+
+# Uni-vennlig OK med Connection: close + riktig length
 def ok_txt(body="OK"):
     data = (body + "\r\n").encode("cp1252", errors="ignore")
     resp = Response(data, status=200, mimetype="text/plain; charset=windows-1252")
     resp.headers["Content-Length"] = str(len(data))
     resp.headers["Connection"] = "close"
     return resp
+
 def require_auth(): return request.args.get("user")==UNI_USER and request.args.get("pass")==UNI_PASS
 def require_admin():
     key = request.args.get("key", "")
@@ -806,17 +809,17 @@ def productlist_asp():
 # ---------- misc stubs ----------
 @app.route("/twinxml/postfiles.asp", methods=["GET","POST","HEAD"])
 def postfiles_asp():
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+    return ok_txt("OK")
 
 @app.route("/twinxml/postdiscountsystem.asp", methods=["GET","POST","HEAD"])
 def postdiscountsystem_asp():
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+    return ok_txt("OK")
 
 @app.route("/twinxml/deletetable.asp", methods=["GET","POST","HEAD"])
 def deletetable_asp():
     name = (request.args.get("name") or "").lower()
     logging.info("Uni requested deletetable for: %s", name)
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+    return ok_txt("OK")
 
 @app.route("/twinxml/postdiscount.asp", methods=["GET","POST","HEAD"])
 @app.route("/twinxml/postdiscount.aspx", methods=["GET","POST","HEAD"])
@@ -825,10 +828,9 @@ def postdiscount_asp():
 
 # ---------- product groups (return literal "true") ----------
 def uni_groups_ok():
-    body = "true"
-    resp = Response(body, status=200)
-    resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    resp.headers["Content-Length"] = str(len(body.encode("cp1252")))
+    body = b"true"
+    resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+    resp.headers["Content-Length"] = str(len(body))
     resp.headers["Connection"] = "close"
     return resp
 
@@ -891,20 +893,30 @@ def post_product_group():
 @app.route("/twinxml/poststock.aspx", methods=["GET","POST"])
 def post_product():
     if request.method == "GET":
-        data = b"true"
-resp = Response(data, status=200, mimetype="text/plain; charset=windows-1252")
-resp.headers["Content-Length"] = str(len(data))
-resp.headers["Connection"] = "close"
-return resp
+        # Uni forventer "true" når den health-checker via GET i noen oppsett
+        body = b"true"
+        resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+        resp.headers["Content-Length"] = str(len(body))
+        resp.headers["Connection"] = "close"
+        return resp
+
     if not require_auth():
-        return ok_txt("OK")
+        body = b"true"
+        resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+        resp.headers["Content-Length"] = str(len(body))
+        resp.headers["Connection"] = "close"
+        return resp
 
     raw, _ = read_xml_body()
     try:
         root = ET.fromstring(raw)
     except Exception as e:
         log.warning("Bad XML products: %s ... first200=%r", e, raw[:200])
-        return ok_txt("OK")
+        body = b"true"
+        resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+        resp.headers["Content-Length"] = str(len(body))
+        resp.headers["Connection"] = "close"
+        return resp
 
     nodes = (root.findall(".//product") or root.findall(".//vare") or
              root.findall(".//item") or root.findall(".//produkt"))
@@ -1008,7 +1020,7 @@ return resp
             sku, full_title, price, price_src, compare_at, stock, reserved, available, vendor, grp, cost_net, cost_src
         )
 
-        # ---- NO-OP detection (compare before overwrite) ----
+        # ---- NO-OP detection ----
         prev = c.execute(
             "SELECT name, price, stock, reserved, body_html, vendor, last_compare_at_price, last_tags, last_cost, "
             "       last_shopify_product_id, last_shopify_variant_id, last_inventory_item_id, barcode "
@@ -1040,7 +1052,7 @@ return resp
             log.info("NO-OP: sku=%s unchanged (incl. cost).", sku)
             continue
 
-        # ---- Persist intended state (do not change last_* IDs yet) ----
+        # ---- Persist intended state ----
         c.execute("""
           INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
                                last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
@@ -1057,31 +1069,29 @@ return resp
              compare_at, tags_csv, cost_net, now_iso()))
         upserted += 1
 
-        # ---------- Shopify: find existing (fast path) ----------
+        # ---------- Shopify: find existing ----------
         if not SHOPIFY_TOKEN:
             continue
 
         v = shopify_find_variant_by_sku(sku)
         if not v:
-            # We do NOT create when STRICT_UPDATE_ONLY=true
             if STRICT_UPDATE_ONLY:
                 skipped_cache_miss += 1
                 log.warning("STRICT_UPDATE_ONLY: SKU %r not found%s. Skipping.",
                             sku, " (cache-only mode)" if FIND_EXISTING_MODE=="cache_only" else "")
                 continue
-            # (Create path would go here if allowed)
             log.warning("Create disabled; skipping SKU %r (not found).", sku)
             continue
 
         pid=v["product_id"]; vid=v["id"]; iid=v.get("inventory_item_id")
 
-        # Flags so we only call endpoints that need changes
+        # Flags (minimerer API-kall)
         do_product_update = (changed_title or changed_body or changed_vendor or ((not LIGHT_MODE) and changed_tags))
         do_variant_update = (changed_price or changed_cmp or changed_bar)
         do_inventory_set  = changed_av
         do_cost_update    = changed_cost and (cost_net is not None)
 
-        # Product update (title/body/vendor/tags)
+        # Product update
         if do_product_update:
             up={"id":pid,"title":full_title,"body_html":body_html or ""}
             if vendor: up["vendor"] = vendor
@@ -1090,26 +1100,26 @@ return resp
             log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                      sku, pid, SHOPIFY_DOMAIN, pid)
 
-            # SEO only if not light mode and title/vendor changed (saves calls)
+            # SEO (ikke i LIGHT_MODE)
             if not LIGHT_MODE and (changed_title or changed_vendor):
                 final_vendor = (vendor or "Ukjent leverandør").strip() or "Ukjent leverandør"
                 seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 shopify_set_seo(pid, seo_title, seo_desc)
 
-            # attach placeholder only when not light mode
+            # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
                 try: shopify_add_placeholder_image(pid)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
-        # Variant fields (price/compare_at/barcode)
+        # Variant (pris / compare_at / barcode)
         if do_variant_update and vid:
             vp = {"price": f"{(price or 0):.2f}", "sku": sku}
             if compare_at: vp["compare_at_price"] = f"{compare_at:.2f}"
             if ean: vp["barcode"] = ean
             shopify_update_variant(vid, vp)
 
-        # Inventory qty (available = stock - reserved)
+        # Inventory (available = stock - reserved)
         if do_inventory_set and iid:
             try:
                 ensure_tracking_and_set_inventory(vid, iid, available)
@@ -1123,7 +1133,7 @@ return resp
             except Exception as e:
                 log.warning("Cost update failed for %s (iid=%s): %s", sku, iid, e)
 
-        # Update IDs cache (if we got them)
+        # Cache IDs
         c.execute(
             "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
             "last_compare_at_price=?, last_tags=?, last_cost=?, updated_at=? WHERE prodid=?",
@@ -1135,7 +1145,13 @@ return resp
     conn.commit(); conn.close()
     log.info("Upserted %d products (Shopify updated %d, skipped no-ops %d, skipped cache-miss %d)",
              upserted, synced, skipped_noops, skipped_cache_miss)
-    return ok_txt("OK")
+
+    # --- VIKTIG: Returnér bokstavelig "true" til Uni for å få neste pakke ---
+    body = b"true"
+    resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+    resp.headers["Content-Length"] = str(len(body))
+    resp.headers["Connection"] = "close"
+    return resp
 
 # ---------- delete ----------
 @app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
@@ -1163,14 +1179,13 @@ def resetmap():
     conn.commit(); conn.close()
     return ok_txt("OK")
 
-# ---------- Admin: streaming seed cache with resume (yields BYTES) ----------
+# ---------- Admin: streaming seed cache with resume ----------
 @app.route("/admin/seed_cache", methods=["GET","POST"])
 def admin_seed_cache():
     key = request.args.get("key","")
     if ADMIN_KEY and key != ADMIN_KEY:
         return Response(b"Forbidden\r\n", status=403, mimetype="text/plain")
 
-    # tunables via query params
     limit = int(request.args.get("limit", "250"))          # variants per page (250 max)
     flush_every = int(request.args.get("flush_every", "500"))
     resume = (request.args.get("resume", "1").lower() in ("1","true","yes"))
@@ -1178,7 +1193,6 @@ def admin_seed_cache():
     def stream():
         conn = db(); cur = conn.cursor()
         try:
-            # read/create checkpoint
             since_id = 0
             if resume:
                 cur.execute("""
@@ -1234,7 +1248,6 @@ def admin_seed_cache():
                         yield f"Seeded +{scanned} (total={total_scanned}) — since_id={since_id}\n".encode("utf-8")
                         scanned = 0
 
-                # flush after each page
                 conn.commit()
                 if resume:
                     cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
@@ -1244,7 +1257,6 @@ def admin_seed_cache():
                     conn.commit()
                 yield f"Page committed — since_id={since_id}, total={total_scanned}\n".encode("utf-8")
 
-            # final commit + report last checkpoint
             conn.commit()
             if resume:
                 row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
