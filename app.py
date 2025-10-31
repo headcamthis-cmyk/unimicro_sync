@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import json
 from datetime import datetime, timezone
-from flask import Flask, request, Response, stream_with_context
+from flask import Flask, request, Response, stream_with_context, jsonify
 import xml.etree.ElementTree as ET
 import requests
 import re
@@ -12,6 +12,7 @@ import base64
 import binascii
 import time
 import random
+import threading
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -91,6 +92,23 @@ LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "false").lower() in ("1", 
 KILL_KEY = "asmstop2025"                 # change if you want
 KILL_FILE = "/mnt/data/SYNC_KILLED"      # create this file to kill; delete to resume
 
+# ---------- PRELOAD (Shopify -> local cache) ----------
+# For Option A: default to on when STRICT_UPDATE_ONLY=true
+PRELOAD_ON_STARTUP   = os.environ.get("PRELOAD_ON_STARTUP", "true" if STRICT_UPDATE_ONLY else "false").lower() in ("1","true","yes")
+PRELOAD_LIMIT        = int(os.environ.get("PRELOAD_LIMIT", "250"))        # up to 250/page
+PRELOAD_FLUSH_EVERY  = int(os.environ.get("PRELOAD_FLUSH_EVERY", "500"))  # DB commit cadence
+PRELOAD_RESUME       = os.environ.get("PRELOAD_RESUME", "1").lower() in ("1","true","yes")
+PRELOAD_DELAY_SEC    = float(os.environ.get("PRELOAD_DELAY_SEC", "1.0"))  # small warmup delay
+
+# ---------- Preload state ----------
+_preload_state = {
+    "running": False,
+    "done": False,
+    "error": "",
+    "total_scanned": 0,
+    "since_id": 0,
+}
+
 def is_killed() -> bool:
     return os.path.exists(KILL_FILE)
 
@@ -154,6 +172,12 @@ def init_db():
     ]:
         try: c.execute(alter)
         except Exception: pass
+    # seed checkpoint for preload
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS seed_checkpoint(
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            since_id INTEGER
+        )""")
     conn.commit(); conn.close()
 init_db()
 
@@ -788,6 +812,40 @@ def _kill_guard():
 @app.route("/", methods=["GET"])
 def index(): return ok_txt("OK")
 
+# NEW: compact JSON health incl. preload/cache size
+@app.route("/admin/health", methods=["GET"])
+def admin_health():
+    try:
+        conn = db()
+        row = conn.execute("SELECT COUNT(*) AS n FROM products WHERE last_shopify_variant_id IS NOT NULL").fetchone()
+        cache_size = int(row["n"] if row else 0)
+    except Exception:
+        cache_size = -1
+    finally:
+        try: conn.close()
+        except: pass
+
+    body = {
+        "ok": True,
+        "strict_update_only": STRICT_UPDATE_ONLY,
+        "find_mode": FIND_EXISTING_MODE,
+        "stop_after_n": STOP_AFTER_N,
+        "light_mode": LIGHT_MODE,
+        "cache_size": cache_size,
+        "preload": {
+            "enabled": PRELOAD_ON_STARTUP,
+            "running": _preload_state["running"],
+            "done": _preload_state["done"],
+            "error": _preload_state["error"],
+            "total_scanned": _preload_state["total_scanned"],
+            "since_id": _preload_state["since_id"],
+            "limit": PRELOAD_LIMIT,
+            "flush_every": PRELOAD_FLUSH_EVERY,
+            "resume": PRELOAD_RESUME,
+        }
+    }
+    return jsonify(body)
+
 # ---------- status/orders/productlist ----------
 @app.route("/twinxml/status.asp", methods=["GET","POST","HEAD"])
 def status_asp():
@@ -1155,7 +1213,7 @@ def post_product():
         c.execute(
             "UPDATE products SET last_shopify_product_id=?, last_shopify_variant_id=?, last_inventory_item_id=?, "
             "last_compare_at_price=?, last_tags=?, last_cost=?, updated_at=? WHERE prodid=?",
-            (pid, vid, iid, compare_at, tags_csv, cost_net, now_iso(), sku)
+            (pid, vid, iid, compare_at, ",".join(tags_list) if tags_list else "", cost_net, now_iso(), sku)
         )
         conn.commit()
         synced += 1
@@ -1289,6 +1347,94 @@ def admin_seed_cache():
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
+# ---------- Auto-preload (non-streaming) ----------
+def seed_cache_once(resume: bool, limit: int, flush_every: int) -> None:
+    """Run once in background on startup: pull all variants into local cache."""
+    if _preload_state["running"]:
+        return
+    _preload_state.update({"running": True, "done": False, "error": "", "total_scanned": 0})
+    conn = db(); cur = conn.cursor()
+    try:
+        row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
+        since_id = int(row["since_id"]) if (resume and row and row["since_id"]) else 0
+
+        total_scanned = 0
+        logging.info("Preload: start (resume=%s) from since_id=%s", resume, since_id)
+
+        while True:
+            r = shopify_request("GET", "/variants.json", params={"limit": min(limit, 250), "since_id": since_id})
+            data = r.json() or {}
+            variants = data.get("variants") or []
+            if not variants:
+                break
+
+            scanned = 0
+            for v in variants:
+                sku = (v.get("sku") or "").strip()
+                if not sku:
+                    continue
+                pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
+                since_id = v.get("id") or since_id
+                cur.execute("""
+                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
+                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(prodid) DO UPDATE SET
+                      last_shopify_product_id=excluded.last_shopify_product_id,
+                      last_shopify_variant_id=excluded.last_shopify_variant_id,
+                      last_inventory_item_id=excluded.last_inventory_item_id,
+                      updated_at=excluded.updated_at
+                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                scanned += 1; total_scanned += 1
+
+                if (scanned % flush_every) == 0:
+                    conn.commit()
+                    if resume:
+                        cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
+                                       VALUES(1, ?)
+                                       ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
+                                    (since_id,))
+                        conn.commit()
+
+            conn.commit()
+            if resume:
+                cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
+                               VALUES(1, ?)
+                               ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
+                            (since_id,))
+                conn.commit()
+            logging.info("Preload: page commit — since_id=%s total=%s", since_id, total_scanned)
+
+        _preload_state.update({"done": True, "running": False, "total_scanned": total_scanned, "since_id": since_id})
+        logging.info("Preload complete. Variants cached: %s (since_id=%s)", total_scanned, since_id)
+
+    except Exception as e:
+        _preload_state.update({"error": str(e), "running": False, "done": False})
+        logging.exception("Preload failed: %s", e)
+    finally:
+        try: conn.close()
+        except: pass
+
+def start_preload_if_enabled():
+    if not PRELOAD_ON_STARTUP:
+        logging.info("Preload disabled (PRELOAD_ON_STARTUP=false)")
+        return
+    if not STRICT_UPDATE_ONLY:
+        logging.info("Preload skipped (STRICT_UPDATE_ONLY=false)")
+        return
+    if not SHOPIFY_TOKEN:
+        logging.warning("Preload skipped: SHOPIFY_TOKEN missing")
+        return
+
+    def worker():
+        # let app & DB warm up
+        time.sleep(max(0.0, PRELOAD_DELAY_SEC))
+        seed_cache_once(PRELOAD_RESUME, PRELOAD_LIMIT, PRELOAD_FLUSH_EVERY)
+
+    threading.Thread(target=worker, name="preload-seed-cache", daemon=True).start()
+    logging.info("Preload thread started (resume=%s, limit=%s, flush_every=%s)",
+                 PRELOAD_RESUME, PRELOAD_LIMIT, PRELOAD_FLUSH_EVERY)
+
 # ---------- Admin: Kill / Resume ----------
 @app.route("/admin/kill", methods=["GET","POST"])
 def admin_kill():
@@ -1361,6 +1507,12 @@ def twinxml_fallback(rest):
     if is_upload and request.method in ("POST","GET"):
         return post_product()
     return ok_txt("OK")
+
+# ---------- Startup: kick off preload ----------
+try:
+    start_preload_if_enabled()
+except Exception as _e:
+    logging.warning("Failed to start preload thread: %s", _e)
 
 # ---------- Main ----------
 if __name__ == "__main__":
