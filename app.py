@@ -1055,8 +1055,8 @@ def post_product():
         changed_price = is_new or f2(prev["price"]) != f2(price)
         changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
         changed_cost  = is_new or f2(prev["last_cost"]) != f2(cost_net)
-        prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
-        changed_av  = is_new or int(prev_avail or -1) != int(available)
+        prev_avail = (max(0, _i0(prev["stock"]) - _i0(prev["reserved"])) if prev else None)
+        changed_av  = is_new or int((prev_avail if prev_avail is not None else -1)) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
         changed_bar = is_new or (prev["barcode"] or "") != (ean or "")
 
