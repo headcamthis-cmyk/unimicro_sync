@@ -442,6 +442,14 @@ def _after(resp):
         resp.headers["Connection"] = "close"
     return resp
 
+@app.before_first_request
+def _boot_before_first_request():
+    try:
+        boot_once()
+    except Exception as e:
+        logging.warning(f"boot_once() failed in before_first_request: {e}")
+
+
 # -----------------------------------------------------------------------------
 # Admin endpoints
 # -----------------------------------------------------------------------------
@@ -553,6 +561,27 @@ def twinxml_catchall(subpath: str):
 # -----------------------------------------------------------------------------
 # Startup
 # -----------------------------------------------------------------------------
+STARTED = False
+START_LOCK = None
+
+try:
+    import threading as _t
+    START_LOCK = _t.Lock()
+except Exception:
+    class _Dummy:
+        def __enter__(self): pass
+        def __exit__(self, *a): pass
+    START_LOCK = _Dummy()
+
+
+def boot_once():
+    global STARTED
+    with START_LOCK:
+        if STARTED:
+            return
+        STARTED = True
+        boot()
+
 def boot():
     logging.info(f"Shopify domain: {SHOPIFY_DOMAIN} | API ver: {SHOPIFY_API_VER} | QPS={QPS}")
     if PRELOAD_SKU_CACHE:
@@ -564,7 +593,12 @@ def boot():
         log_cache_size("Startup (no warmup). Current SKU cache")
     start_workers(WORKER_THREADS)
 
+if os.environ.get("BOOT_IMMEDIATELY", "true").lower() == "true":
+    try:
+        boot_once()
+    except Exception as e:
+        logging.warning(f"boot_once() at import failed: {e}")
+
 if __name__ == "__main__":
-    boot()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)
