@@ -1153,14 +1153,14 @@ def post_product():
     resp.headers["Connection"] = "close"
     return resp
 
-# ---------- delete ----------
-@app.route("/twinxml/deleteproduct.asp", methods=["GET","POST"])
-@app.route("/twinxml/deleteproduct.aspx", methods=["GET","POST"])
-def delete_product():
-    if not require_auth(): return ok_txt("OK")
+# --- Uni -> "delete product" (we ignore) ---
+@app.route("/twinxml/deleteproduct.asp", methods=["POST"])
+def uni_delete_product():
     sku = (request.args.get("id") or "").strip()
-    if not sku: return ok_txt("OK")
-    conn = db(); conn.execute("DELETE FROM products WHERE prodid=?", (sku,)); conn.commit(); conn.close()
+    # Only log if you want to see that Uni asked for a delete
+    if os.environ.get("LOG_UNI_DELETES", "true").lower() == "true":
+        logging.info(f"UNI requested delete for {sku} — ignored (NO Shopify delete).")
+    # Always acknowledge with OK so Uni doesn't retry
     return ok_txt("OK")
 
 # ---------- reset map ----------
