@@ -891,7 +891,11 @@ def post_product_group():
 @app.route("/twinxml/poststock.aspx", methods=["GET","POST"])
 def post_product():
     if request.method == "GET":
-        return ok_txt("OK")
+        data = b"true"
+resp = Response(data, status=200, mimetype="text/plain; charset=windows-1252")
+resp.headers["Content-Length"] = str(len(data))
+resp.headers["Connection"] = "close"
+return resp
     if not require_auth():
         return ok_txt("OK")
 
