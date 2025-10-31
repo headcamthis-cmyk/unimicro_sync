@@ -175,7 +175,12 @@ def safe_log(endpoint: str, method: str, query: str, body: str):
 
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
-def ok_txt(body="OK"): return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
+def ok_txt(body="OK"):
+    data = (body + "\r\n").encode("cp1252", errors="ignore")
+    resp = Response(data, status=200, mimetype="text/plain; charset=windows-1252")
+    resp.headers["Content-Length"] = str(len(data))
+    resp.headers["Connection"] = "close"
+    return resp
 def require_auth(): return request.args.get("user")==UNI_USER and request.args.get("pass")==UNI_PASS
 def require_admin():
     key = request.args.get("key", "")
