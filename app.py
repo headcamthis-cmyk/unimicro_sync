@@ -7,11 +7,13 @@ import html
 import base64
 import re
 import urllib.parse
+import threading
+import queue
 from typing import Dict, Any, Optional, List, Tuple
 
 import xml.etree.ElementTree as ET
 import requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, make_response
 
 # -----------------------------------------------------------------------------
 # Flask & Logging
@@ -32,6 +34,12 @@ STRICT_UPDATE_ONLY     = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() ==
 ALLOW_CREATE           = os.environ.get("ALLOW_CREATE", "false").lower() == "true"  # ignored if STRICT_UPDATE_ONLY=true
 PRELOAD_SKU_CACHE      = os.environ.get("PRELOAD_SKU_CACHE", "true").lower() == "true"
 KILL_SWITCH            = os.environ.get("KILL_SWITCH", "false").lower() == "true"   # hard stop for all upserts
+
+# Throughput / stability
+ACK_FIRST_THEN_WORK    = os.environ.get("ACK_FIRST_THEN_WORK", "true").lower() == "true"  # return OK immediately, process in workers
+WORKER_THREADS         = int(os.environ.get("WORKER_THREADS", "4"))
+MAX_QUEUE_SIZE         = int(os.environ.get("MAX_QUEUE_SIZE", "5000"))  # number of product dicts buffered
+CONNECTION_CLOSE       = os.environ.get("CONNECTION_CLOSE", "true").lower() == "true"     # add Connection: close to avoid UM keepalive hangs
 
 # Content controls
 PLACEHOLDER_IMAGE_URL  = os.environ.get("PLACEHOLDER_IMAGE_URL", "").strip()
@@ -139,12 +147,18 @@ def find_variant_by_sku_live(sku: str) -> Optional[Tuple[int, int]]:
 # -----------------------------------------------------------------------------
 def ok_txt(body: str = "OK"):
     # exact plain text + CRLF; UM can be picky about line endings
-    return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
+    resp = make_response(body + "\r\n")
+    resp.mimetype = "text/plain"
+    resp.charset = "windows-1252"
+    if CONNECTION_CLOSE:
+        resp.headers["Connection"] = "close"
+    # tiny content avoids client buffering stalls
+    resp.headers["Content-Length"] = str(len((body + "\\r\\n").encode("cp1252", errors="ignore")))
+    return resp
 
 def parse_um_xml(xml_text: str) -> List[Dict[str, Any]]:
     """Parse Uni Micro postproduct payload into list of dicts with fields:
     sku, title, price, compare_at, stock, vendor, group, cost, description (optional)
-    The XML structure can vary; we try multiple common tag names.
     """
     items: List[Dict[str, Any]] = []
     try:
@@ -209,7 +223,6 @@ def parse_um_xml(xml_text: str) -> List[Dict[str, Any]]:
             "description": desc,
         }
         items.append(item)
-        logging.info(f"PARSED sku={item['sku']} title='{item['title']}' price={item['price']} (src=price) compare_at={item['compare_at']} stock={item['stock']} reserved={item['reserved']} -> available={item['available']} vendor='{item['vendor']}' group='{item['group']}' cost={item['cost']} (src=None)")
     return items
 
 def ensure_product_images(product_id: int, sku: str):
@@ -324,7 +337,64 @@ def update_product(product_id: int, variant_id: int, item: Dict[str, Any]):
     ensure_product_images(product_id, item["sku"])
 
 # -----------------------------------------------------------------------------
-# Request logging
+# Async work queue
+# -----------------------------------------------------------------------------
+WORK_Q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+STATS = {"queued": 0, "updated": 0, "created": 0, "skipped_noop": 0, "skipped_cache_miss": 0, "dropped": 0}
+WORKERS: list[threading.Thread] = []
+
+def worker_loop(idx: int):
+    logging.info(f"Worker {idx} started")
+    while True:
+        item = WORK_Q.get()
+        if item is None:
+            logging.info(f"Worker {idx} stopping")
+            break
+        try:
+            if KILL_SWITCH:
+                STATS["skipped_noop"] += 1
+                continue
+
+            sku = (item.get("sku") or "").strip()
+            if not sku:
+                STATS["skipped_noop"] += 1
+                continue
+
+            ids = SKU_CACHE.get(sku) or find_variant_by_sku_live(sku)
+            if not ids:
+                if STRICT_UPDATE_ONLY or not ALLOW_CREATE:
+                    STATS["skipped_cache_miss"] += 1
+                    continue
+                created = create_product(item)
+                if created:
+                    STATS["created"] += 1
+                else:
+                    STATS["skipped_noop"] += 1
+                continue
+
+            product_id, variant_id = ids
+            update_product(product_id, variant_id, item)
+            STATS["updated"] += 1
+        except Exception as e:
+            logging.warning(f"Worker {idx} error: {e}")
+        finally:
+            WORK_Q.task_done()
+
+def start_workers(n: int):
+    global WORKERS
+    if WORKERS:
+        return
+    for i in range(n):
+        t = threading.Thread(target=worker_loop, args=(i+1,), daemon=True)
+        t.start()
+        WORKERS.append(t)
+
+def stop_workers():
+    for _ in WORKERS:
+        WORK_Q.put(None)
+
+# -----------------------------------------------------------------------------
+# Request logging & connection handling
 # -----------------------------------------------------------------------------
 @app.before_request
 def _log_every_request():
@@ -334,12 +404,34 @@ def _log_every_request():
     except Exception:
         pass
 
+@app.after_request
+def _after(resp):
+    if CONNECTION_CLOSE:
+        resp.headers["Connection"] = "close"
+    return resp
+
 # -----------------------------------------------------------------------------
 # Admin endpoints
 # -----------------------------------------------------------------------------
 @app.route("/admin/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "cache_size": len(SKU_CACHE), "strict_update_only": STRICT_UPDATE_ONLY, "allow_create": ALLOW_CREATE, "preload_cache": PRELOAD_SKU_CACHE, "kill_switch": KILL_SWITCH})
+    return jsonify({
+        "ok": True,
+        "cache_size": len(SKU_CACHE),
+        "strict_update_only": STRICT_UPDATE_ONLY,
+        "allow_create": ALLOW_CREATE,
+        "preload_cache": PRELOAD_SKU_CACHE,
+        "kill_switch": KILL_SWITCH,
+        "queued": STATS["queued"],
+        "updated": STATS["updated"],
+        "created": STATS["created"],
+        "skipped_noop": STATS["skipped_noop"],
+        "skipped_cache_miss": STATS["skipped_cache_miss"],
+        "dropped": STATS["dropped"],
+        "workers": len(WORKERS),
+        "queue_size": WORK_Q.qsize(),
+        "max_queue_size": MAX_QUEUE_SIZE,
+    })
 
 @app.route("/admin/refresh_sku_cache", methods=["POST", "GET"])
 def refresh_sku_cache():
@@ -384,71 +476,42 @@ def _maybe_decode_hex_body(raw: bytes) -> str:
         except:
             return raw.decode("utf-8", errors="replace")
 
-def _upsert_batch(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    metrics = {
-        "updated": 0,
-        "created": 0,
-        "skipped_noop": 0,
-        "skipped_cache_miss": 0,
-    }
-    if KILL_SWITCH:
-        logging.warning("KILL_SWITCH enabled: skipping all upserts in this batch.")
-        return metrics
-
-    for item in items:
-        sku = (item.get("sku") or "").strip()
-        if not sku:
-            logging.warning("Missing SKU -> skipping row")
-            metrics["skipped_noop"] += 1
-            continue
-
-        # Find variant by cache or live
-        ids = SKU_CACHE.get(sku)
-        if not ids:
-            ids = find_variant_by_sku_live(sku)
-
-        if not ids:
-            if STRICT_UPDATE_ONLY:
-                logging.warning(f"STRICT_UPDATE_ONLY: SKU '{sku}' not found after cache+live lookup. Skipping.")
-                metrics["skipped_cache_miss"] += 1
-                continue
-            if not ALLOW_CREATE:
-                logging.warning(f"CREATE disabled and SKU '{sku}' not found. Skipping.")
-                metrics["skipped_cache_miss"] += 1
-                continue
-            # create
-            created = create_product(item)
-            if created:
-                metrics["created"] += 1
-            else:
-                metrics["skipped_noop"] += 1
-            continue
-
-        # update
-        product_id, variant_id = ids
-        update_product(product_id, variant_id, item)
-        metrics["updated"] += 1
-
-    return metrics
+def enqueue_items(items: List[Dict[str, Any]]):
+    added = 0
+    for it in items:
+        try:
+            WORK_Q.put_nowait(it)
+            STATS["queued"] += 1
+            added += 1
+        except queue.Full:
+            STATS["dropped"] += 1
+            # We still ACK UM to avoid it freezing, but we record drops
+    return added
 
 @app.route("/twinxml/postproduct.asp", methods=["POST"])
 def postproduct():
-    # Acknowledge fast; UM often only needs "OK" to continue. But we will also process now.
-    # If you prefer to fully process before response, remove early OK and return at the end.
-    # Here we process synchronously to keep logs consistent with UM.
     raw = request.get_data(cache=False, as_text=False)
     text = _maybe_decode_hex_body(raw)
 
+    # Parse and queue
     items = parse_um_xml(text)
-    metrics = _upsert_batch(items)
-    logging.info(f"Upserted {len(items)} products (Shopify updated {metrics['updated']}, created {metrics['created']}, skipped no-ops {metrics['skipped_noop']}, skipped cache-miss {metrics['skipped_cache_miss']})")
+    added = enqueue_items(items)
+
+    qs = request.args.to_dict(flat=True)
+    last_flag = (qs.get("last", "") or "").lower() == "true"
+    total = qs.get("total")
+    sessionid = qs.get("sessionid")
+
+    logging.info(f"BATCH: queued {added}/{len(items)} items | queue={WORK_Q.qsize()}/{MAX_QUEUE_SIZE} | last={last_flag} total={total} session={sessionid}")
+
+    # If ACK-first mode, return immediately; workers will continue
+    # This avoids UM UI timeouts/freezes on very large uploads.
     return ok_txt("OK")
 
 # Explicitly stop any deleteproduct attempts (we don't support it)
 @app.route("/twinxml/postdeleteproduct.asp", methods=["POST", "GET"])
 def postdeleteproduct():
     logging.warning("DELETEPRODUCT received -> telling UM to stop (feature disabled).")
-    # Many UM TwinXML integrations stop on non-OK body. "STOP" is a gentle signal.
     return ok_txt("STOP")
 
 # Some UM variants use different path names; catch-all that rejects deletes safely.
@@ -458,15 +521,13 @@ def twinxml_catchall(subpath: str):
         logging.warning(f"DELETE route '{subpath}' -> STOP")
         return ok_txt("STOP")
     if "postproduct" in subpath.lower():
-        # fallback if routed here; reuse handler
         return postproduct()
-    # default OK for unknown probes
     return ok_txt("OK")
 
 # -----------------------------------------------------------------------------
 # Startup
 # -----------------------------------------------------------------------------
-if __name__ == "__main__":
+def boot():
     logging.info(f"Shopify domain: {SHOPIFY_DOMAIN} | API ver: {SHOPIFY_API_VER}")
     if PRELOAD_SKU_CACHE:
         try:
@@ -475,6 +536,9 @@ if __name__ == "__main__":
             logging.warning(f"CACHE WARMUP failed: {e}")
     else:
         log_cache_size("Startup (no warmup). Current SKU cache")
+    start_workers(WORKER_THREADS)
 
+if __name__ == "__main__":
+    boot()
     port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
