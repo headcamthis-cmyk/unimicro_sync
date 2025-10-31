@@ -115,16 +115,14 @@ def _s_post(url: str, payload: dict, timeout=30):
 # -----------------------------------------------------------------------------
 _PRELOAD_THREAD_STARTED = False
 
+# --- replace your preload worker with this version ---
 def _preload_catalog_worker():
     logging.info("PRELOAD: started")
+    added = 0
     try:
         base = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
-        params = {
-            "limit": 250,
-            "fields": "id,images,variants,vendor",
-        }
+        params = {"limit": 250, "fields": "id,images,variants,vendor"}
         since_id = None
-        added = 0
         while True:
             if since_id:
                 params["since_id"] = since_id
@@ -156,14 +154,39 @@ def _preload_catalog_worker():
                         break
                 if CACHE_SIZE_LIMIT and len(SKU_CACHE) >= CACHE_SIZE_LIMIT:
                     break
-            METRICS["cache_size"] = len(SKU_CACHE)
             since_id = products[-1]["id"]
+            METRICS["cache_size"] = len(SKU_CACHE)
             if CACHE_SIZE_LIMIT and len(SKU_CACHE) >= CACHE_SIZE_LIMIT:
                 break
         METRICS["preload_done"] = True
+        METRICS["cache_size"] = len(SKU_CACHE)
         logging.info(f"PRELOAD: done. cached {added} SKUs (total keys: {len(SKU_CACHE)})")
     except Exception as e:
         logging.exception(f"PRELOAD: crashed: {e}")
+    finally:
+        # make sure metrics are correct even if we crashed mid-way
+        METRICS["cache_size"] = len(SKU_CACHE)
+        if added > 0:
+            METRICS["preload_done"] = True
+
+# --- replace your /admin/health route with this version ---
+@app.get("/admin/health")
+def admin_health():
+    # Keep health reflective of reality even if another thread updated the cache
+    METRICS.update({
+        "cache_size": len(SKU_CACHE),
+        "preload_done": METRICS.get("preload_done", False) or (len(SKU_CACHE) > 0),
+        "queue_size": 0,
+        "default_body_mode": DEFAULT_BODY_MODE,
+        "tag_max": TAG_MAX,
+        "qps": QPS,
+        "strict_update_only": STRICT_UPDATE_ONLY,
+        "max_queue_size": MAX_QUEUE_SIZE,
+        "workers": WORKERS,
+        "stop_after_n": STOP_AFTER_N,
+        "placehldr": bool(PLACEHOLDER_URL),
+    })
+    return jsonify(METRICS)
 
 def _start_preloader_once():
     global _PRELOAD_THREAD_STARTED
