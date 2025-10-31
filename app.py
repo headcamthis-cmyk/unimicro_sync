@@ -1,632 +1,568 @@
 # app.py
-# Uni Micro -> Shopify updater (STRICT_UPDATE_ONLY)
-# - Exposes UM endpoints (.asp/.aspx/none) and always returns exact "OK\r\n" (windows-1252)
-# - Parses UM product payloads (hex XML tolerated), enqueues updates
-# - Background workers update Shopify: title, tags (generated), SEO (metafields), price, stock, placeholder image
-# - Alt text for placeholder = SKU
-# - Preloads SKU cache at boot to avoid "skipping" on existing products
-# - Flask 3 compatible (no before_first_request)
-
-import os, logging, time, re, json, html, threading, queue
+import os, logging, json, time, html, base64, re, threading
 from typing import Dict, Any, Optional, List, Tuple
 from flask import Flask, request, Response, jsonify
 import requests
 import xml.etree.ElementTree as ET
+from queue import Queue
 
-# ----------------------------------
-# App & logging
-# ----------------------------------
+# -----------------------------------------------------------------------------
+# Flask & logging
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s: %(message)s")
 
-# ----------------------------------
-# Env / Config (defaults are safe)
-# ----------------------------------
-SHOPIFY_DOMAIN      = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
-SHOPIFY_TOKEN       = os.environ.get("SHOPIFY_TOKEN", "")
-SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-SHOPIFY_LOC_ID      = os.environ.get("SHOPIFY_LOCATION_ID", "")  # inventory location id (string)
+# -----------------------------------------------------------------------------
+# ENV / Config
+# -----------------------------------------------------------------------------
+SHOPIFY_DOMAIN        = os.environ.get("SHOPIFY_DOMAIN", "allsupermotoas.myshopify.com")
+SHOPIFY_TOKEN         = os.environ.get("SHOPIFY_TOKEN")  # required
+SHOPIFY_API_VERSION   = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+SHOPIFY_LOCATION_ID   = os.environ.get("SHOPIFY_LOCATION_ID", "")   # required for inventory
 
-UNI_USER            = os.environ.get("UNI_USER", "synall")
-UNI_PASS            = os.environ.get("UNI_PASS", "synall")
+# Behavior toggles
+STRICT_UPDATE_ONLY    = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() == "true"
+ALLOW_CREATE          = os.environ.get("ALLOW_CREATE", "false").lower() == "true"  # ignored if STRICT_UPDATE_ONLY
+PRELOAD_CACHE         = os.environ.get("PRELOAD_CACHE", "true").lower() == "true"
+HYBRID_LOOKUP         = os.environ.get("HYBRID_LOOKUP", "true").lower() == "true"
+KILL_SWITCH_DEFAULT   = os.environ.get("KILL_SWITCH", "false").lower() == "true"
+DEFAULT_BODY_MODE     = os.environ.get("DEFAULT_BODY_MODE", "append").lower()  # "append" | "replace" | "skip"
+TAG_MAX               = int(os.environ.get("TAG_MAX", "8"))
+QPS                   = float(os.environ.get("QPS", "2"))
+STOP_AFTER_N          = int(os.environ.get("STOP_AFTER_N", "0"))  # 0 = unlimited
+MAX_QUEUE_SIZE        = int(os.environ.get("MAX_QUEUE_SIZE", "8000"))
+WORKERS               = int(os.environ.get("WORKER_THREADS", str(os.cpu_count() or 4)))
+CACHE_SIZE_LIMIT      = int(os.environ.get("CACHE_SIZE_LIMIT", "0"))  # 0 = unlimited
 
-# Behavior
-STRICT_UPDATE_ONLY  = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() == "true"
-PRELOAD_SKU_CACHE   = os.environ.get("PRELOAD_SKU_CACHE", "true").lower() == "true"
-WORKER_THREADS      = int(os.environ.get("WORKER_THREADS", "4"))
-MAX_QUEUE_SIZE      = int(os.environ.get("MAX_QUEUE_SIZE", "5000"))
-STOP_AFTER_N        = int(os.environ.get("STOP_AFTER_N", "0"))   # 0 = unlimited
-QPS                 = float(os.environ.get("QPS", "1.6"))        # total API calls per second (soft rate)
-KILL_SWITCH_DEFAULT = os.environ.get("KILL_SWITCH", "false").lower() == "true"
+# Placeholder image
+PLACEHOLDER_URL       = os.environ.get("PLACEHOLDER_URL", "").strip()  # public URL to a PNG/JPG
+PLACEHOLDER_ALT_MODE  = os.environ.get("PLACEHOLDER_ALT_MODE", "sku")  # "sku" | "const"
+PLACEHOLDER_ALT_CONST = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
 
-# Content
-DEFAULT_VENDOR      = os.environ.get("DEFAULT_VENDOR", "Ukjent leverandør")
-DEFAULT_SEO_DESC    = os.environ.get("DEFAULT_SEO_DESC", "AllSupermoto AS – originale deler og tilbehør.")
-DEFAULT_BODY_HTML   = os.environ.get("DEFAULT_BODY_HTML", "<p>Originale deler fra ASM.</p>")
-DEFAULT_BODY_MODE   = os.environ.get("DEFAULT_BODY_MODE", "fallback")  # fallback|replace|append
-TAG_MAX             = int(os.environ.get("TAG_MAX", "8"))
-PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL", "").strip()
+# SEO
+SEO_TITLE_PREFIX      = os.environ.get("SEO_TITLE_PREFIX", "")
+SEO_TITLE_SUFFIX      = os.environ.get("SEO_TITLE_SUFFIX", " | AllSupermoto AS")
+SEO_DESC_SUFFIX       = os.environ.get("SEO_DESC_SUFFIX", "")
 
-# Admin
-ADMIN_TOKEN         = os.environ.get("ADMIN_TOKEN", "")  # optional for /admin/toggle etc.
+# Safety
+if not SHOPIFY_TOKEN:
+    logging.warning("SHOPIFY_TOKEN is missing - Shopify calls will fail.")
 
-# Network
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "ASM-UniMicro-Sync/1.0",
-    "X-Shopify-Access-Token": SHOPIFY_TOKEN
-})
-
-# ----------------------------------
-# Globals (state)
-# ----------------------------------
-task_q: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_QUEUE_SIZE)
-metrics = {
+# -----------------------------------------------------------------------------
+# Globals / Metrics
+# -----------------------------------------------------------------------------
+METRICS: Dict[str, Any] = {
+    "ok": True,
+    "queue_size": 0,
     "queued": 0,
-    "dropped": 0,
     "updated": 0,
-    "skipped_noop": 0,
+    "dropped": 0,
     "skipped_cache_miss": 0,
-    "workers": 0,
-    "preload_done": False,
+    "skipped_noop": 0,
     "cache_size": 0,
+    "preload_done": False,
+    "placehldr": bool(PLACEHOLDER_URL),
+    "default_body_mode": DEFAULT_BODY_MODE,
+    "tag_max": TAG_MAX,
+    "qps": QPS,
+    "strict_update_only": STRICT_UPDATE_ONLY,
+    "max_queue_size": MAX_QUEUE_SIZE,
+    "workers": WORKERS,
+    "stop_after_n": STOP_AFTER_N,
 }
-kill_switch = KILL_SWITCH_DEFAULT
-accept_counter = 0
-_started = False
 
-# SKU -> (product_id, variant_id, inventory_item_id, has_product_image:bool)
-SKU_CACHE: Dict[str, Tuple[int, int, int, bool]] = {}
+KILL_SWITCH = KILL_SWITCH_DEFAULT
 
-# ----------------------------------
-# Helpers
-# ----------------------------------
-def um_ok():
-    return Response("OK\r\n", mimetype="text/plain; charset=windows-1252")
+# SKU cache: sku -> (product_id, variant_id, inventory_item_id, has_image, product_vendor)
+SKU_CACHE: Dict[str, Tuple[str, str, str, bool, str]] = {}
 
-def _log_um_request(tag: str):
+# Rate limiter (global)
+_next_call = 0.0
+_rate_lock = threading.Lock()
+
+def _ratelimit():
+    global _next_call
+    with _rate_lock:
+        now = time.time()
+        wait = _next_call - now
+        if wait > 0:
+            time.sleep(wait)
+        _next_call = max(now, _next_call) + 1.0 / max(QPS, 0.1)
+
+# HTTP helpers
+def _shopify_headers():
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN or "",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+def _s_get(url: str, params: Optional[dict]=None, timeout=30):
+    _ratelimit()
+    return requests.get(url, headers=_shopify_headers(), params=params or {}, timeout=timeout)
+
+def _s_put(url: str, payload: dict, timeout=30):
+    _ratelimit()
+    return requests.put(url, headers=_shopify_headers(), data=json.dumps(payload), timeout=timeout)
+
+def _s_post(url: str, payload: dict, timeout=30):
+    _ratelimit()
+    return requests.post(url, headers=_shopify_headers(), data=json.dumps(payload), timeout=timeout)
+
+# -----------------------------------------------------------------------------
+# Preload Catalog on Startup (Flask 3 safe)
+# -----------------------------------------------------------------------------
+_PRELOAD_THREAD_STARTED = False
+
+def _preload_catalog_worker():
+    logging.info("PRELOAD: started")
     try:
-        raw = request.get_data(cache=True) or b""
-        logging.info(f"{tag}: method={request.method} len={len(raw)} ct={request.headers.get('Content-Type','-')}")
+        base = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
+        params = {
+            "limit": 250,
+            "fields": "id,images,variants,vendor",
+        }
+        since_id = None
+        added = 0
+        while True:
+            if since_id:
+                params["since_id"] = since_id
+            resp = _s_get(base, params=params)
+            if resp.status_code != 200:
+                logging.warning(f"PRELOAD: GET products failed {resp.status_code} {resp.text[:300]}")
+                break
+            data = resp.json() or {}
+            products = data.get("products", [])
+            if not products:
+                break
+            for p in products:
+                pid = str(p["id"])
+                has_image = bool(p.get("images"))
+                vendor = (p.get("vendor") or "").strip()
+                for v in (p.get("variants") or []):
+                    sku = (v.get("sku") or "").strip()
+                    if not sku:
+                        continue
+                    SKU_CACHE[sku] = (
+                        pid,
+                        str(v["id"]),
+                        str(v["inventory_item_id"]),
+                        has_image,
+                        vendor,
+                    )
+                    added += 1
+                    if CACHE_SIZE_LIMIT and len(SKU_CACHE) >= CACHE_SIZE_LIMIT:
+                        break
+                if CACHE_SIZE_LIMIT and len(SKU_CACHE) >= CACHE_SIZE_LIMIT:
+                    break
+            METRICS["cache_size"] = len(SKU_CACHE)
+            since_id = products[-1]["id"]
+            if CACHE_SIZE_LIMIT and len(SKU_CACHE) >= CACHE_SIZE_LIMIT:
+                break
+        METRICS["preload_done"] = True
+        logging.info(f"PRELOAD: done. cached {added} SKUs (total keys: {len(SKU_CACHE)})")
     except Exception as e:
-        logging.warning(f"{tag}: failed to log body: {e}")
+        logging.exception(f"PRELOAD: crashed: {e}")
 
-def _sleep_for_rate():
-    # Basic soft rate-limit: sleep 1/QPS between calls
-    if QPS > 0:
-        time.sleep(max(0.0, 1.0 / QPS))
+def _start_preloader_once():
+    global _PRELOAD_THREAD_STARTED
+    if _PRELOAD_THREAD_STARTED or not PRELOAD_CACHE:
+        return
+    _PRELOAD_THREAD_STARTED = True
+    t = threading.Thread(target=_preload_catalog_worker, name="sku-preload", daemon=True)
+    t.start()
 
-def shopify_path(path: str) -> str:
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"https://{SHOPIFY_DOMAIN}{path}"
+# Start immediately on import
+_start_preloader_once()
 
-def sreq(method: str, path: str, json_body: Optional[dict]=None, params: Optional[dict]=None) -> requests.Response:
-    url = shopify_path(path)
-    for attempt in range(3):
-        try:
-            _sleep_for_rate()
-            resp = SESSION.request(method, url, json=json_body, params=params, timeout=30)
-            if resp.status_code in (429, 430, 520, 521, 522, 523, 524):
-                # Rate/edge retry
-                retry_after = int(resp.headers.get("Retry-After", "1"))
-                time.sleep(min(5, retry_after))
-                continue
-            return resp
-        except requests.RequestException as e:
-            logging.warning(f"Shopify request error {method} {path}: {e}; retry {attempt+1}/3")
-            time.sleep(1.0 + attempt)
-    return resp  # last
-
-def parse_link_next(link_header: str) -> Optional[str]:
-    # Parse Shopify Link header for page_info rel="next"
-    # Example: <https://.../products.json?limit=250&page_info=abcd>; rel="next"
-    if not link_header:
-        return None
-    for part in link_header.split(","):
-        part = part.strip()
-        if 'rel="next"' in part:
-            m = re.search(r'<([^>]+)>', part)
-            if m:
-                url = m.group(1)
-                m2 = re.search(r'[?&]page_info=([^&]+)', url)
-                if m2:
-                    return m2.group(1)
-    return None
-
-def text_of(node: ET.Element, names: List[str]) -> Optional[str]:
-    names_l = [n.lower() for n in names]
-    for child in list(node):
-        tag = child.tag.split("}")[-1].lower()
-        if tag in names_l:
-            val = (child.text or "").strip()
-            if val != "":
-                return val
-    # also check attributes by names
-    for k, v in node.attrib.items():
-        if k.lower() in names_l and v:
-            return v.strip()
-    return None
-
-def to_float(s: Optional[str]) -> Optional[float]:
-    if not s:
-        return None
+def _search_variant_by_sku(sku: str) -> Optional[Tuple[str, str, str, bool, str]]:
+    """Search small page for this SKU to avoid skips while preload happens."""
     try:
-        # normalize comma/space
-        s2 = s.replace(" ", "").replace(",", ".")
-        return float(s2)
-    except:
-        return None
-
-def to_int(s: Optional[str]) -> Optional[int]:
-    if s is None:
-        return None
-    try:
-        return int(float(s))
-    except:
-        try:
-            return int(s)
-        except:
+        url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
+        # No native sku: filter in REST; fetch a few and match in app
+        params = {"limit": 50, "fields": "id,images,variants,vendor"}
+        r = _s_get(url, params=params)
+        if r.status_code != 200:
             return None
+        for p in (r.json() or {}).get("products", []):
+            has_image = bool(p.get("images"))
+            vendor = (p.get("vendor") or "").strip()
+            for v in (p.get("variants") or []):
+                if (v.get("sku") or "").strip() == sku:
+                    return (str(p["id"]), str(v["id"]), str(v["inventory_item_id"]), has_image, vendor)
+    except Exception:
+        logging.exception(f"Hybrid lookup error for {sku}")
+    return None
 
-def clean_tags(s: str) -> List[str]:
-    # Simple tag generator: from title + vendor words (letters/digits only), length limit
-    words = re.split(r"[^0-9a-zA-ZæøåÆØÅ]+", s)
-    uniq = []
-    for w in words:
-        w = w.strip()
-        if not w:
-            continue
-        if len(w) < 2:
-            continue
-        if w not in uniq:
-            uniq.append(w)
-        if len(uniq) >= TAG_MAX:
-            break
-    return uniq
+def resolve_sku(sku: str) -> Optional[Tuple[str, str, str, bool, str]]:
+    row = SKU_CACHE.get(sku)
+    if row:
+        return row
+    if HYBRID_LOOKUP:
+        found = _search_variant_by_sku(sku)
+        if found:
+            SKU_CACHE[sku] = found
+            METRICS["cache_size"] = len(SKU_CACHE)
+            return found
+    METRICS["skipped_cache_miss"] = METRICS.get("skipped_cache_miss", 0) + 1
+    return None
 
-def ensure_seo(product_id: int, seo_title: str, seo_desc: str):
-    # Metafields: namespace=global keys=title_tag/description_tag
-    body = {
-        "metafield": {
-            "namespace": "global",
-            "key": "title_tag",
-            "type": "single_line_text_field",
-            "value": seo_title[:70]  # Google displays ~60-70 chars
-        }
-    }
-    r1 = sreq("POST", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json", json_body=body)
-    if r1.status_code == 422:
-        # Maybe exists -> update via PUT after fetching id
-        mf = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json",
-                  params={"namespace":"global","key":"title_tag"})
-        if mf.ok:
-            arr = mf.json().get("metafields", [])
-            if arr:
-                mid = arr[0]["id"]
-                sreq("PUT", f"/admin/api/{SHOPIFY_API_VERSION}/metafields/{mid}.json",
-                     json_body={"metafield":{"id": mid, "value": seo_title[:70]}})
-    # description
-    body2 = {
-        "metafield": {
-            "namespace": "global",
-            "key": "description_tag",
-            "type": "single_line_text_field",
-            "value": seo_desc[:320]
-        }
-    }
-    r2 = sreq("POST", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json", json_body=body2)
-    if r2.status_code == 422:
-        mf = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/metafields.json",
-                  params={"namespace":"global","key":"description_tag"})
-        if mf.ok:
-            arr = mf.json().get("metafields", [])
-            if arr:
-                mid = arr[0]["id"]
-                sreq("PUT", f"/admin/api/{SHOPIFY_API_VERSION}/metafields/{mid}.json",
-                     json_body={"metafield":{"id": mid, "value": seo_desc[:320]}})
+# -----------------------------------------------------------------------------
+# Utils: XML parsing & helpers
+# -----------------------------------------------------------------------------
+def _ok_txt(body="OK"):
+    # Uni can be picky about line endings
+    return Response(body + "\r\n", mimetype="text/plain; charset=windows-1252")
 
-def ensure_placeholder_image(product_id: int, has_image: bool, sku: str):
-    if has_image:
-        return
-    if not PLACEHOLDER_IMAGE_URL:
-        return
-    body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "alt": sku}}
-    r = sreq("POST", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/images.json", json_body=body)
-    if not r.ok:
-        logging.warning(f"image add failed pid={product_id} status={r.status_code} {r.text}")
-
-def set_inventory(inventory_item_id: int, available: int):
-    if not SHOPIFY_LOC_ID:
-        return
-    body = {"location_id": int(SHOPIFY_LOC_ID), "inventory_item_id": inventory_item_id, "available": int(max(0, available))}
-    r = sreq("POST", f"/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json", json_body=body)
-    if not r.ok:
-        logging.warning(f"inventory set failed item={inventory_item_id} status={r.status_code} {r.text}")
-
-def update_variant_price(variant_id: int, price: Optional[float]):
-    if price is None:
-        return
-    body = {"variant": {"id": variant_id, "price": round(price, 2)}}
-    r = sreq("PUT", f"/admin/api/{SHOPIFY_API_VERSION}/variants/{variant_id}.json", json_body=body)
-    if not r.ok:
-        logging.warning(f"price update failed vid={variant_id} status={r.status_code} {r.text}")
-
-def update_product_fields(product_id: int, title: Optional[str], tags: List[str], body_html_mode: str, body_html_default: str):
-    payload: Dict[str, Any] = {"id": product_id}
-    if title:
-        payload["title"] = title[:255]
-    tag_string = ",".join(tags) if tags else None
-
-    # body_html handling
-    body_html_to_set: Optional[str] = None
-    if body_html_mode == "replace":
-        body_html_to_set = body_html_default
-    elif body_html_mode == "append":
-        # need current body to append
-        r = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json", params={"fields":"id,body_html,tags"})
-        if r.ok:
-            cur = r.json().get("product", {})
-            cur_body = cur.get("body_html") or ""
-            cur_tags = cur.get("tags") or ""
-            if tag_string:
-                # Merge tags with existing
-                merged = set([t.strip() for t in cur_tags.split(",") if t.strip()])
-                for t in tags:
-                    merged.add(t)
-                tag_string = ",".join(sorted(merged))
-            body_html_to_set = (cur_body or "") + body_html_default
-        else:
-            body_html_to_set = body_html_default
-    else:  # fallback
-        # only set if empty (one GET required to check)
-        r = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json", params={"fields":"id,body_html,tags"})
-        if r.ok:
-            cur = r.json().get("product", {})
-            cur_body = cur.get("body_html")
-            cur_tags = cur.get("tags") or ""
-            if not cur_body:
-                body_html_to_set = body_html_default
-            # Merge tags with existing
-            if tag_string:
-                merged = set([t.strip() for t in cur_tags.split(",") if t.strip()])
-                for t in tags:
-                    merged.add(t)
-                tag_string = ",".join(sorted(merged))
-        else:
-            # on failure, do minimal update without body
-            pass
-
-    if body_html_to_set is not None:
-        payload["body_html"] = body_html_to_set
-
-    if tag_string is not None:
-        payload["tags"] = tag_string
-
-    r2 = sreq("PUT", f"/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json", json_body={"product": payload})
-    if not r2.ok:
-        logging.warning(f"product update failed pid={product_id} status={r2.status_code} {r2.text}")
-
-def preload_sku_cache():
-    global SKU_CACHE
-    if not SHOPIFY_TOKEN:
-        logging.warning("No SHOPIFY_TOKEN set; cannot preload cache.")
-        return
-    logging.info("Preloading SKU cache from Shopify...")
-    params = {"limit": 250, "fields": "id,variants,image,vendor"}
-    next_page = None
-    while True:
-        if next_page:
-            params = {"limit": 250, "fields": "id,variants,image,vendor", "page_info": next_page}
-        r = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products.json", params=params)
-        if not r.ok:
-            logging.warning(f"preload failed status={r.status_code} {r.text}")
-            break
-        data = r.json().get("products", [])
-        for p in data:
-            pid = int(p["id"])
-            has_img = bool(p.get("image"))
-            for v in p.get("variants", []):
-                sku = (v.get("sku") or "").strip()
-                if not sku:
-                    continue
-                vid = int(v["id"])
-                inv_item = int(v.get("inventory_item_id") or 0)
-                SKU_CACHE[sku] = (pid, vid, inv_item, has_img)
-        metrics["cache_size"] = len(SKU_CACHE)
-        next_page = parse_link_next(r.headers.get("Link", ""))
-        if not next_page:
-            break
-    metrics["preload_done"] = True
-    logging.info(f"Preload complete. Variants cached: {len(SKU_CACHE)}")
-
-# ----------------------------------
-# Payload parsing (UM XML, hex tolerated)
-# ----------------------------------
-def decode_um_payload(raw: bytes, hex_flag: bool) -> bytes:
-    if hex_flag:
+def _decode_body(req: request) -> bytes:
+    raw = req.data or b""
+    if not raw:
+        return raw
+    # Some Uni payloads come as hex=true query param
+    if request.args.get("hex", "false").lower() == "true":
         try:
-            # UM sends lowercase hex sometimes
-            return bytes.fromhex(raw.decode("ascii"))
-        except Exception as e:
-            logging.warning(f"hex decode failed: {e}")
-            return raw
+            raw = bytes.fromhex(raw.decode("ascii"))
+        except Exception:
+            logging.warning("HEX decode failed, using raw body.")
     return raw
 
-def parse_um_products(raw_xml: bytes) -> List[dict]:
-    items: List[dict] = []
+def _parse_products_xml(xml_bytes: bytes) -> List[Dict[str, Any]]:
+    """Parse minimal fields from Uni 'postproduct.asp' XML."""
+    out = []
+    if not xml_bytes:
+        return out
     try:
-        root = ET.fromstring(raw_xml)
-    except ET.ParseError as e:
-        # try to salvage by stripping BOM or odd chars
-        raw2 = raw_xml.strip()
-        try:
-            root = ET.fromstring(raw2)
-        except Exception as e2:
-            logging.warning(f"XML parse failed: {e}; second try: {e2}")
-            return items
-
-    # Heuristic: find nodes that look like "product"
-    candidates = []
-    for node in root.iter():
-        tag = node.tag.split("}")[-1].lower()
-        if tag in ("product","item","varerow","row","linje","vare","produkt"):
-            # very likely product nodes
-            candidates.append(node)
-
-    if not candidates:
-        # fallback: use direct children
-        candidates = list(root)
-
-    for n in candidates:
-        sku = text_of(n, ["sku","itemno","varenr","varenummer","artnr","partno","productno","productid","externalid"])
-        title = text_of(n, ["title","name","productname","varenavn","beskrivelse","description"])
-        price = to_float(text_of(n, ["price","unitprice","listprice","pris","salgspris","grossprice"]))
-        stock = to_int(text_of(n, ["stock","qty","quantity","onhand","lager","bestand","antall"]))
-        reserved = to_int(text_of(n, ["reserved","alloc","allocated","reservert","res"]))
-        vendor = text_of(n, ["vendor","brand","leverandor","manufacturer","produsent","mfr"])
-        group  = text_of(n, ["group","productgroup","gruppe","kategori","categoryid"])
-
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        logging.exception(f"XML parse failed: {e}")
+        return out
+    for item in root.findall(".//product"):
+        sku = (item.findtext("sku") or "").strip()
         if not sku:
             continue
-
-        items.append({
-            "sku": sku.strip(),
-            "title": (title or "").strip(),
-            "price": price,
-            "stock": stock or 0,
-            "reserved": reserved or 0,
-            "vendor": (vendor or "").strip(),
-            "group": (group or "").strip()
+        title = (item.findtext("title") or "").strip()
+        price = _to_float(item.findtext("price"))
+        compare_at = _to_float(item.findtext("compare_at"))
+        stock = _to_int(item.findtext("stock"))
+        reserved = _to_int(item.findtext("reserved"))
+        vendor = (item.findtext("vendor") or "").strip()
+        group = (item.findtext("group") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        available = max(0, stock - reserved)
+        out.append({
+            "sku": sku, "title": title, "price": price, "compare_at": compare_at,
+            "available": available, "vendor": vendor, "group": group, "desc": desc
         })
-    return items
+    return out
 
-# ----------------------------------
-# Worker logic
-# ----------------------------------
-def process_product_update(it: dict):
-    sku = it.get("sku")
-    if not sku:
-        return
-    entry = SKU_CACHE.get(sku)
-    if not entry:
-        if STRICT_UPDATE_ONLY:
-            metrics["skipped_cache_miss"] += 1
-            logging.warning(f"STRICT_UPDATE_ONLY: SKU '{sku}' not found in cache. Skipping.")
-            return
-        else:
-            # Optional: on-demand lookup by SKU (slow). We won't create anyway.
-            r = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/variants.json", params={"sku": sku})
-            if r.ok:
-                arr = r.json().get("variants", [])
-                if arr:
-                    v = arr[0]
-                    pid = int(v["product_id"])
-                    vid = int(v["id"])
-                    inv = int(v.get("inventory_item_id") or 0)
-                    # fetch product image presence quickly
-                    rp = sreq("GET", f"/admin/api/{SHOPIFY_API_VERSION}/products/{pid}.json", params={"fields":"id,image"})
-                    has_img = False
-                    if rp.ok:
-                        has_img = bool(rp.json().get("product", {}).get("image"))
-                    SKU_CACHE[sku] = (pid, vid, inv, has_img)
-                    entry = SKU_CACHE[sku]
-            if not entry:
-                metrics["skipped_cache_miss"] += 1
-                logging.warning(f"Lookup by SKU failed: '{sku}'. Skipping.")
-                return
-
-    pid, vid, inv_item, has_img = entry
-    title = it.get("title") or None
-    vendor = it.get("vendor") or DEFAULT_VENDOR
-    group  = it.get("group") or ""
-    price  = it.get("price")
-    stock  = max(0, int(it.get("stock") or 0) - int(it.get("reserved") or 0))
-
-    # Tags (self-generated)
-    tag_source = f"{vendor} {group} {title or ''}"
-    tags = clean_tags(tag_source)
-
-    # SEO
-    seo_title = f"{vendor} - {(title or sku)[:55]} | {sku} | AllSupermoto AS"
-    seo_desc  = f"{DEFAULT_SEO_DESC} {title or ''}".strip()
-
-    # 1) product title/tags/body
-    update_product_fields(pid, title, tags, DEFAULT_BODY_MODE, DEFAULT_BODY_HTML)
-
-    # 2) SEO metafields
-    ensure_seo(pid, seo_title, seo_desc)
-
-    # 3) Price (variant)
-    update_variant_price(vid, price)
-
-    # 4) Inventory
-    set_inventory(inv_item, stock)
-
-    # 5) Placeholder image if product has none
-    ensure_placeholder_image(pid, has_img, sku)
-
-    # Local flag: if we added image, mark product as having one to avoid re-adding
-    if not has_img and PLACEHOLDER_IMAGE_URL:
-        SKU_CACHE[sku] = (pid, vid, inv_item, True)
-
-    metrics["updated"] += 1
-    logging.info(f"UPDATED sku={sku} pid={pid} vid={vid} price={price} stock={stock} tags={len(tags)}")
-
-def worker_loop(idx: int):
-    while True:
-        it = task_q.get()
-        if it is None:
-            break
-        try:
-            process_product_update(it)
-        except Exception as e:
-            logging.exception(f"worker {idx} error: {e}")
-        finally:
-            task_q.task_done()
-
-def start_workers():
-    global _started
-    if _started:
-        return
-    _started = True
-    # Preload cache
-    if PRELOAD_SKU_CACHE:
-        threading.Thread(target=preload_sku_cache, daemon=True).start()
-    # Workers
-    for i in range(max(1, WORKER_THREADS)):
-        threading.Thread(target=worker_loop, args=(i+1,), daemon=True).start()
-        metrics["workers"] += 1
-    logging.info(f"Workers started: {metrics['workers']} / queue size {MAX_QUEUE_SIZE}")
-
-# Start immediately on import (Flask 3 safe under gunicorn worker)
-start_workers()
-
-# ----------------------------------
-# UM Routes (asp/aspx/none) with exact OK\r\n
-# ----------------------------------
-@app.route("/twinxml/postproductgroup", methods=["GET","POST"])
-@app.route("/twinxml/postproductgroup.asp", methods=["GET","POST"])
-@app.route("/twinxml/postproductgroup.aspx", methods=["GET","POST"])
-def um_postproductgroup():
-    _log_um_request("UM postproductgroup")
-    # We don't parse here; UM only needs OK
-    return um_ok()
-
-@app.route("/twinxml/orders", methods=["GET","POST"])
-@app.route("/twinxml/orders.asp", methods=["GET","POST"])
-@app.route("/twinxml/orders.aspx", methods=["GET","POST"])
-def um_orders():
-    _log_um_request("UM orders")
-    return um_ok()
-
-@app.route("/twinxml/postproduct", methods=["GET","POST"])
-@app.route("/twinxml/postproduct.asp", methods=["GET","POST"])
-@app.route("/twinxml/postproduct.aspx", methods=["GET","POST"])
-def um_postproduct():
-    global accept_counter
-    _log_um_request("UM postproduct")
-    # ACK immediately
-    resp = um_ok()
-
-    # Drop if kill switch
-    if kill_switch:
-        logging.warning("KILL_SWITCH active: dropping incoming postproduct payload.")
-        return resp
-
-    # Decode & parse asynchronously
+def _to_float(x: Optional[str]) -> Optional[float]:
+    if x is None:
+        return None
     try:
-        raw = request.get_data(cache=True) or b""
-        hex_flag = (request.args.get("hex","false").lower() == "true")
-        decoded = decode_um_payload(raw, hex_flag)
-        items = parse_um_products(decoded)
-        for it in items:
-            if STOP_AFTER_N and accept_counter >= STOP_AFTER_N:
-                break
-            try:
-                task_q.put_nowait(it)
-                accept_counter += 1
-                metrics["queued"] += 1
-            except queue.Full:
-                metrics["dropped"] += 1
-                logging.warning("Queue full; dropping item.")
-        logging.info(f"Enqueued {len(items)} items (accepted_total={accept_counter})")
-    except Exception as e:
-        logging.exception(f"failed to parse/enqueue: {e}")
-    return resp
-
-# Ensure exact headers for UM responses
-@app.after_request
-def _after(resp):
-    if request.path.startswith("/twinxml/"):
-        resp.headers["Connection"] = "close"
-        resp.headers["Content-Type"] = "text/plain; charset=windows-1252"
-    return resp
-
-# ----------------------------------
-# Admin / health
-# ----------------------------------
-@app.route("/admin/health")
-def admin_health():
-    state = {
-        "ok": True,
-        "strict_update_only": STRICT_UPDATE_ONLY,
-        "preload_cache": PRELOAD_SKU_CACHE,
-        "cache_size": metrics["cache_size"],
-        "preload_done": metrics["preload_done"],
-        "workers": metrics["workers"],
-        "queue_size": task_q.qsize(),
-        "queued": metrics["queued"],
-        "dropped": metrics["dropped"],
-        "updated": metrics["updated"],
-        "skipped_noop": metrics["skipped_noop"],
-        "skipped_cache_miss": metrics["skipped_cache_miss"],
-        "qps": QPS,
-        "tag_max": TAG_MAX,
-        "default_body_mode": DEFAULT_BODY_MODE,
-        "kill_switch": kill_switch,
-        "stop_after_n": STOP_AFTER_N,
-        "max_queue_size": MAX_QUEUE_SIZE,
-        "placehldr": bool(PLACEHOLDER_IMAGE_URL),
-    }
-    return jsonify(state)
-
-def _admin_auth_ok(req) -> bool:
-    if not ADMIN_TOKEN:
-        return True
-    return (req.args.get("token") == ADMIN_TOKEN)
-
-@app.route("/admin/toggle_kill")
-def admin_toggle_kill():
-    global kill_switch
-    if not _admin_auth_ok(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 403
-    v = request.args.get("on")
-    if v is not None:
-        kill_switch = (v.lower() in ("1","true","yes","on"))
-    else:
-        kill_switch = not kill_switch
-    return jsonify({"ok": True, "kill_switch": kill_switch})
-
-@app.route("/admin/set_stop")
-def admin_set_stop():
-    global STOP_AFTER_N
-    if not _admin_auth_ok(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 403
-    try:
-        STOP_AFTER_N = int(request.args.get("n","0"))
+        # handle both "," and "." decimals
+        return float(str(x).replace(",", "."))
     except:
-        STOP_AFTER_N = 0
-    return jsonify({"ok": True, "stop_after_n": STOP_AFTER_N})
+        return None
 
-# Root 404 (Render health ping may hit /)
+def _to_int(x: Optional[str]) -> int:
+    if x is None:
+        return 0
+    try:
+        return int(float(str(x).replace(",", ".")))
+    except:
+        return 0
+
+def _gen_tags(row: Dict[str, Any]) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9\-]+", (row.get("title") or "") + " " + (row.get("group") or ""))
+    tags = []
+    seen = set()
+    for t in tokens:
+        t = t.upper()
+        if t in seen: continue
+        seen.add(t)
+        tags.append(t)
+        if len(tags) >= TAG_MAX:
+            break
+    # include vendor if present
+    v = (row.get("vendor") or "").strip()
+    if v and v.upper() not in seen and len(tags) < TAG_MAX:
+        tags.append(v.upper())
+    return tags
+
+def _seo_title(title: str, vendor: str, sku: str) -> str:
+    base = title.strip() if title else sku
+    pieces = [SEO_TITLE_PREFIX, (vendor or "Ukjent leverandør"), base, SEO_TITLE_SUFFIX]
+    return " ".join([p for p in pieces if p]).strip()
+
+def _seo_desc(title: str, sku: str) -> str:
+    base = f"{title} | {sku}".strip(" |")
+    if SEO_DESC_SUFFIX:
+        base = f"{base} {SEO_DESC_SUFFIX}"
+    # Shopify truncates ~320 chars
+    return base[:300]
+
+def _placeholder_alt(sku: str) -> str:
+    if PLACEHOLDER_ALT_MODE == "sku":
+        return sku
+    return PLACEHOLDER_ALT_CONST
+
+# -----------------------------------------------------------------------------
+# Shopify updaters
+# -----------------------------------------------------------------------------
+def update_product(row: Dict[str, Any]) -> bool:
+    """
+    Updates a product strictly by existing SKU.
+    - title, vendor
+    - price (first variant)
+    - inventory level
+    - tags
+    - SEO title/description
+    - body_html append/replace/skip
+    - add placeholder image if product has none
+    Returns True if Shopify was updated, False if skipped.
+    """
+    sku = row["sku"]
+    found = resolve_sku(sku)
+    if not found:
+        if STRICT_UPDATE_ONLY:
+            logging.warning(f"STRICT_UPDATE_ONLY: SKU '{sku}' not found. Skipping.")
+            return False
+        if not ALLOW_CREATE:
+            logging.warning(f"CREATE disabled and SKU '{sku}' missing. Skipping.")
+            return False
+        # Not creating by request
+        return False
+
+    product_id, variant_id, inventory_item_id, has_image, vendor_cached = found
+    # Title & vendor
+    title = row.get("title") or sku
+    vendor = (row.get("vendor") or vendor_cached or "").strip()
+    tags = _gen_tags(row)
+
+    # Build product update payload
+    product_payload = {
+        "product": {
+            "id": product_id,
+            "title": title,
+            "vendor": vendor,
+            "tags": ", ".join(tags),
+            # SEO fields
+            "metafields_global_title_tag": _seo_title(title, vendor, sku),
+            "metafields_global_description_tag": _seo_desc(title, sku),
+        }
+    }
+
+    # Description policy
+    desc = (row.get("desc") or "").strip()
+    if desc:
+        if DEFAULT_BODY_MODE == "replace":
+            product_payload["product"]["body_html"] = desc
+        elif DEFAULT_BODY_MODE == "append":
+            # Get existing to append safely
+            try:
+                purl = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json"
+                pr = _s_get(purl, params={"fields": "id,body_html"})
+                if pr.status_code == 200:
+                    cur = (pr.json().get("product", {}) or {}).get("body_html") or ""
+                    if desc not in (cur or ""):
+                        joined = (cur or "") + (("<br/>" if cur else "") + desc)
+                        product_payload["product"]["body_html"] = joined
+                else:
+                    # fallback set
+                    product_payload["product"]["body_html"] = desc
+            except Exception:
+                product_payload["product"]["body_html"] = desc
+        else:
+            # skip
+            pass
+
+    # Send product update
+    purl = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json"
+    pr = _s_put(purl, product_payload)
+    if pr.status_code not in (200):
+        logging.warning(f"Product update failed SKU {sku}: {pr.status_code} {pr.text[:300]}")
+
+    # Price (variant)
+    price = row.get("price")
+    compare_at = row.get("compare_at")
+    var_changed = False
+    if price is not None or compare_at is not None:
+        vurl = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/variants/{variant_id}.json"
+        vp = {"variant": { "id": int(variant_id) }}
+        if price is not None:
+            vp["variant"]["price"] = round(float(price), 2)
+            var_changed = True
+        if compare_at is not None and compare_at > 0:
+            vp["variant"]["compare_at_price"] = round(float(compare_at), 2)
+            var_changed = True
+        if var_changed:
+            vr = _s_put(vurl, vp)
+            if vr.status_code not in (200):
+                logging.warning(f"Variant update failed SKU {sku}: {vr.status_code} {vr.text[:300]}")
+
+    # Inventory
+    if SHOPIFY_LOCATION_ID and row.get("available") is not None:
+        inv_url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json"
+        inv_payload = {
+            "location_id": int(SHOPIFY_LOCATION_ID),
+            "inventory_item_id": int(inventory_item_id),
+            "available": int(row["available"]),
+        }
+        ir = _s_post(inv_url, inv_payload)
+        if ir.status_code not in (200, 201):
+            logging.warning(f"Inventory set failed SKU {sku}: {ir.status_code} {ir.text[:300]}")
+
+    # Placeholder image if none
+    if PLACEHOLDER_URL and not has_image:
+        try:
+            img_url = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}/images.json"
+            # Double-check to avoid duplicates
+            check = _s_get(img_url, params={"fields": "id,src"})
+            already = False
+            if check.status_code == 200:
+                for im in (check.json() or {}).get("images", []):
+                    if im.get("src") == PLACEHOLDER_URL:
+                        already = True
+                        break
+            if not already:
+                up = {
+                    "image": {
+                        "src": PLACEHOLDER_URL,
+                        "alt": _placeholder_alt(sku)
+                    }
+                }
+                ir = _s_post(img_url, up)
+                if ir.status_code not in (200, 201):
+                    logging.warning(f"Image add failed SKU {sku}: {ir.status_code} {ir.text[:300]}")
+            # mark cache as having image
+            SKU_CACHE[sku] = (product_id, variant_id, inventory_item_id, True, vendor)
+        except Exception:
+            logging.exception(f"Image upload error for {sku}")
+
+    METRICS["updated"] += 1
+    return True
+
+# -----------------------------------------------------------------------------
+# Request queue (simple inline processing; Uni calls are sequential anyway)
+# -----------------------------------------------------------------------------
+def process_rows(rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+    """Returns (updated, skipped_noop, skipped_cache_miss)"""
+    updated = skipped_noop = skipped_cache = 0
+    count = 0
+    for row in rows:
+        if KILL_SWITCH:
+            logging.warning("KILL_SWITCH active - aborting batch")
+            break
+        if STOP_AFTER_N and count >= STOP_AFTER_N:
+            logging.info(f"STOP_AFTER_N={STOP_AFTER_N} reached.")
+            break
+        ok = update_product(row)
+        if ok:
+            updated += 1
+        else:
+            # differentiate cache miss vs. noop if you like
+            if row["sku"] not in SKU_CACHE and not HYBRID_LOOKUP:
+                skipped_cache += 1
+            else:
+                skipped_noop += 1
+        count += 1
+    return updated, skipped_noop, skipped_cache
+
+# -----------------------------------------------------------------------------
+# Routes: Uni Micro TwinXML endpoints
+# -----------------------------------------------------------------------------
+@app.before_request
+def _log_every_request():
+    try:
+        logging.info(f"REQ {request.method} {request.path}?{request.query_string.decode('utf-8', 'ignore') or ''}  Referer={request.headers.get('Referer','-')}")
+    except Exception:
+        pass
+
 @app.route("/")
 def root_404():
-    return Response("<h1>Not Found</h1>", status=404)
+    return Response("<h1>Not Found</h1>", status=404, mimetype="text/html")
 
-# -------------------------------
-# Local run (for dev)
-# -------------------------------
+@app.get("/admin/health")
+def admin_health():
+    METRICS.update({
+        "queue_size": 0,
+        "default_body_mode": DEFAULT_BODY_MODE,
+        "tag_max": TAG_MAX,
+        "qps": QPS,
+        "strict_update_only": STRICT_UPDATE_ONLY,
+        "max_queue_size": MAX_QUEUE_SIZE,
+        "workers": WORKERS,
+        "stop_after_n": STOP_AFTER_N,
+        "placehldr": bool(PLACEHOLDER_URL),
+    })
+    return jsonify(METRICS)
+
+@app.post("/admin/kill")
+def admin_kill():
+    global KILL_SWITCH
+    KILL_SWITCH = True
+    return jsonify({"ok": True, "kill_switch": True})
+
+@app.post("/admin/resume")
+def admin_resume():
+    global KILL_SWITCH
+    KILL_SWITCH = False
+    return jsonify({"ok": True, "kill_switch": False})
+
+@app.get("/admin/preload")
+def admin_preload():
+    if METRICS.get("preload_done"):
+        return jsonify({"ok": True, "already_done": True, "cache_size": METRICS.get("cache_size", 0)})
+    _start_preloader_once()
+    return jsonify({"ok": True, "started": True})
+
+# --- Product GROUPS (we accept & OK so Uni continues) ---
+@app.post("/twinxml/postproductgroup.asp")
+def post_product_groups():
+    body = _decode_body(request)
+    # Parse if needed; for now we just log count
+    try:
+        root = ET.fromstring(body) if body else None
+        groups = len(root.findall(".//group")) if root is not None else 0
+        logging.info(f"Got {groups} product groups.")
+    except Exception:
+        logging.info("Got 0 product groups.")
+    return _ok_txt("OK")
+
+# --- Products feed ---
+@app.post("/twinxml/postproduct.asp")
+def post_product():
+    # Early kill or delete short-circuit
+    if KILL_SWITCH:
+        return _ok_txt("OK")
+    # If Uni tries to send deleteproduct here, short-circuit
+    if "delete" in (request.args.get("action","") or "").lower():
+        logging.info("Delete action received - STRICT stop (no-op).")
+        return _ok_txt("OK")
+
+    body = _decode_body(request)
+    rows = _parse_products_xml(body)
+    logging.info(f"Parsed {len(rows)} products from payload.")
+    up, noop, miss = process_rows(rows)
+    logging.info(f"Upserted {len(rows)} products (Shopify updated {up}, skipped no-ops {noop}, skipped cache-miss {miss})")
+    return _ok_txt("OK")
+
+# --- Orders (optional placeholder to avoid 404 noise) ---
+@app.route("/twinxml/orders.asp", methods=["GET","POST"])
+def orders_passthrough():
+    # Not implemented; just OK to keep Uni happy
+    return _ok_txt("OK")
+
+# --- Safety: explicit delete endpoint guard (if Uni calls postdeleteproduct.asp) ---
+@app.post("/twinxml/postdeleteproduct.asp")
+def post_delete_guard():
+    logging.info("Delete product payload received - blocked by policy.")
+    return _ok_txt("OK")
+
+# -----------------------------------------------------------------------------
+# Gunicorn entry
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # For local testing only
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")), debug=True)
+    # For local testing
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), threaded=True)
