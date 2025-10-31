@@ -12,6 +12,8 @@ import base64
 import binascii
 import time
 import random
+import threading
+import socket
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -93,6 +95,17 @@ KILL_FILE = "/mnt/data/SYNC_KILLED"      # create this file to kill; delete to r
 
 def is_killed() -> bool:
     return os.path.exists(KILL_FILE)
+
+# ---------- Preloader config / markers ----------
+PRELOAD_ON_START      = os.environ.get("PRELOAD_ON_START", "true").lower() in ("1", "true", "yes")
+PRELOAD_LIMIT         = int(os.environ.get("PRELOAD_LIMIT", "250"))            # per page; Shopify max 250
+PRELOAD_FLUSH_EVERY   = int(os.environ.get("PRELOAD_FLUSH_EVERY", "500"))
+PRELOAD_RESUME        = os.environ.get("PRELOAD_RESUME", "true").lower() in ("1", "true", "yes")
+PRELOAD_LOG_EVERY     = int(os.environ.get("PRELOAD_LOG_EVERY", "500"))
+PRELOAD_MAX_PAGES     = int(os.environ.get("PRELOAD_MAX_PAGES", "0"))          # 0 = no page cap
+
+PRELOAD_LOCK_PATH     = "/mnt/data/PRELOAD_LOCK"
+PRELOAD_DONE_PATH     = "/mnt/data/PRELOAD_DONE"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
@@ -1202,9 +1215,9 @@ def admin_seed_cache():
     if ADMIN_KEY and key != ADMIN_KEY:
         return Response(b"Forbidden\r\n", status=403, mimetype="text/plain")
 
-    limit = int(request.args.get("limit", "250"))          # variants per page (250 max)
-    flush_every = int(request.args.get("flush_every", "500"))
-    resume = (request.args.get("resume", "1").lower() in ("1","true","yes"))
+    limit = int(request.args.get("limit", str(PRELOAD_LIMIT)))          # variants per page (250 max)
+    flush_every = int(request.args.get("flush_every", str(PRELOAD_FLUSH_EVERY)))
+    resume = (request.args.get("resume", "1" if PRELOAD_RESUME else "0").lower() in ("1","true","yes"))
 
     def stream():
         conn = db(); cur = conn.cursor()
@@ -1289,6 +1302,151 @@ def admin_seed_cache():
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
+# ---------- Auto-preload helpers ----------
+def _count_cached_variants() -> int:
+    try:
+        conn = db()
+        row = conn.execute("SELECT COUNT(1) AS c FROM products WHERE last_shopify_variant_id IS NOT NULL").fetchone()
+        conn.close()
+        return int(row["c"] or 0)
+    except Exception:
+        return 0
+
+def _write_file(path: str, content: str):
+    try:
+        with open(path, "w") as f:
+            f.write(content)
+    except Exception as e:
+        logging.warning("Failed writing %s: %s", path, e)
+
+def _atomic_create(path: str) -> bool:
+    try:
+        # Exclusive create fails if file exists
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(now_iso())
+        return True
+    except FileExistsError:
+        return False
+    except Exception as e:
+        logging.warning("Lock create error %s: %s", path, e)
+        return False
+
+def _remove_if_exists(path: str):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logging.warning("Remove %s failed: %s", path, e)
+
+def _preload_worker():
+    if not SHOPIFY_TOKEN:
+        logging.info("Preload skipped: SHOPIFY_TOKEN not set.")
+        return
+    if os.path.exists(PRELOAD_DONE_PATH):
+        logging.info("Preload skipped: PRELOAD_DONE exists.")
+        return
+    if not _atomic_create(PRELOAD_LOCK_PATH):
+        logging.info("Preload skipped: another worker holds PRELOAD_LOCK.")
+        return
+
+    hostname = socket.gethostname()
+    logging.info("Starting Shopify preload on %s (limit=%d flush_every=%d resume=%s)",
+                 hostname, PRELOAD_LIMIT, PRELOAD_FLUSH_EVERY, PRELOAD_RESUME)
+    conn = db(); cur = conn.cursor()
+    total_scanned = 0
+    page = 0
+    since_id = 0
+
+    # resume checkpoint table (shared with /admin/seed_cache)
+    try:
+        if PRELOAD_RESUME:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS seed_checkpoint(
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    since_id INTEGER
+                )""")
+            row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
+            if row and row["since_id"]:
+                since_id = int(row["since_id"] or 0)
+    except Exception as e:
+        logging.warning("Checkpoint init failed: %s", e)
+
+    try:
+        while True:
+            page += 1
+            if PRELOAD_MAX_PAGES and page > PRELOAD_MAX_PAGES:
+                logging.info("Preload page cap reached (%d).", PRELOAD_MAX_PAGES)
+                break
+
+            r = shopify_request("GET", f"/variants.json",
+                                params={"since_id": since_id, "limit": min(PRELOAD_LIMIT, 250)})
+            if r.status_code != 200:
+                logging.warning("Preload error %s: %s", r.status_code, r.text[:200])
+                break
+            arr = r.json().get("variants", [])
+            if not arr:
+                logging.info("Preload done. No more variants.")
+                break
+
+            scanned_this_page = 0
+            for v in arr:
+                sku = (v.get("sku") or "").strip()
+                if not sku:
+                    continue
+                pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
+                cur.execute("""
+                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
+                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(prodid) DO UPDATE SET
+                      last_shopify_product_id=excluded.last_shopify_product_id,
+                      last_shopify_variant_id=excluded.last_shopify_variant_id,
+                      last_inventory_item_id=excluded.last_inventory_item_id,
+                      updated_at=excluded.updated_at
+                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
+                since_id = v.get("id") or since_id
+                scanned_this_page += 1
+                total_scanned += 1
+
+                if scanned_this_page % PRELOAD_LOG_EVERY == 0:
+                    conn.commit()
+                    logging.info("Preload progress: +%d this page, total=%d, since_id=%s",
+                                 PRELOAD_LOG_EVERY, total_scanned, since_id)
+
+            conn.commit()
+            if PRELOAD_RESUME:
+                try:
+                    cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
+                                   VALUES(1, ?)
+                                   ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
+                                (since_id,))
+                    conn.commit()
+                except Exception as e:
+                    logging.warning("Checkpoint save failed: %s", e)
+
+            logging.info("Preload page committed — variants this page=%d, total=%d, since_id=%s",
+                         scanned_this_page, total_scanned, since_id)
+
+        logging.info("Preload complete. Variants cached: %d", _count_cached_variants())
+        _write_file(PRELOAD_DONE_PATH, f"{now_iso()} total={total_scanned}\n")
+    except Exception as e:
+        logging.exception("Preload fatal error: %s", e)
+    finally:
+        _remove_if_exists(PRELOAD_LOCK_PATH)
+        try: conn.close()
+        except: pass
+
+def _schedule_preload_once():
+    # Skip if disabled or already done
+    if not PRELOAD_ON_START:
+        return
+    if os.path.exists(PRELOAD_DONE_PATH):
+        return
+    # Start thread
+    t = threading.Thread(target=_preload_worker, name="shopify-preload", daemon=True)
+    t.start()
+
 # ---------- Admin: Kill / Resume ----------
 @app.route("/admin/kill", methods=["GET","POST"])
 def admin_kill():
@@ -1312,6 +1470,30 @@ def admin_resume():
         return Response(f"ERROR: {e}\r\n".encode("utf-8"), status=500, mimetype="text/plain")
     return Response(b"RESUMED\r\n", status=200, mimetype="text/plain; charset=windows-1252")
 
+# ---------- Admin: Health ----------
+@app.route("/admin/health", methods=["GET"])
+def admin_health():
+    data = {
+        "cache_size": _count_cached_variants(),
+        "default_body_mode": DEFAULT_BODY_MODE,
+        "placehldr": bool(ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL),
+        "preload_done": os.path.exists(PRELOAD_DONE_PATH),
+        "qps": QPS,
+        "max_queue_size": 8000,          # cosmetic / static
+        "queue_size": 0,
+        "queued": 0,
+        "ok": True,
+        "skipped_cache_miss": 0,
+        "skipped_noop": 0,
+        "dropped": 0,
+        "stop_after_n": STOP_AFTER_N,
+        "strict_update_only": STRICT_UPDATE_ONLY,
+        "tag_max": TAG_MAX,
+        "workers": int(os.environ.get("WEB_CONCURRENCY", "1")),
+    }
+    return Response(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    mimetype="application/json; charset=utf-8")
+
 # ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
@@ -1324,6 +1506,8 @@ def delete_all():
         conn = db()
         conn.execute("DELETE FROM products"); conn.execute("DELETE FROM groups")
         conn.commit(); conn.close()
+        _remove_if_exists(PRELOAD_DONE_PATH)
+        _remove_if_exists(PRELOAD_LOCK_PATH)
     except Exception:
         pass
     return ok_txt("OK")
@@ -1361,6 +1545,9 @@ def twinxml_fallback(rest):
     if is_upload and request.method in ("POST","GET"):
         return post_product()
     return ok_txt("OK")
+
+# Schedule preload once at import time (works under Gunicorn too; guarded by lock files)
+_schedule_preload_once()
 
 # ---------- Main ----------
 if __name__ == "__main__":
