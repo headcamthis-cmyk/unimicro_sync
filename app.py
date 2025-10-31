@@ -1,7 +1,6 @@
-
 # app.py
-import os, logging, json, time, html, base64, re, threading, queue
-from typing import Dict, Any, Optional, List, Tuple
+import os, logging, json, time, html, re, threading, queue
+from typing import Dict, Any, Optional, List
 from flask import Flask, request, Response, jsonify
 import requests
 
@@ -22,10 +21,11 @@ SHOPIFY_LOC_ID   = os.environ.get("SHOPIFY_LOCATION_ID", "")  # optional
 # Behavior toggles
 STRICT_UPDATE_ONLY     = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() == "true"
 PRELOAD_SKU_CACHE      = os.environ.get("PRELOAD_SKU_CACHE", "true").lower() == "true"
-ALLOW_CREATE           = False  # FORCE disabled as requested
+ALLOW_CREATE           = False  # FORCE disabled as requested (never create products)
 KILL_SWITCH            = os.environ.get("KILL_SWITCH", "false").lower() == "true"
 ACK_FIRST_THEN_WORK    = os.environ.get("ACK_FIRST_THEN_WORK", "true").lower() == "true"
 CONNECTION_CLOSE       = os.environ.get("CONNECTION_CLOSE", "true").lower() == "true"
+STOP_AFTER_N           = int(os.environ.get("STOP_AFTER_N", "0"))  # 0 = unlimited; cap per incoming batch
 
 # Content knobs
 DEFAULT_VENDOR         = os.environ.get("DEFAULT_VENDOR", "Ukjent leverandør")
@@ -36,9 +36,9 @@ TAG_MAX                = int(os.environ.get("TAG_MAX", "8"))
 PLACEHOLDER_IMAGE_URL  = os.environ.get("PLACEHOLDER_IMAGE_URL", "")
 
 # Throughput
-WORKER_THREADS         = int(os.environ.get("WORKER_THREADS", "6"))
-MAX_QUEUE_SIZE         = int(os.environ.get("MAX_QUEUE_SIZE", "8000"))
-QPS                    = float(os.environ.get("QPS", "2.0"))
+WORKER_THREADS         = int(os.environ.get("WORKER_THREADS", "4"))
+MAX_QUEUE_SIZE         = int(os.environ.get("MAX_QUEUE_SIZE", "5000"))
+QPS                    = float(os.environ.get("QPS", "1.6"))
 BOOT_IMMEDIATELY       = os.environ.get("BOOT_IMMEDIATELY", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------------
@@ -63,9 +63,10 @@ metrics = {
     "workers": 0,
     "cache_size": 0,
     "max_queue_size": MAX_QUEUE_SIZE,
+    "stop_after_n": STOP_AFTER_N,
 }
 
-job_q = queue.Queue(maxsize=MAX_QUEUE_SIZE)  # type: ignore
+job_q: "queue.Queue[Optional[dict]]" = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 sku_cache: Dict[str, Dict[str, Any]] = {}  # sku -> {product_id, variant_id, has_image, vendor}
 
 # Token-bucket rate limiter shared by all workers
@@ -74,6 +75,7 @@ tokens = QPS
 last_fill = time.time()
 
 def _rate_wait():
+    """Global QPS limiter across all threads."""
     global tokens, last_fill
     if QPS <= 0:  # disabled
         return
@@ -93,7 +95,7 @@ def _rate_wait():
 # Helpers
 # ---------------------------------------------------------------------------------
 def is_authenticated(username: str, password: str) -> bool:
-    # uni test creds per your setup
+    # Uni Micro test creds per your setup
     return username == "synall" and password == "synall"
 
 def ok_txt(body="OK"):
@@ -134,7 +136,7 @@ def _safe_vendor(v: Optional[str]) -> str:
 def _cap_tags(tags: List[str]) -> List[str]:
     if TAG_MAX <= 0:
         return []
-    out = []
+    out: List[str] = []
     for t in tags:
         if t and t not in out:
             out.append(t[:64])  # Shopify short tags
@@ -223,12 +225,7 @@ def _lookup_sku_live(sku: str) -> Optional[Dict[str, Any]]:
 def _ensure_placeholder_image(product_id: int, sku: str, has_image: bool) -> None:
     if has_image or not PLACEHOLDER_IMAGE_URL:
         return
-    payload = {
-        "image": {
-            "src": PLACEHOLDER_IMAGE_URL,
-            "alt": sku  # alt text = SKU
-        }
-    }
+    payload = {"image": {"src": PLACEHOLDER_IMAGE_URL, "alt": sku}}  # alt text = SKU
     r = _shopify_post(f"/products/{product_id}/images.json", payload)
     if r.status_code not in (200, 201):
         logging.warning(f"Add placeholder image failed {r.status_code}: {r.text[:200]}")
@@ -243,7 +240,7 @@ def _build_body_html(uni_desc: Optional[str]) -> str:
     return uni_desc if uni_desc else DEFAULT_BODY_HTML
 
 def _make_tags(vendor: str, group: Optional[str]) -> List[str]:
-    tags = []
+    tags: List[str] = []
     if vendor:
         tags.append(vendor)
     if group:
@@ -257,6 +254,7 @@ def update_shopify_from_uni(sku: str, title: str, price: Optional[float], compar
     sku = (sku or "").strip()
     if not sku:
         return False
+
     rec = sku_cache.get(sku) or _lookup_sku_live(sku)
     if not rec:
         metrics["skipped_cache_miss"] += 1
@@ -269,12 +267,19 @@ def update_shopify_from_uni(sku: str, title: str, price: Optional[float], compar
     vendor = _safe_vendor(vendor_in or rec.get("vendor", ""))
 
     # Price / inventory
-    variant_updates = {}
+    variant_updates: Dict[str, Any] = {}
     if price is not None:
         variant_updates["price"] = round(float(price), 2)
     if compare_at is not None:
         variant_updates["compare_at_price"] = round(float(compare_at), 2)
+
+    if variant_updates:
+        r = _shopify_put(f"/variants/{variant_id}.json", {"variant": {"id": variant_id, **variant_updates}})
+        if r.status_code not in (200, 201):
+            logging.warning(f"variant update failed {r.status_code}: {r.text[:200]}")
+
     if SHOPIFY_LOC_ID and available is not None:
+        # inventory set using inventory_item_id
         vr = _shopify_get(f"/variants/{variant_id}.json")
         if vr.status_code == 200:
             inv_item = vr.json().get("variant", {}).get("inventory_item_id")
@@ -284,13 +289,8 @@ def update_shopify_from_uni(sku: str, title: str, price: Optional[float], compar
                 if ir.status_code not in (200, 201):
                     logging.warning(f"inventory set failed {ir.status_code}: {ir.text[:200]}")
 
-    if variant_updates:
-        r = _shopify_put(f"/variants/{variant_id}.json", {"variant": {"id": variant_id, **variant_updates}})
-        if r.status_code not in (200, 201):
-            logging.warning(f"variant update failed {r.status_code}: {r.text[:200]}")
-
     body_html = _build_body_html(description)
-    product_payload = {
+    product_payload: Dict[str, Any] = {
         "product": {
             "id": product_id,
             "title": title[:255] if title else None,
@@ -304,6 +304,7 @@ def update_shopify_from_uni(sku: str, title: str, price: Optional[float], compar
     if pr.status_code not in (200, 201):
         logging.warning(f"product update failed {pr.status_code}: {pr.text[:200]}")
 
+    # SEO
     seo_title = f"{vendor} - {title} | {sku} | AllSupermoto AS".strip()
     seo_desc = DEFAULT_SEO_DESC[:320]
     _shopify_put(f"/products/{product_id}.json",
@@ -345,7 +346,7 @@ def boot():
         t = threading.Thread(target=worker_main, args=(i+1,), daemon=True)
         t.start()
     metrics["workers"] = WORKER_THREADS
-    logging.info(f"Boot complete: workers={WORKER_THREADS}, preload={PRELOAD_SKU_CACHE}, qps={QPS}")
+    logging.info(f"Boot complete: workers={WORKER_THREADS}, preload={PRELOAD_SKU_CACHE}, qps={QPS}, stop_after_n={STOP_AFTER_N}")
 
 def boot_once():
     global STARTED
@@ -390,7 +391,7 @@ def root_index():
 
 def _parse_uni_xml(xml_text: str) -> List[Dict[str, Any]]:
     # Tolerant parser for Uni payloads.
-    items = []
+    items: List[Dict[str, Any]] = []
     for m in re.finditer(r"<produkt\b[^>]*>(.*?)</produkt>", xml_text, flags=re.DOTALL | re.IGNORECASE):
         block = m.group(1)
         def gx(tag):
@@ -440,9 +441,16 @@ def postproduct():
         resp = None
 
     items = _parse_uni_xml(body)
+
+    # Hard stop on deleteproduct
     if any((it.get("action") or "").lower() == "deleteproduct" for it in items):
         logging.info("Received deleteproduct action -> telling Uni to stop (skip)")
         return ok_txt("STOP")
+
+    # Apply STOP_AFTER_N cap per incoming batch
+    if STOP_AFTER_N > 0 and len(items) > STOP_AFTER_N:
+        items = items[:STOP_AFTER_N]
+        logging.info(f"STOP_AFTER_N active: truncating batch to first {STOP_AFTER_N} items")
 
     enq = 0
     for it in items:
@@ -456,7 +464,7 @@ def postproduct():
         except queue.Full:
             metrics["dropped"] += 1
 
-    logging.info(f"Upserted {len(items)} products (enqueued {enq}, queue={job_q.qsize()})")
+    logging.info(f"Accepted {len(items)} items (enqueued {enq}, queue={job_q.qsize()})")
     if resp is not None:
         return resp
     else:
