@@ -20,13 +20,42 @@ APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
 
 # ---------- Data dir (writable) ----------
-DATA_DIR = os.environ.get("DATA_DIR", "/mnt/data")
-def _ensure_data_dir():
+import tempfile, uuid
+
+def _is_writable(dir_path: str) -> bool:
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception as e:
-        logging.warning("Could not create DATA_DIR %s: %s", DATA_DIR, e)
-_ensure_data_dir()
+        os.makedirs(dir_path, exist_ok=True)
+        testfile = os.path.join(dir_path, f".writetest-{uuid.uuid4().hex}")
+        with open(testfile, "w") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return True
+    except Exception:
+        return False
+
+def _choose_data_dir() -> str:
+    # 1) Respect explicit env if writable
+    env_dir = os.environ.get("DATA_DIR")
+    if env_dir and _is_writable(env_dir):
+        return env_dir
+
+    # 2) Try common writable locations
+    candidates = [
+        "/var/tmp/unimicro-sync",
+        "/tmp/unimicro-sync",
+        os.path.join(tempfile.gettempdir(), "unimicro-sync"),
+    ]
+    for c in candidates:
+        if _is_writable(c):
+            return c
+
+    # 3) Last resort: current working directory subfolder
+    fallback = os.path.join(os.getcwd(), ".unimicro-sync")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+DATA_DIR = _choose_data_dir()
+logging.info("Using DATA_DIR=%s", DATA_DIR)
 
 # ---------- Uni auth ----------
 UNI_USER = os.environ.get("UNI_USER", "synall")
