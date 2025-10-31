@@ -478,6 +478,13 @@ def parse_gid(gid: str, kind: str) -> int | None:
     m = re.match(rf"^gid://shopify/{re.escape(kind)}/(\d+)$", str(gid))
     return int(m.group(1)) if m else None
 
+
+
+def _i0(x):
+    try:
+        return int(x)
+    except Exception:
+        return 0
 def shopify_get_product(pid: int):
     r = shopify_request("GET", f"/products/{pid}.json")
     if r.status_code != 200:
@@ -502,7 +509,7 @@ def shopify_add_placeholder_image(pid: int):
                 if PLACEHOLDER_ALT.lower() in alt:
                     return
             return
-        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": (sku or PLACEHOLDER_ALT)}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
         if r.status_code not in (200, 201):
             logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
@@ -949,7 +956,7 @@ def post_product():
         nodes=cands
 
     conn = db(); c = conn.cursor()
-    upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0
+    upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0; hit_limit=False
 
     # Optional field sniff (light)
     if LOG_SNIFF_FIELDS:
@@ -973,6 +980,7 @@ def post_product():
     for p in nodes:
         if STOP_AFTER_N and processed >= STOP_AFTER_N:
             log.info("STOP_AFTER_N reached (%d). Stopping early.", STOP_AFTER_N)
+            hit_limit = True
             break
         processed += 1
 
@@ -1127,7 +1135,7 @@ def post_product():
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid)
+                try: shopify_add_placeholder_image(pid, sku)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
@@ -1165,6 +1173,8 @@ def post_product():
              upserted, synced, skipped_noops, skipped_cache_miss)
 
     # --- VIKTIG: Returnér bokstavelig "true" til Uni for å få neste pakke ---
+    if hit_limit:
+        return ok_txt("OK")
     body = b"true"
     resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
     resp.headers["Content-Length"] = str(len(body))
