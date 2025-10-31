@@ -13,13 +13,6 @@ import binascii
 import time
 import random
 
-
-# --- Auto-seed config ---
-AUTO_SEED_CACHE_ON_START = (os.environ.get("AUTO_SEED_CACHE_ON_START","true").lower() in ("1","true","yes"))
-AUTO_SEED_LIMIT = int(os.environ.get("AUTO_SEED_LIMIT","250"))           # per page, 250 max by Shopify
-AUTO_SEED_FLUSH_EVERY = int(os.environ.get("AUTO_SEED_FLUSH_EVERY","500"))
-AUTO_SEED_RESUME = (os.environ.get("AUTO_SEED_RESUME","true").lower() in ("1","true","yes"))
-AUTO_SEED_DELAY = float(os.environ.get("AUTO_SEED_DELAY","2.0"))         # seconds before starting after import
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -105,6 +98,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger(APP_NAME)
 
 app = Flask(__name__)
+_init_limit_tables()
 app.url_map.strict_slashes = False
 
 # ---- normalize '//' in PATH
@@ -121,6 +115,31 @@ def db():
     conn = sqlite3.connect(DB_URL)
     conn.row_factory = sqlite3.Row
     return conn
+# --- Session limit helpers ---
+def _init_limit_tables():
+    try:
+        conn = db(); cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS run_limit(
+            sessionid TEXT PRIMARY KEY,
+            processed INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.commit(); conn.close()
+    except Exception as e:
+        logging.getLogger("limits").warning("Could not init run_limit table: %s", e)
+
+def _get_processed_for_session(sessionid: str) -> int:
+    conn = db(); cur = conn.cursor()
+    row = cur.execute("SELECT processed FROM run_limit WHERE sessionid=?", (sessionid,)).fetchone()
+    conn.close()
+    return int(row["processed"]) if row and row["processed"] is not None else 0
+
+def _bump_processed_for_session(sessionid: str, delta: int):
+    conn = db(); cur = conn.cursor()
+    cur.execute("""INSERT INTO run_limit(sessionid, processed) VALUES(?, ?)
+                   ON CONFLICT(sessionid) DO UPDATE SET processed=run_limit.processed + excluded.processed""",
+                (sessionid, int(delta)))
+    conn.commit(); conn.close()
+
 
 def init_db():
     conn = db(); c = conn.cursor()
@@ -485,13 +504,6 @@ def parse_gid(gid: str, kind: str) -> int | None:
     m = re.match(rf"^gid://shopify/{re.escape(kind)}/(\d+)$", str(gid))
     return int(m.group(1)) if m else None
 
-
-
-def _i0(x):
-    try:
-        return int(x)
-    except Exception:
-        return 0
 def shopify_get_product(pid: int):
     r = shopify_request("GET", f"/products/{pid}.json")
     if r.status_code != 200:
@@ -860,6 +872,8 @@ def postdiscount_asp():
 
 # ---------- product groups (return literal "true") ----------
 def uni_groups_ok():
+    if hit_limit:
+        return ok_txt("OK")
     body = b"true"
     resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
     resp.headers["Content-Length"] = str(len(body))
@@ -924,16 +938,25 @@ def post_product_group():
 @app.route("/twinxml/poststock.asp", methods=["GET","POST"])
 @app.route("/twinxml/poststock.aspx", methods=["GET","POST"])
 def post_product():
+    sessionid = request.args.get("sessionid") or request.args.get("sessionId") or ""
+    current_total = _get_processed_for_session(sessionid) if (STOP_AFTER_N > 0 and sessionid) else 0
+    if STOP_AFTER_N > 0 and sessionid and current_total >= STOP_AFTER_N:
+        logging.getLogger("limits").info(f"Session {sessionid} already reached STOP_AFTER_N={STOP_AFTER_N} (total={current_total}). Returning OK.")
+        return ok_txt("OK")
     if request.method == "GET":
         # Uni forventer "true" når den health-checker via GET i noen oppsett
-        body = b"true"
+        if hit_limit:
+        return ok_txt("OK")
+    body = b"true"
         resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
         resp.headers["Content-Length"] = str(len(body))
         resp.headers["Connection"] = "close"
         return resp
 
     if not require_auth():
-        body = b"true"
+        if hit_limit:
+        return ok_txt("OK")
+    body = b"true"
         resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
         resp.headers["Content-Length"] = str(len(body))
         resp.headers["Connection"] = "close"
@@ -944,7 +967,9 @@ def post_product():
         root = ET.fromstring(raw)
     except Exception as e:
         log.warning("Bad XML products: %s ... first200=%r", e, raw[:200])
-        body = b"true"
+        if hit_limit:
+        return ok_txt("OK")
+    body = b"true"
         resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
         resp.headers["Content-Length"] = str(len(body))
         resp.headers["Connection"] = "close"
@@ -963,7 +988,7 @@ def post_product():
         nodes=cands
 
     conn = db(); c = conn.cursor()
-    upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0; hit_limit=False
+    upserted=0; synced=0; processed=0; skipped_noops=0; skipped_cache_miss=0
 
     # Optional field sniff (light)
     if LOG_SNIFF_FIELDS:
@@ -985,11 +1010,12 @@ def post_product():
         pass
 
     for p in nodes:
-        if STOP_AFTER_N and processed >= STOP_AFTER_N:
+        if STOP_AFTER_N > 0 and (processed + current_total) >= STOP_AFTER_N:
             log.info("STOP_AFTER_N reached (%d). Stopping early.", STOP_AFTER_N)
-            hit_limit = True
             break
         processed += 1
+            if STOP_AFTER_N > 0 and sessionid:
+                _bump_processed_for_session(sessionid, 1)
 
         sku = (findtext_ci_any(p,["productident","prodid","varenr","sku","itemno"]) or "").strip()
         if not sku: continue
@@ -1070,8 +1096,8 @@ def post_product():
         changed_price = is_new or f2(prev["price"]) != f2(price)
         changed_cmp   = is_new or f2(prev["last_compare_at_price"]) != f2(compare_at)
         changed_cost  = is_new or f2(prev["last_cost"]) != f2(cost_net)
-        prev_avail = (max(0, _i0(prev["stock"]) - _i0(prev["reserved"])) if prev else None)
-        changed_av  = is_new or int((prev_avail if prev_avail is not None else -1)) != int(available)
+        prev_avail = max(0, int(prev["stock"]) - int(prev["reserved"])) if prev else None
+        changed_av  = is_new or int(prev_avail or -1) != int(available)
         changed_tags= is_new or (prev["last_tags"] or "") != (tags_csv or "")
         changed_bar = is_new or (prev["barcode"] or "") != (ean or "")
 
@@ -1142,7 +1168,7 @@ def post_product():
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid, sku)
+                try: shopify_add_placeholder_image(pid)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
@@ -1378,105 +1404,6 @@ def twinxml_fallback(rest):
     if is_upload and request.method in ("POST","GET"):
         return post_product()
     return ok_txt("OK")
-
-# ---------- Auto-seed SKU cache on startup ----------
-def _auto_seed_cache_logger():
-    return logging.getLogger("auto_seed")
-
-def _auto_seed_cache_once():
-    log = _auto_seed_cache_logger()
-    try:
-        import threading, time, fcntl
-        # Prevent multiple workers from doing the same job: file lock
-        lock_path = "/tmp/asm_auto_seed.lock"
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except Exception:
-            log.info("Another worker is already seeding; skipping.")
-            return
-
-        conn = db(); cur = conn.cursor()
-        since_id = 0
-        if AUTO_SEED_RESUME:
-            # Ensure checkpoint table exists
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS seed_checkpoint(
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    since_id INTEGER
-                )""")
-            row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
-            if row and row["since_id"]:
-                since_id = int(row["since_id"] or 0)
-
-        scanned = 0
-        total_scanned = 0
-        log.info("Auto-seed starting (resume=%s) from since_id=%s", AUTO_SEED_RESUME, since_id)
-
-        while True:
-            r = shopify_request("GET", f"/variants.json",
-                                params={"since_id": since_id, "limit": min(AUTO_SEED_LIMIT, 250)})
-            if r.status_code != 200:
-                log.error("Error %s: %s", r.status_code, r.text[:200])
-                break
-            arr = r.json().get("variants", [])
-            if not arr:
-                log.info("Auto-seed done. No more variants.")
-                break
-
-            for v in arr:
-                sku = (v.get("sku") or "").strip()
-                if not sku:
-                    continue
-                pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
-                cur.execute("""
-                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(prodid) DO UPDATE SET
-                      last_shopify_product_id=excluded.last_shopify_product_id,
-                      last_shopify_variant_id=excluded.last_shopify_variant_id,
-                      last_inventory_item_id=excluded.last_inventory_item_id,
-                      updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
-                scanned += 1; total_scanned += 1
-                since_id = v.get("id") or since_id
-
-                if scanned >= AUTO_SEED_FLUSH_EVERY:
-                    conn.commit()
-                    if AUTO_SEED_RESUME:
-                        cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
-                                       VALUES(1, ?)
-                                       ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
-                                    (since_id,))
-                        conn.commit()
-                    log.info("Auto-seed progress — since_id=%s, total=%s", since_id, total_scanned)
-                    scanned = 0
-
-            conn.commit()
-            if AUTO_SEED_RESUME:
-                cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
-                               VALUES(1, ?)
-                               ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
-                            (since_id,))
-                conn.commit()
-            log.info("Auto-seed page committed — since_id=%s, total=%s", since_id, total_scanned)
-
-        conn.commit(); conn.close()
-        log.info("Preload complete. Variants cached: %s", total_scanned)
-    except Exception as e:
-        log = _auto_seed_cache_logger()
-        log.exception("Auto-seed failed: %s", e)
-
-# Kick off background seeding shortly after import
-if AUTO_SEED_CACHE_ON_START:
-    import threading, time
-    def _starter():
-        time.sleep(AUTO_SEED_DELAY)
-        _auto_seed_cache_once()
-    try:
-        threading.Thread(target=_starter, daemon=True).start()
-    except Exception as _e:
-        logging.getLogger("auto_seed").warning("Failed to start auto-seed thread: %s", _e)
 
 # ---------- Main ----------
 if __name__ == "__main__":
