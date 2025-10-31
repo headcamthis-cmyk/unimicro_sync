@@ -946,12 +946,13 @@ def post_product():
     if request.method == "GET":
         # Uni forventer "true" når den health-checker via GET i noen oppsett
         if hit_limit:
-        return ok_txt("OK")
-    body = b"true"
-        resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
-        resp.headers["Content-Length"] = str(len(body))
-        resp.headers["Connection"] = "close"
-        return resp
+    return ok_txt("OK")
+
+body = b"true"
+resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
+resp.headers["Content-Length"] = str(len(body))
+resp.headers["Connection"] = "close"
+return resp
 
     if not require_auth():
         if hit_limit:
