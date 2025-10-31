@@ -507,6 +507,20 @@ def shopify_get_product(pid: int):
     if r.status_code != 200:
         raise RuntimeError(f"get product {r.status_code}: {r.text[:200]}")
     return r.json()["product"]
+def effective_vendor_for_seo(pid, incoming_vendor):
+    v = (incoming_vendor or "").strip()
+    if v:
+        return v
+    try:
+        p = shopify_get_product(int(pid))
+        existing = (p.get("vendor") or "").strip()
+        if existing:
+            return existing
+    except Exception as e:
+        logging.warning("SEO vendor fallback: couldn't fetch product %s vendor: %s", pid, e)
+    return "Ukjent leverandør"
+
+
 
 def shopify_product_images(pid: int):
     r = shopify_request("GET", f"/products/{pid}/images.json")
@@ -514,7 +528,7 @@ def shopify_product_images(pid: int):
         raise RuntimeError(f"images {r.status_code}: {r.text[:200]}")
     return r.json().get("images", [])
 
-def shopify_add_placeholder_image(pid: int):
+def shopify_add_placeholder_image(pid: int, alt_text: str | None = None):
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
         return
     try:
@@ -526,7 +540,7 @@ def shopify_add_placeholder_image(pid: int):
                 if PLACEHOLDER_ALT.lower() in alt:
                     return
             return
-        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": ((alt_text or "").strip() or (PLACEHOLDER_ALT or ""))}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
         if r.status_code not in (200, 201):
             logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
@@ -1184,14 +1198,14 @@ def post_product():
 
             # SEO (ikke i LIGHT_MODE)
             if not LIGHT_MODE and (changed_title or changed_vendor):
-                final_vendor = (vendor or "Ukjent leverandør").strip() or "Ukjent leverandør"
+                final_vendor = effective_vendor_for_seo(pid, vendor)
                 seo_title = SEO_DEFAULT_TITLE_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 seo_desc  = SEO_DEFAULT_DESC_TEMPLATE.format(title=full_title, sku=sku, vendor=final_vendor)
                 shopify_set_seo(pid, seo_title, seo_desc)
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid)
+                try: shopify_add_placeholder_image(pid, alt_text=sku)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
