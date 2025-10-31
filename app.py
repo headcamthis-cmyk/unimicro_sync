@@ -87,17 +87,17 @@ LIGHT_MODE = os.environ.get("LIGHT_MODE", "false").lower() in ("1", "true", "yes
 STORE_RAW_XML = os.environ.get("STORE_RAW_XML", "true").lower() in ("1", "true", "yes")
 LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "false").lower() in ("1", "true", "yes")
 
-# ---------- Hardcoded Kill Switch (no env) ----------
-KILL_KEY = "asmstop2025"                 # change if you want
-KILL_FILE = "/mnt/data/SYNC_KILLED"      # create this file to kill; delete to resume
-
-def is_killed() -> bool:
-    return os.path.exists(KILL_FILE)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
 
 app = Flask(__name__)
+
+# ----------------------------
+# Kill switch (no env required)
+# ----------------------------
+KILLED = False  # when True, all /twinxml endpoints will return 'KILLED'
+KILL_SWITCH_KEY = "asm-stop-123"  # edit this string directly in the file to change
+
 app.url_map.strict_slashes = False
 
 # ---- normalize '//' in PATH
@@ -490,7 +490,7 @@ def shopify_product_images(pid: int):
         raise RuntimeError(f"images {r.status_code}: {r.text[:200]}")
     return r.json().get("images", [])
 
-def shopify_add_placeholder_image(pid: int):
+def shopify_add_placeholder_image(pid: int, sku: str):
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
         return
     try:
@@ -502,7 +502,7 @@ def shopify_add_placeholder_image(pid: int):
                 if PLACEHOLDER_ALT.lower() in alt:
                     return
             return
-        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": (sku or PLACEHOLDER_ALT)}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
         if r.status_code not in (200, 201):
             logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
@@ -766,6 +766,17 @@ def shopify_find_variant_by_sku(sku):
     return None
 
 # ---------- Request logging ----------
+
+@app.before_request
+def _kill_guard():
+    global KILLED
+    # allow admin endpoints even when killed
+    if request.path.startswith("/admin"):
+        return
+    # block Uni endpoints while killed
+    if KILLED and request.path.startswith("/twinxml"):
+        return ok_txt("KILLED")
+
 @app.before_request
 def _log_req():
     try:
@@ -774,15 +785,6 @@ def _log_req():
                  request.query_string.decode(errors="ignore"), ref)
     except Exception:
         pass
-
-# ---------- Global Kill: short-circuit everything except admin ----------
-@app.before_request
-def _kill_guard():
-    # allow admin endpoints even when killed
-    if request.path.startswith("/admin"):
-        return None
-    if is_killed():
-        return Response(b"STOPPED\r\n", status=503, mimetype="text/plain; charset=windows-1252")
 
 # ---------- Health ----------
 @app.route("/", methods=["GET"])
@@ -800,7 +802,6 @@ def status_asp():
            "<supportsstock>1</supportsstock>"
            "<supportsproducts>1</supportsproducts>"
            "<supportsproductgroups>1</supportsproductgroups>"
-           # IMPORTANT: tell Uni we DO NOT support deletes
            "<supportsdeletes>0</supportsdeletes>"
            f"<echo_lastupdate>{lastupdate}</echo_lastupdate></Root>")
     resp = Response(xml, status=200)
@@ -836,7 +837,6 @@ def postdiscountsystem_asp():
 def deletetable_asp():
     name = (request.args.get("name") or "").lower()
     logging.info("Uni requested deletetable for: %s", name)
-    # Do not encourage delete flows; just acknowledge
     return ok_txt("OK")
 
 @app.route("/twinxml/postdiscount.asp", methods=["GET","POST","HEAD"])
@@ -1127,7 +1127,7 @@ def post_product():
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid)
+                try: shopify_add_placeholder_image(pid, sku)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
@@ -1171,13 +1171,13 @@ def post_product():
     resp.headers["Connection"] = "close"
     return resp
 
-# --- Uni -> "delete product" (we ignore + do NOT return 'true') ---
-@app.route("/twinxml/deleteproduct.asp", methods=["POST", "GET", "HEAD"])
+# --- Uni -> "delete product" (we ignore) ---
+@app.route("/twinxml/deleteproduct.asp", methods=["POST"])
 def uni_delete_product():
-    sku = (request.args.get("id") or "").strip()
-    logging.info(f"UNI requested delete for %r — ignored (NO Shopify delete).", sku)
-    # We return a plain OK (not 'true') so Uni doesn't treat this like a chained batch step.
-    return ok_txt("OK")
+    # Deletions are disabled: instruct Uni to stop the delete phase now.
+    # Always 200 with custom body so Uni won't retry.
+    return ok_txt("STOP_DELETES")
+
 
 # ---------- reset map ----------
 @app.route("/twinxml/resetmap.asp", methods=["GET","POST"])
@@ -1289,33 +1289,9 @@ def admin_seed_cache():
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
-# ---------- Admin: Kill / Resume ----------
-@app.route("/admin/kill", methods=["GET","POST"])
-def admin_kill():
-    if request.args.get("key") != KILL_KEY:
-        return Response(b"Forbidden\r\n", status=403, mimetype="text/plain; charset=windows-1252")
-    try:
-        with open(KILL_FILE, "w") as f:
-            f.write(now_iso())
-    except Exception as e:
-        return Response(f"ERROR: {e}\r\n".encode("utf-8"), status=500, mimetype="text/plain")
-    return Response(b"KILLED\r\n", status=200, mimetype="text/plain; charset=windows-1252")
-
-@app.route("/admin/resume", methods=["GET","POST"])
-def admin_resume():
-    if request.args.get("key") != KILL_KEY:
-        return Response(b"Forbidden\r\n", status=403, mimetype="text/plain; charset=windows-1252")
-    try:
-        if os.path.exists(KILL_FILE):
-            os.remove(KILL_FILE)
-    except Exception as e:
-        return Response(f"ERROR: {e}\r\n".encode("utf-8"), status=500, mimetype="text/plain")
-    return Response(b"RESUMED\r\n", status=200, mimetype="text/plain; charset=windows-1252")
-
 # ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
-    # We acknowledge but do not cascade any delete-like behavior
     return ok_txt("OK")
 
 @app.route("/twinxml/deleteall.asp", methods=["GET","POST"])
@@ -1345,17 +1321,11 @@ def twinxml_fallback(rest):
     except Exception:
         qs = ""
     path_l = rest.lower()
-
-    # Explicitly exclude deletes from being treated like uploads
-    if path_l.startswith("delete") or "delete" in path_l:
-        logging.warning("Delete-related endpoint hit: /twinxml/%s?%s — acknowledging only.", rest, qs)
-        return ok_txt("OK")
-
     is_upload = (
         path_l.startswith("post") or
-        ("product" in path_l) or ("item" in path_l) or
-        ("price" in path_l) or ("stock" in path_l) or
-        ("inventory" in path_l) or ("discount" in path_l)
+        "product" in path_l or "item" in path_l or
+        "price" in path_l or "stock" in path_l or
+        "inventory" in path_l or "discount" in path_l
     )
     logging.warning("TwinXML FALLBACK hit: /twinxml/%s?%s  (upload=%s)", rest, qs, is_upload)
     if is_upload and request.method in ("POST","GET"):
@@ -1363,5 +1333,35 @@ def twinxml_fallback(rest):
     return ok_txt("OK")
 
 # ---------- Main ----------
+
+# ----------------------------
+# Admin kill/unkill/status endpoints
+# ----------------------------
+def _check_key():
+    if KILL_SWITCH_KEY and request.args.get("key") != KILL_SWITCH_KEY:
+        return Response("Forbidden\r\n", status=403, mimetype="text/plain; charset=windows-1252")
+
+@app.get("/admin/status")
+def admin_status():
+    bad = _check_key()
+    if bad: return bad
+    return Response(("KILLED\r\n" if KILLED else "RUNNING\r\n"), mimetype="text/plain; charset=windows-1252")
+
+@app.post("/admin/kill")
+def admin_kill():
+    bad = _check_key()
+    if bad: return bad
+    global KILLED
+    KILLED = True
+    return ok_txt("KILLED")
+
+@app.post("/admin/unkill")
+def admin_unkill():
+    bad = _check_key()
+    if bad: return bad
+    global KILLED
+    KILLED = False
+    return ok_txt("RUNNING")
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
