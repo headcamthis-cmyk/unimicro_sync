@@ -436,18 +436,15 @@ def _log_every_request():
     except Exception:
         pass
 
-@app.after_request
-def _after(resp):
-    if CONNECTION_CLOSE:
-        resp.headers["Connection"] = "close"
-    return resp
-
-@app.before_first_request
-def _boot_before_first_request():
+\1
+@app.before_request
+def _ensure_boot_started():
     try:
-        boot_once()
+        if not globals().get('STARTED', False):
+            boot_once()
     except Exception as e:
-        logging.warning(f"boot_once() failed in before_first_request: {e}")
+        logging.warning(f"boot_once() in before_request failed: {e}")
+
 
 
 # -----------------------------------------------------------------------------
