@@ -12,50 +12,9 @@ import base64
 import binascii
 import time
 import random
-import threading
-import socket
-import errno
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
-
-# ---------- Data dir (writable) ----------
-import tempfile, uuid
-
-def _is_writable(dir_path: str) -> bool:
-    try:
-        os.makedirs(dir_path, exist_ok=True)
-        testfile = os.path.join(dir_path, f".writetest-{uuid.uuid4().hex}")
-        with open(testfile, "w") as f:
-            f.write("ok")
-        os.remove(testfile)
-        return True
-    except Exception:
-        return False
-
-def _choose_data_dir() -> str:
-    # 1) Respect explicit env if writable
-    env_dir = os.environ.get("DATA_DIR")
-    if env_dir and _is_writable(env_dir):
-        return env_dir
-
-    # 2) Try common writable locations
-    candidates = [
-        "/var/tmp/unimicro-sync",
-        "/tmp/unimicro-sync",
-        os.path.join(tempfile.gettempdir(), "unimicro-sync"),
-    ]
-    for c in candidates:
-        if _is_writable(c):
-            return c
-
-    # 3) Last resort: current working directory subfolder
-    fallback = os.path.join(os.getcwd(), ".unimicro-sync")
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
-
-DATA_DIR = _choose_data_dir()
-logging.info("Using DATA_DIR=%s", DATA_DIR)
 
 # ---------- Uni auth ----------
 UNI_USER = os.environ.get("UNI_USER", "synall")
@@ -80,7 +39,7 @@ UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "tr
 # ---------- Images ----------
 ENABLE_IMAGE_UPLOAD = os.environ.get("ENABLE_IMAGE_UPLOAD", "false").lower() in ("1", "true", "yes")
 PLACEHOLDER_IMAGE_URL = os.environ.get("PLACEHOLDER_IMAGE_URL")
-PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")  # used if SKU not provided
+PLACEHOLDER_ALT = os.environ.get("PLACEHOLDER_ALT", "ASM placeholder")
 
 # ---------- Create / Update strategy ----------
 STRICT_UPDATE_ONLY = os.environ.get("STRICT_UPDATE_ONLY", "true").lower() in ("1", "true", "yes")
@@ -128,23 +87,12 @@ LIGHT_MODE = os.environ.get("LIGHT_MODE", "false").lower() in ("1", "true", "yes
 STORE_RAW_XML = os.environ.get("STORE_RAW_XML", "true").lower() in ("1", "true", "yes")
 LOG_SNIFF_FIELDS = os.environ.get("LOG_SNIFF_FIELDS", "false").lower() in ("1", "true", "yes")
 
-# ---------- Hardcoded Kill Switch (no env needed) ----------
-KILL_KEY = "asmstop2025"                                # change if you want
-KILL_FILE = os.path.join(DATA_DIR, "SYNC_KILLED")       # create this file to kill; delete to resume
+# ---------- Hardcoded Kill Switch (no env) ----------
+KILL_KEY = "asmstop2025"                 # change if you want
+KILL_FILE = "/mnt/data/SYNC_KILLED"      # create this file to kill; delete to resume
 
 def is_killed() -> bool:
     return os.path.exists(KILL_FILE)
-
-# ---------- Preloader config / markers ----------
-PRELOAD_ON_START      = os.environ.get("PRELOAD_ON_START", "true").lower() in ("1", "true", "yes")
-PRELOAD_LIMIT         = int(os.environ.get("PRELOAD_LIMIT", "250"))            # per page; Shopify max 250
-PRELOAD_FLUSH_EVERY   = int(os.environ.get("PRELOAD_FLUSH_EVERY", "500"))
-PRELOAD_RESUME        = os.environ.get("PRELOAD_RESUME", "true").lower() in ("1", "true", "yes")
-PRELOAD_LOG_EVERY     = int(os.environ.get("PRELOAD_LOG_EVERY", "500"))
-PRELOAD_MAX_PAGES     = int(os.environ.get("PRELOAD_MAX_PAGES", "0"))          # 0 = no page cap
-
-PRELOAD_LOCK_PATH     = os.path.join(DATA_DIR, "PRELOAD_LOCK")
-PRELOAD_DONE_PATH     = os.path.join(DATA_DIR, "PRELOAD_DONE")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(APP_NAME)
@@ -217,6 +165,21 @@ def ensure_logs_table(conn):
     )""")
     conn.commit()
 
+def safe_log(endpoint: str, method: str, query: str, body: str):
+    try:
+        conn = db()
+        ensure_logs_table(conn)
+        conn.execute(
+            "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
+            (endpoint, method, query, body, now_iso())
+        )
+        conn.commit()
+    except Exception as e:
+        logging.warning("Skipping logs insert: %s", e)
+    finally:
+        try: conn.close()
+        except: pass
+
 # ---------- Utils ----------
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 
@@ -285,21 +248,6 @@ def clean_b64(data):
 def one_line(s: str | None) -> str | None:
     if not s: return None
     return re.sub(r"[\r\n]+", " ", str(s)).strip()
-
-def safe_log(endpoint: str, method: str, query: str, body: str):
-    try:
-        conn = db()
-        ensure_logs_table(conn)
-        conn.execute(
-            "INSERT INTO logs(endpoint, method, query, body, created_at) VALUES (?,?,?,?,?)",
-            (endpoint, method, query, body, now_iso())
-        )
-        conn.commit()
-    except Exception as e:
-        logging.warning("Skipping logs insert: %s", e)
-    finally:
-        try: conn.close()
-        except: pass
 
 # ---------- Tag helpers ----------
 def norm_tag(tag: str) -> str:
@@ -542,11 +490,7 @@ def shopify_product_images(pid: int):
         raise RuntimeError(f"images {r.status_code}: {r.text[:200]}")
     return r.json().get("images", [])
 
-def shopify_add_placeholder_image(pid: int, sku_for_alt: str | None = None):
-    """
-    Attach placeholder image only if product has no images.
-    Alt text defaults to SKU when provided; otherwise PLACEHOLDER_ALT.
-    """
+def shopify_add_placeholder_image(pid: int):
     if not ENABLE_IMAGE_UPLOAD or not PLACEHOLDER_IMAGE_URL:
         return
     try:
@@ -555,16 +499,15 @@ def shopify_add_placeholder_image(pid: int, sku_for_alt: str | None = None):
             # any image exists -> skip placeholder
             for img in imgs:
                 alt = (img.get("alt") or "").lower()
-                if (PLACEHOLDER_ALT or "").lower() in alt:
+                if PLACEHOLDER_ALT.lower() in alt:
                     return
             return
-        alt_text = (sku_for_alt or "").strip() or PLACEHOLDER_ALT
-        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": alt_text}}
+        body = {"image": {"src": PLACEHOLDER_IMAGE_URL, "position": 1, "alt": PLACEHOLDER_ALT}}
         r = shopify_request("POST", f"/products/{pid}/images.json", data=json.dumps(body))
         if r.status_code not in (200, 201):
             logging.warning("Placeholder image upload failed for %s: %s %s", pid, r.status_code, r.text[:200])
         else:
-            logging.info("Placeholder image attached to product %s (alt=%r)", pid, alt_text)
+            logging.info("Placeholder image attached to product %s", pid)
     except Exception as e:
         logging.warning("Placeholder image attach error for %s: %s", pid, e)
 
@@ -1184,7 +1127,7 @@ def post_product():
 
             # Placeholder-bilde (ikke i LIGHT_MODE)
             if not LIGHT_MODE and ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL:
-                try: shopify_add_placeholder_image(pid, sku_for_alt=sku)
+                try: shopify_add_placeholder_image(pid)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
         # Variant (pris / compare_at / barcode)
@@ -1259,9 +1202,9 @@ def admin_seed_cache():
     if ADMIN_KEY and key != ADMIN_KEY:
         return Response(b"Forbidden\r\n", status=403, mimetype="text/plain")
 
-    limit = int(request.args.get("limit", str(PRELOAD_LIMIT)))          # variants per page (250 max)
-    flush_every = int(request.args.get("flush_every", str(PRELOAD_FLUSH_EVERY)))
-    resume = (request.args.get("resume", "1" if PRELOAD_RESUME else "0").lower() in ("1","true","yes"))
+    limit = int(request.args.get("limit", "250"))          # variants per page (250 max)
+    flush_every = int(request.args.get("flush_every", "500"))
+    resume = (request.args.get("resume", "1").lower() in ("1","true","yes"))
 
     def stream():
         conn = db(); cur = conn.cursor()
@@ -1346,165 +1289,6 @@ def admin_seed_cache():
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
-# ---------- Auto-preload helpers ----------
-def _count_cached_variants() -> int:
-    try:
-        conn = db()
-        row = conn.execute("SELECT COUNT(1) AS c FROM products WHERE last_shopify_variant_id IS NOT NULL").fetchone()
-        conn.close()
-        return int(row["c"] or 0)
-    except Exception:
-        return 0
-
-def _write_file(path: str, content: str):
-    try:
-        with open(path, "w") as f:
-            f.write(content)
-    except Exception as e:
-        logging.warning("Failed writing %s: %s", path, e)
-
-def _atomic_create(path: str) -> bool:
-    # Ensure parent dir exists
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    except Exception as e:
-        logging.warning("Lock dir create failed for %s: %s", path, e)
-        return False
-
-    try:
-        # Exclusive create; succeeds only if file does not exist
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w") as f:
-            f.write(now_iso())
-        return True
-    except FileExistsError:
-        # Another worker already holds the lock
-        return False
-    except OSError as e:
-        if e.errno == errno.ENOENT:
-            logging.warning("Lock create error (missing path) for %s: %s", path, e)
-        else:
-            logging.warning("Lock create unexpected OSError for %s: %s", path, e)
-        return False
-    except Exception as e:
-        logging.warning("Lock create unexpected error for %s: %s", path, e)
-        return False
-
-def _remove_if_exists(path: str):
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        logging.warning("Remove %s failed: %s", path, e)
-
-def _preload_worker():
-    if not SHOPIFY_TOKEN:
-        logging.info("Preload skipped: SHOPIFY_TOKEN not set.")
-        return
-    if os.path.exists(PRELOAD_DONE_PATH):
-        logging.info("Preload skipped: PRELOAD_DONE exists.")
-        return
-    if not _atomic_create(PRELOAD_LOCK_PATH):
-        logging.info("Preload skipped: could not acquire PRELOAD_LOCK (dir/permissions/another worker).")
-        return
-
-    hostname = socket.gethostname()
-    logging.info("Starting Shopify preload on %s (limit=%d flush_every=%d resume=%s)",
-                 hostname, PRELOAD_LIMIT, PRELOAD_FLUSH_EVERY, PRELOAD_RESUME)
-    conn = db(); cur = conn.cursor()
-    total_scanned = 0
-    page = 0
-    since_id = 0
-
-    # resume checkpoint table (shared with /admin/seed_cache)
-    try:
-        if PRELOAD_RESUME:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS seed_checkpoint(
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    since_id INTEGER
-                )""")
-            row = cur.execute("SELECT since_id FROM seed_checkpoint WHERE id=1").fetchone()
-            if row and row["since_id"]:
-                since_id = int(row["since_id"] or 0)
-    except Exception as e:
-        logging.warning("Checkpoint init failed: %s", e)
-
-    try:
-        while True:
-            page += 1
-            if PRELOAD_MAX_PAGES and page > PRELOAD_MAX_PAGES:
-                logging.info("Preload page cap reached (%d).", PRELOAD_MAX_PAGES)
-                break
-
-            r = shopify_request("GET", f"/variants.json",
-                                params={"since_id": since_id, "limit": min(PRELOAD_LIMIT, 250)})
-            if r.status_code != 200:
-                logging.warning("Preload error %s: %s", r.status_code, r.text[:200])
-                break
-            arr = r.json().get("variants", [])
-            if not arr:
-                logging.info("Preload done. No more variants.")
-                break
-
-            scanned_this_page = 0
-            for v in arr:
-                sku = (v.get("sku") or "").strip()
-                if not sku:
-                    continue
-                pid = v.get("product_id"); vid = v.get("id"); iid = v.get("inventory_item_id")
-                cur.execute("""
-                    INSERT INTO products(prodid,name,price,vatcode,groupid,barcode,stock,reserved,body_html,image_b64,webactive,vendor,payload_xml,
-                                         last_shopify_product_id,last_shopify_variant_id,last_inventory_item_id,last_compare_at_price,last_tags,last_cost,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(prodid) DO UPDATE SET
-                      last_shopify_product_id=excluded.last_shopify_product_id,
-                      last_shopify_variant_id=excluded.last_shopify_variant_id,
-                      last_inventory_item_id=excluded.last_inventory_item_id,
-                      updated_at=excluded.updated_at
-                """,(sku,None,None,None,None,None,None,None,None,None,1,None,None,pid,vid,iid,None,None,None,now_iso()))
-                since_id = v.get("id") or since_id
-                scanned_this_page += 1
-                total_scanned += 1
-
-                if scanned_this_page % PRELOAD_LOG_EVERY == 0:
-                    conn.commit()
-                    logging.info("Preload progress: +%d this page, total=%d, since_id=%s",
-                                 PRELOAD_LOG_EVERY, total_scanned, since_id)
-
-            conn.commit()
-            if PRELOAD_RESUME:
-                try:
-                    cur.execute("""INSERT INTO seed_checkpoint(id, since_id)
-                                   VALUES(1, ?)
-                                   ON CONFLICT(id) DO UPDATE SET since_id=excluded.since_id""",
-                                (since_id,))
-                    conn.commit()
-                except Exception as e:
-                    logging.warning("Checkpoint save failed: %s", e)
-
-            logging.info("Preload page committed — variants this page=%d, total=%d, since_id=%s",
-                         scanned_this_page, total_scanned, since_id)
-
-        logging.info("Preload complete. Variants cached: %d", _count_cached_variants())
-        _write_file(PRELOAD_DONE_PATH, f"{now_iso()} total={total_scanned}\n")
-    except Exception as e:
-        logging.exception("Preload fatal error: %s", e)
-    finally:
-        _remove_if_exists(PRELOAD_LOCK_PATH)
-        try: conn.close()
-        except: pass
-
-def _schedule_preload_once():
-    # Skip if disabled or already done
-    if not PRELOAD_ON_START:
-        return
-    if os.path.exists(PRELOAD_DONE_PATH):
-        return
-    # Start thread
-    t = threading.Thread(target=_preload_worker, name="shopify-preload", daemon=True)
-    t.start()
-
 # ---------- Admin: Kill / Resume ----------
 @app.route("/admin/kill", methods=["GET","POST"])
 def admin_kill():
@@ -1528,31 +1312,6 @@ def admin_resume():
         return Response(f"ERROR: {e}\r\n".encode("utf-8"), status=500, mimetype="text/plain")
     return Response(b"RESUMED\r\n", status=200, mimetype="text/plain; charset=windows-1252")
 
-# ---------- Admin: Health ----------
-@app.route("/admin/health", methods=["GET"])
-def admin_health():
-    data = {
-        "cache_size": _count_cached_variants(),
-        "default_body_mode": DEFAULT_BODY_MODE,
-        "dropped": 0,
-        "max_queue_size": 8000,
-        "ok": True,
-        "placehldr": bool(ENABLE_IMAGE_UPLOAD and PLACEHOLDER_IMAGE_URL),
-        "preload_done": os.path.exists(PRELOAD_DONE_PATH),
-        "qps": QPS,
-        "queue_size": 0,
-        "queued": 0,
-        "skipped_cache_miss": 0,
-        "skipped_noop": 0,
-        "stop_after_n": STOP_AFTER_N,
-        "strict_update_only": STRICT_UPDATE_ONLY,
-        "tag_max": TAG_MAX,
-        "updated": 0,
-        "workers": int(os.environ.get("WEB_CONCURRENCY", "1")),
-    }
-    return Response(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                    mimetype="application/json; charset=utf-8")
-
 # ---------- misc stubs ----------
 @app.route("/twinxml/deleteproductgroup.asp", methods=["GET","POST"])
 def delete_product_group():
@@ -1565,8 +1324,6 @@ def delete_all():
         conn = db()
         conn.execute("DELETE FROM products"); conn.execute("DELETE FROM groups")
         conn.commit(); conn.close()
-        _remove_if_exists(PRELOAD_DONE_PATH)
-        _remove_if_exists(PRELOAD_LOCK_PATH)
     except Exception:
         pass
     return ok_txt("OK")
@@ -1604,9 +1361,6 @@ def twinxml_fallback(rest):
     if is_upload and request.method in ("POST","GET"):
         return post_product()
     return ok_txt("OK")
-
-# Schedule preload once at import time (works under Gunicorn too; guarded by lock files)
-_schedule_preload_once()
 
 # ---------- Main ----------
 if __name__ == "__main__":
