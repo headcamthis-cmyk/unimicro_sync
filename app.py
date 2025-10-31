@@ -436,7 +436,6 @@ def _log_every_request():
     except Exception:
         pass
 
-\1
 @app.before_request
 def _ensure_boot_started():
     try:
