@@ -488,6 +488,7 @@ def sh_headers():
     }
 
 def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
+    global SESSION
     url = f"{shopify_base()}{path}"
     headers = kwargs.pop("headers", {})
     headers.update(sh_headers())
@@ -540,7 +541,6 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
             time.sleep(sleep_s)
             if attempt in (3, 5):
                 try:
-                    global SESSION
                     SESSION.close()
                     SESSION = requests.Session()
                     SESSION.mount("https://", adapter)
