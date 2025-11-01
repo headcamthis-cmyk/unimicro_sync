@@ -488,70 +488,67 @@ def sh_headers():
     }
 
 def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
+    url = f"{shopify_base()}{path}"
+    headers = kwargs.pop("headers", {})
+    headers.update(sh_headers())
+    backoff = 0.6  # base seconds
 
-url = f"{shopify_base()}{path}"
-headers = kwargs.pop("headers", {})
-headers.update(sh_headers())
-backoff = 0.6  # base seconds
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            _pre_sleep()
+            resp = SESSION.request(method.upper(), url, headers=headers, timeout=60, **kwargs)
+            _post_mark()
 
-for attempt in range(1, MAX_RETRIES + 1):
-    try:
-        _pre_sleep()
-        resp = SESSION.request(method.upper(), url, headers=headers, timeout=60, **kwargs)
-        _post_mark()
+            cl = resp.headers.get("X-Shopify-Shop-Api-Call-Limit")
+            if cl:
+                try:
+                    used, cap = map(int, cl.split("/"))
+                    if used >= cap - 5:
+                        time.sleep(1.2 + random.uniform(0, 0.3))
+                except Exception:
+                    pass
 
-        cl = resp.headers.get("X-Shopify-Shop-Api-Call-Limit")
-        if cl:
-            try:
-                used, cap = map(int, cl.split("/"))
-                if used >= cap - 5:
-                    time.sleep(1.2 + random.uniform(0, 0.3))
-            except Exception:
-                pass
+            if resp.status_code < 400:
+                return resp
 
-        if resp.status_code < 400:
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After")
+                if ra:
+                    try:
+                        sleep_s = float(ra)
+                    except ValueError:
+                        sleep_s = 1.0
+                else:
+                    sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
+                logging.warning("429 rate limit. Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
+                time.sleep(sleep_s)
+                continue
+
+            if 500 <= resp.status_code < 600:
+                sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
+                logging.warning("Shopify %s. Sleeping %.2fs (attempt %d/%d)", resp.status_code, sleep_s, attempt, MAX_RETRIES)
+                time.sleep(sleep_s)
+                continue
+
+            # Non-retryable HTTP
             return resp
 
-        if resp.status_code == 429:
-            ra = resp.headers.get("Retry-After")
-            if ra:
-                try:
-                    sleep_s = float(ra)
-                except ValueError:
-                    sleep_s = 1.0
-            else:
-                sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
-            logging.warning("429 rate limit. Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
-            time.sleep(sleep_s)
-            continue
-
-        if 500 <= resp.status_code < 600:
+        except requests.RequestException as e:
             sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
-            logging.warning("Shopify %s. Sleeping %.2fs (attempt %d/%d)", resp.status_code, sleep_s, attempt, MAX_RETRIES)
+            logging.warning("Shopify request exception (%s %s): %s — retrying in %.2fs (attempt %d/%d)",
+                            method, path, e, sleep_s, attempt, MAX_RETRIES)
             time.sleep(sleep_s)
-            continue
+            if attempt in (3, 5):
+                try:
+                    global SESSION
+                    SESSION.close()
+                    SESSION = requests.Session()
+                    SESSION.mount("https://", adapter)
+                    SESSION.mount("http://", adapter)
+                except Exception:
+                    pass
 
-        # Non-retryable HTTP
-        return resp
-
-    except requests.RequestException as e:
-        sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
-        logging.warning("Shopify request exception (%s %s): %s — retrying in %.2fs (attempt %d/%d)",
-                        method, path, e, sleep_s, attempt, MAX_RETRIES)
-        time.sleep(sleep_s)
-        if attempt in (3, 5):
-            try:
-                global SESSION
-                SESSION.close()
-                SESSION = requests.Session()
-                SESSION.mount("https://", adapter)
-                SESSION.mount("http://", adapter)
-            except Exception:
-                pass
-
-raise requests.ConnectionError(f"Shopify request failed after {MAX_RETRIES} attempts: {method} {path}")
-
-
+    raise requests.ConnectionError(f"Shopify request failed after {MAX_RETRIES} attempts: {method} {path}")
 def shopify_graphql(payload: dict) -> requests.Response:
     url = f"{shopify_base()}/graphql.json"
     headers = sh_headers()
