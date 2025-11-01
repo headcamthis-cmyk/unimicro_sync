@@ -13,6 +13,7 @@ import binascii
 import time
 import random
 import threading
+import math  # <-- added for price rounding modes
 
 APP_NAME = "uni-shopify-sync"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -33,6 +34,31 @@ SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 # ---------- Pricing behavior ----------
 UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1", "true", "yes")
 VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% default
+
+# NEW: Configurable price decimals / rounding
+PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "0"))  # 0 = whole kr
+PRICE_ROUND_MODE = os.environ.get("PRICE_ROUND_MODE", "round").lower()  # round|floor|ceil|truncate
+
+def _round_price(val: float | None) -> float | None:
+    """Round price according to config."""
+    if val is None:
+        return None
+    x = float(val)
+    # If you want standard 2-decimals behavior, set PRICE_DECIMALS=2
+    if PRICE_DECIMALS >= 2:
+        return round(x, PRICE_DECIMALS)
+    if PRICE_DECIMALS == 1:
+        # one decimal - uncommon in NOK, still supported
+        return round(x, 1)
+    # PRICE_DECIMALS == 0  -> whole kroner
+    if PRICE_ROUND_MODE == "floor":
+        return float(math.floor(x))
+    if PRICE_ROUND_MODE == "ceil":
+        return float(math.ceil(x))
+    if PRICE_ROUND_MODE == "truncate":
+        return float(math.trunc(x))
+    # default: round to nearest whole kr
+    return float(round(x, 0))
 
 # ---------- COST behavior ----------
 UNI_COST_IS_NET = os.environ.get("UNI_COST_IS_NET", "true").lower() in ("1", "true", "yes")
@@ -507,6 +533,7 @@ def shopify_get_product(pid: int):
     if r.status_code != 200:
         raise RuntimeError(f"get product {r.status_code}: {r.text[:200]}")
     return r.json()["product"]
+
 def effective_vendor_for_seo(pid, incoming_vendor):
     v = (incoming_vendor or "").strip()
     if v:
@@ -519,8 +546,6 @@ def effective_vendor_for_seo(pid, incoming_vendor):
     except Exception as e:
         logging.warning("SEO vendor fallback: couldn't fetch product %s vendor: %s", pid, e)
     return "Ukjent leverandør"
-
-
 
 def shopify_product_images(pid: int):
     r = shopify_request("GET", f"/products/{pid}/images.json")
@@ -1078,15 +1103,19 @@ def post_product():
         price_raw, price_src = extract_best_price(p)
         def brutto(val):
             if val is None: return None
-            return round(val * (1.0 + VAT_RATE), 2) if UNI_PRICE_IS_NET else round(val, 2)
+            # keep internal compute at 2 dec to avoid cumulative rounding before final rounding step
+            gross = (val * (1.0 + VAT_RATE)) if UNI_PRICE_IS_NET else val
+            return round(gross, 2)
+
+        # NEW: apply configured rounding to final price and compare_at
         price = _round_price(brutto(price_raw))
 
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
         compare_at = None
         if ordinaryprice is not None:
-    ordinaryprice = brutto(ordinaryprice)
-    if price and ordinaryprice and ordinaryprice > price:
-        compare_at = _round_price(ordinaryprice)
+            ordinaryprice = brutto(ordinaryprice)
+            if price and ordinaryprice and ordinaryprice > price:
+                compare_at = _round_price(ordinaryprice)
 
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
@@ -1118,7 +1147,12 @@ def post_product():
             (sku,)
         ).fetchone()
 
-        def f2(x): return None if x is None else round(float(x), 2)
+        # NEW: compare at configured precision (prevents churn when decimals are disabled)
+        def f2(x):
+            if x is None:
+                return None
+            # round() supports 0,1,2... decimals; cast to float for consistent compare
+            return round(float(x), PRICE_DECIMALS)
 
         is_new = prev is None
         changed_title = is_new or (prev["name"] or "") != (full_title or "")
@@ -1210,9 +1244,21 @@ def post_product():
 
         # Variant (pris / compare_at / barcode)
         if do_variant_update and vid:
-            vp = {"price": f"{(price or 0):.2f}", "sku": sku}
-            if compare_at: vp["compare_at_price"] = f"{compare_at:.2f}"
-            if ean: vp["barcode"] = ean
+            # NEW: format with configured decimals
+            if PRICE_DECIMALS > 0:
+                fmt = f"{{:.{PRICE_DECIMALS}f}}"
+                price_out = fmt.format(float(price or 0))
+                cmp_out = fmt.format(float(compare_at)) if compare_at is not None else None
+            else:
+                # whole kr: send as integer string (Shopify accepts "123")
+                price_out = str(int(price or 0))
+                cmp_out = str(int(compare_at)) if compare_at is not None else None
+
+            vp = {"price": price_out, "sku": sku}
+            if cmp_out is not None:
+                vp["compare_at_price"] = cmp_out
+            if ean:
+                vp["barcode"] = ean
             shopify_update_variant(vid, vp)
 
         # Inventory (available = stock - reserved)
