@@ -31,13 +31,12 @@ SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")  # set in Render
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 SHOPIFY_LOCATION_ID = os.environ.get("SHOPIFY_LOCATION_ID", "16764928067")
 
-
-
 # ---------- Fast path controls (GraphQL batching) ----------
 USE_GQL_BATCH = os.environ.get("USE_GQL_BATCH", "true").lower() in ("1","true","yes")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))          # 25–40 is a good range
 GQL_COOLDOWN_OK = float(os.environ.get("GQL_COOLDOWN_OK", "0.15"))
 GQL_COOLDOWN_LOW = float(os.environ.get("GQL_COOLDOWN_LOW", "1.5"))
+
 # ---------- Pricing behavior ----------
 UNI_PRICE_IS_NET = os.environ.get("UNI_PRICE_IS_NET", "true").lower() in ("1", "true", "yes")
 VAT_RATE = float(os.environ.get("VAT_RATE", "0.25"))  # 25% default
@@ -211,14 +210,7 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id=1),
             since_id INTEGER
         )""")
-    
-    # Flush GraphQL batches for price+stock
-    try:
-        if USE_GQL_BATCH and rows_for_batch:
-            process_rows_batched(rows_for_batch, SHOPIFY_LOCATION_ID)
-    except Exception as e:
-        logging.warning("Batch flush failed: %s", e)
-conn.commit(); conn.close()
+    conn.commit(); conn.close()
 init_db()
 
 def ensure_logs_table(conn):
@@ -537,10 +529,9 @@ def shopify_graphql(payload: dict) -> requests.Response:
     _post_mark()
     return resp
 
-
 # === BEGIN: GraphQL batched helpers ===
 def to_gid(kind: str, numeric_id: int | str | None) -> str | None:
-    if numeric_id is None:
+    if numeric_id is None or str(numeric_id).strip() == "":
         return None
     try:
         return f"gid://shopify/{kind}/{int(numeric_id)}"
@@ -557,12 +548,12 @@ def _send_batched_mutations(alias_mutations: list[str]):
     if not alias_mutations:
         return
     query = "mutation {\n" + "\n".join(alias_mutations) + "\n}"
+    data = None
     try:
         r = shopify_graphql({"query": query, "variables": {}})
         if r.status_code >= 400:
             logging.error("GraphQL HTTP %s: %s", r.status_code, r.text[:500])
-            time.sleep(GQL_COOLDOWN_LOW)
-            return
+            time.sleep(GQL_COOLDOWN_LOW); return
         data = r.json() or {}
         errs = []
         for k, v in (data.get("data") or {}).items():
@@ -578,8 +569,7 @@ def _send_batched_mutations(alias_mutations: list[str]):
         logging.warning("GraphQL batch send failed: %s", e)
 
 def _money(amount_float: float | None) -> str | None:
-    if amount_float is None:
-        return None
+    if amount_float is None: return None
     return f"{float(amount_float):.2f}"
 
 def _alias_variant_update(alias: str, variant_gid: str, price: float | None, compare_at: float | None, barcode: str | None):
@@ -588,20 +578,19 @@ def _alias_variant_update(alias: str, variant_gid: str, price: float | None, com
         parts.append(f'price: {{ amount: "{_money(price)}", currencyCode: NOK }}')
     if compare_at is not None:
         parts.append(f'compareAtPrice: {{ amount: "{_money(compare_at)}", currencyCode: NOK }}')
-    frag = ", ".join(parts)
-    return f"""{alias}: productVariantUpdate(input: {{ id: \"{variant_gid}\", {frag} }}) {{
+    frag = ", ".join(parts) if parts else ""
+    return f'''{alias}: productVariantUpdate(input: {{ id: "{variant_gid}", {frag} }}) {{
       userErrors {{ field message }} productVariant {{ id }}
-    }}"""
+    }}'''
 
 def _alias_inventory_set(alias: str, inventory_item_gid: str, location_gid: str, available: int):
-    return f"""{alias}: inventorySetOnHandQuantities(input: {{
+    return f'''{alias}: inventorySetOnHandQuantities(input: {{
       reason: correction,
-      setQuantities: [{{ inventoryItemId: \"{inventory_item_gid}\", locationId: \"{location_gid}\", quantity: {int(available)} }}]
-    }}) {{ userErrors {{ field message }} }}"""
+      setQuantities: [{{ inventoryItemId: "{inventory_item_gid}", locationId: "{location_gid}", quantity: {int(available)} }}]
+    }}) {{ userErrors {{ field message }} }}'''
 
 def process_rows_batched(rows: list[dict], location_id: int | str):
-    if not USE_GQL_BATCH or not rows:
-        return
+    if not USE_GQL_BATCH or not rows: return
     location_gid = to_gid("Location", location_id)
     alias_mutations: list[str] = []
     alias_i = 0
@@ -609,19 +598,20 @@ def process_rows_batched(rows: list[dict], location_id: int | str):
         vg = to_gid("ProductVariant", r.get("variant_id"))
         ig = to_gid("InventoryItem", r.get("inventory_item_id"))
         if r.get("changed_price") or r.get("changed_cmp"):
-            alias_mutations.append(
-                _alias_variant_update(f"pv_{alias_i}", vg, r.get("price"), r.get("compare_at"), r.get("barcode"))
-            ); alias_i += 1
+            if vg:
+                alias_mutations.append(
+                    _alias_variant_update(f"pv_{alias_i}", vg, r.get("price"), r.get("compare_at"), r.get("barcode"))
+                ); alias_i += 1
         if r.get("changed_av") and ig and location_gid:
             alias_mutations.append(
                 _alias_inventory_set(f"inv_{alias_i}", ig, location_gid, int(r.get("available", 0)))
             ); alias_i += 1
         if len(alias_mutations) >= max(1, BATCH_SIZE):
-            _send_batched_mutations(alias_mutations)
-            alias_mutations.clear()
+            _send_batched_mutations(alias_mutations); alias_mutations.clear()
     if alias_mutations:
         _send_batched_mutations(alias_mutations)
 # === END: GraphQL batched helpers ===
+
 def parse_gid(gid: str, kind: str) -> int | None:
     if not gid: return None
     m = re.match(rf"^gid://shopify/{re.escape(kind)}/(\d+)$", str(gid))
@@ -1107,6 +1097,7 @@ def post_product_group():
 @app.route("/twinxml/poststock.aspx", methods=["GET","POST"])
 def post_product():
     if request.method == "GET":
+    rows_for_batch: list[dict] = []
         # Uni forventer "true" når den health-checker via GET i noen oppsett
         body = b"true"
         resp = Response(body, status=200, mimetype="text/plain; charset=windows-1252")
@@ -1166,7 +1157,6 @@ def post_product():
     except Exception:
         pass
 
-    rows_for_batch: list[dict] = []
     for p in nodes:
         if STOP_AFTER_N and processed >= STOP_AFTER_N:
             log.info("STOP_AFTER_N reached (%d). Stopping early.", STOP_AFTER_N)
@@ -1342,17 +1332,24 @@ def post_product():
                 try: shopify_add_placeholder_image(pid, alt_text=sku)
                 except Exception as e: logging.warning("Placeholder attach on update failed for %s: %s", sku, e)
 
-        # Variant collected for GraphQL batch (see flush below)
-        if (do_variant_update and vid):
-            pass
 
-        # Inventory collected for GraphQL batch (see flush below)
-        if (do_inventory_set and iid):
-            pass
+        # Variant (pris / compare_at / barcode)
+        # Inventory (available = stock - reserved)
+        if do_inventory_set and iid:
+            try:
+                ensure_tracking_and_set_inventory(vid, iid, available)
+            except Exception as e:
+                log.warning("Inventory set failed for %s: %s", sku, e)
 
-        
-        # Collect for GraphQL batch
-        if (vid and (do_variant_update or do_inventory_set)):
+        # Cost per item
+        if do_cost_update and iid:
+            try:
+                shopify_update_inventory_cost(iid, float(cost_net))
+            except Exception as e:
+                log.warning("Cost update failed for %s (iid=%s): %s", sku, iid, e)
+
+        # Collect variant+inventory changes for GraphQL batch (fast path)
+        if (do_variant_update or do_inventory_set) and vid:
             rows_for_batch.append({
                 "sku": sku,
                 "variant_id": vid,
@@ -1365,12 +1362,6 @@ def post_product():
                 "changed_cmp": changed_cmp,
                 "changed_av": changed_av,
             })
-# Cost per item
-        if do_cost_update and iid:
-            try:
-                shopify_update_inventory_cost(iid, float(cost_net))
-            except Exception as e:
-                log.warning("Cost update failed for %s (iid=%s): %s", sku, iid, e)
 
         # Cache IDs
         c.execute(
@@ -1381,6 +1372,11 @@ def post_product():
         conn.commit()
         synced += 1
 
+    try:
+        if USE_GQL_BATCH and rows_for_batch:
+            process_rows_batched(rows_for_batch, SHOPIFY_LOCATION_ID)
+    except Exception as e:
+        logging.warning("Batch flush failed: %s", e)
     conn.commit(); conn.close()
     log.info("Upserted %d products (Shopify updated %d, skipped no-ops %d, skipped cache-miss %d)",
              upserted, synced, skipped_noops, skipped_cache_miss)
