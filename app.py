@@ -1084,9 +1084,9 @@ def post_product():
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
         compare_at = None
         if ordinaryprice is not None:
-            ordinaryprice = brutto(ordinaryprice)
-            if price and ordinaryprice and ordinaryprice > price:
-                compare_at = round(ordinaryprice, 2)
+    ordinaryprice = brutto(ordinaryprice)
+    if price and ordinaryprice and ordinaryprice > price:
+        compare_at = _round_price(ordinaryprice)
 
         vendor = (findtext_ci_any(p,["vendor","produsent","leverandor","leverandør","manufacturer","brand","supplier"]) or "").strip()
         ean = (findtext_ci_any(p,["ean","ean_nr","ean_nr.ean","alt02"]) or "").strip()
