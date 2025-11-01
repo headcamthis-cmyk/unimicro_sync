@@ -1079,7 +1079,7 @@ def post_product():
         def brutto(val):
             if val is None: return None
             return round(val * (1.0 + VAT_RATE), 2) if UNI_PRICE_IS_NET else round(val, 2)
-        price = brutto(price_raw)
+        price = _round_price(brutto(price_raw))
 
         ordinaryprice = to_float_safe(findtext_ci_any(p, ["ordinaryprice", "pris2"]))
         compare_at = None
