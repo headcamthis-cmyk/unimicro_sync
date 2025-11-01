@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from flask import Flask, request, Response, stream_with_context, jsonify
 import xml.etree.ElementTree as ET
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import re
 import base64
 import binascii
@@ -155,8 +157,13 @@ app.wsgi_app = DoubleSlashFix(app.wsgi_app)
 
 # ---------- DB helpers ----------
 def db():
-    conn = sqlite3.connect(DB_URL)
+    conn = sqlite3.connect(DB_URL, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     return conn
 
 def init_db():
@@ -445,6 +452,13 @@ def generate_tags(title: str, vendor: str, group_id: str, group_name: str, sku: 
 
 # ---------- Shopify rate limit + retry wrapper ----------
 SESSION = requests.Session()
+# Resilient connection pools
+_retry = Retry(
+    total=0, connect=0, read=0, redirect=0, status=0, backoff_factor=0.0
+)
+adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=_retry)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 LAST_CALL_TS = 0.0
 QPS = float(os.environ.get("QPS", "1.6"))
 MIN_INTERVAL = 1.0 / max(QPS, 0.1)
@@ -474,12 +488,14 @@ def sh_headers():
     }
 
 def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
-    url = f"{shopify_base()}{path}"
-    headers = kwargs.pop("headers", {})
-    headers.update(sh_headers())
-    backoff = 0.6  # base seconds
 
-    for attempt in range(1, MAX_RETRIES + 1):
+url = f"{shopify_base()}{path}"
+headers = kwargs.pop("headers", {})
+headers.update(sh_headers())
+backoff = 0.6  # base seconds
+
+for attempt in range(1, MAX_RETRIES + 1):
+    try:
         _pre_sleep()
         resp = SESSION.request(method.upper(), url, headers=headers, timeout=60, **kwargs)
         _post_mark()
@@ -499,21 +515,42 @@ def shopify_request(method: str, path: str, **kwargs) -> requests.Response:
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
             if ra:
-                try: sleep_s = float(ra)
-                except ValueError: sleep_s = 1.0
+                try:
+                    sleep_s = float(ra)
+                except ValueError:
+                    sleep_s = 1.0
             else:
                 sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
             logging.warning("429 rate limit. Sleeping %.2fs (attempt %d/%d)", sleep_s, attempt, MAX_RETRIES)
-            time.sleep(sleep_s); continue
+            time.sleep(sleep_s)
+            continue
 
         if 500 <= resp.status_code < 600:
             sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
             logging.warning("Shopify %s. Sleeping %.2fs (attempt %d/%d)", resp.status_code, sleep_s, attempt, MAX_RETRIES)
-            time.sleep(sleep_s); continue
+            time.sleep(sleep_s)
+            continue
 
+        # Non-retryable HTTP
         return resp
 
-    return resp
+    except requests.RequestException as e:
+        sleep_s = min(10.0, backoff * (2 ** (attempt - 1))) + random.uniform(0, 0.4)
+        logging.warning("Shopify request exception (%s %s): %s — retrying in %.2fs (attempt %d/%d)",
+                        method, path, e, sleep_s, attempt, MAX_RETRIES)
+        time.sleep(sleep_s)
+        if attempt in (3, 5):
+            try:
+                global SESSION
+                SESSION.close()
+                SESSION = requests.Session()
+                SESSION.mount("https://", adapter)
+                SESSION.mount("http://", adapter)
+            except Exception:
+                pass
+
+raise requests.ConnectionError(f"Shopify request failed after {MAX_RETRIES} attempts: {method} {path}")
+
 
 def shopify_graphql(payload: dict) -> requests.Response:
     url = f"{shopify_base()}/graphql.json"
@@ -680,6 +717,15 @@ def shopify_update_inventory_cost(iid: int, cost: float):
             logging.warning("GraphQL inventoryItemUpdate HTTP %s: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logging.error("GraphQL inventoryItemUpdate failed for iid=%s: %s", iid, e)
+
+
+def swallow_exceptions(label: str, fn, *args, **kwargs):
+    """Call fn(*args, **kwargs); log and continue on any exception. Returns function result or None."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        logging.warning("%s failed: %s", label, e)
+        return None
 
 def shopify_upsert_product_metafields(pid: int, meta: dict):
     if not meta or LIGHT_MODE:  # gated in light mode
@@ -1226,7 +1272,7 @@ def post_product():
             up={"id":pid,"title":full_title,"body_html":body_html or ""}
             if vendor: up["vendor"] = vendor
             if (not LIGHT_MODE) and tags_list: up["tags"] = ",".join(tags_list)
-            shopify_update_product(pid, up)
+            swallow_exceptions("Shopify update_product", shopify_update_product, pid, up)
             log.info("Shopify UPDATE OK sku=%s product_id=%s admin=https://%s/admin/products/%s",
                      sku, pid, SHOPIFY_DOMAIN, pid)
 
@@ -1259,7 +1305,7 @@ def post_product():
                 vp["compare_at_price"] = cmp_out
             if ean:
                 vp["barcode"] = ean
-            shopify_update_variant(vid, vp)
+            swallow_exceptions("Shopify update_variant", shopify_update_variant, vid, vp)
 
         # Inventory (available = stock - reserved)
         if do_inventory_set and iid:
